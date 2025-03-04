@@ -501,7 +501,7 @@ function main()
                                 media_item = track_item:GetMediaPoolItem()
                                 id = media_item:GetMediaId()
                                 local start_frame = track_item:GetSourceStartFrame()
-                                local end_frame = track_item:GetSourceEndFrame() - 1
+                                local end_frame = track_item:GetSourceEndFrame()
                                 if clips[id] == nil then
                                     clips[id] = {}
                                 end
