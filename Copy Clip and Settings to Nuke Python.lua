@@ -1,6 +1,6 @@
 -- User editable variables
-local FRAME_HANDLES = 15          		-- Default number of handles to add
-local NUKE_COLORSPACE = "ARRI LogC4" 	-- Default colorspace for Read node
+local DEFAULT_HANDLES = 15          -- Default number of handles to add
+local DEFAULT_COLORSPACE = "ARRI LogC4" -- Default colorspace for Read node
 -- You can change these values to your preferences
 
 -- Get the current project
@@ -62,9 +62,44 @@ if timeline then
             reelName = string.match(baseName, "([A-Z]%d+[A-Z]%d+_%d+_[A-Z]+)") or baseName
         end
         
-        -- Get clip resolution
-        local width = tonumber(mediaPoolItem:GetClipProperty("Resolution X")) or 1920
-        local height = tonumber(mediaPoolItem:GetClipProperty("Resolution Y")) or 1080
+        -- Get clip resolution with better error handling
+        local width, height = 1920, 1080  -- Default fallback values
+        
+        -- Try different methods to get resolution
+        local resX = mediaPoolItem:GetClipProperty("Resolution X")
+        local resY = mediaPoolItem:GetClipProperty("Resolution Y")
+        
+        if resX and resY and resX ~= "" and resY ~= "" then
+            width = tonumber(resX) or width
+            height = tonumber(resY) or height
+        else
+            -- Try alternate properties that might contain resolution
+            local resolution = mediaPoolItem:GetClipProperty("Resolution")
+            if resolution then
+                -- Try to extract dimensions from a string like "1920x1080"
+                local w, h = string.match(resolution, "(%d+)%s*x%s*(%d+)")
+                if w and h then
+                    width, height = tonumber(w) or width, tonumber(h) or height
+                end
+            end
+            print("Using default resolution: " .. width .. "x" .. height)
+        end
+        
+        -- Get clip FPS
+        local clipFPS = 24.0  -- Default fallback value
+        
+        -- Try different methods to get FPS
+        local fps = mediaPoolItem:GetClipProperty("FPS")
+        if fps and fps ~= "" then
+            clipFPS = tonumber(fps) or clipFPS
+        else
+            -- Try to get FPS from timeline
+            local timelineFPS = timeline:GetSetting("timelineFrameRate")
+            if timelineFPS and timelineFPS ~= "" then
+                clipFPS = tonumber(timelineFPS) or clipFPS
+            end
+            print("Using default FPS: " .. clipFPS)
+        end
         
         -- Initialize frame range variables
         local firstFrame = 1
@@ -114,16 +149,28 @@ for n in nuke.allNodes():
 def modify_project_settings():
     print("Modifying project settings...")
     
+    # Calculate handles
+    handles = ]] .. DEFAULT_HANDLES .. [[
+    
+    # Calculate clip length
+    clip_length = ]] .. endFrame .. [[ - ]] .. startFrame .. [[
+    
+    # Calculate frame range
+    first_frame = 1001 - handles
+    
+    # Calculate last frame 
+    last_frame = 1001 + clip_length + handles
+    
     # Set frame range
-    nuke.root()["first_frame"].setValue(1001)
-    print("Successfully set first_frame to 1001")
+    nuke.root()["first_frame"].setValue(first_frame)
+    print("Successfully set first_frame to " + str(first_frame))
     
-    nuke.root()["last_frame"].setValue(1100)
-    print("Successfully set last_frame to 1100")
+    nuke.root()["last_frame"].setValue(last_frame)
+    print("Successfully set last_frame to " + str(last_frame))
     
-    # Set fps
-    nuke.root()["fps"].setValue(24.0)
-    print("Successfully set fps to 24.0")
+    # Set fps to match the clip's FPS
+    nuke.root()["fps"].setValue(]] .. clipFPS .. [[)
+    print("Successfully set fps to ]] .. clipFPS .. [[")
     
     # Create a custom format with the clip's resolution
     try:
@@ -171,7 +218,7 @@ read["first"].setValue(]] .. firstFrame .. [[)
 read["last"].setValue(]] .. lastFrame .. [[)
 read["origfirst"].setValue(]] .. firstFrame .. [[)
 read["origlast"].setValue(]] .. lastFrame .. [[)
-read["colorspace"].setValue("]] .. NUKE_COLORSPACE .. [[")
+read["colorspace"].setValue("]] .. DEFAULT_COLORSPACE .. [[")
 read["name"].setValue("ReadFromResolve1")
 
 # Create ModifyMetaData node with metadata
@@ -193,6 +240,13 @@ except Exception as e:
 # Create Group node for shot setup
 group = nuke.createNode("Group")
 group.setName("ShotSetup")
+
+# Connect ModifyMetaData node to the Read node
+read.setInput(0, None)  # Ensure it has no inputs
+metadata_node.setInput(0, read)  # Connect the metadata node to the read node
+
+# Connect ShotSetup group to the ModifyMetaData node
+group.setInput(0, metadata_node)  # Connect the group to the metadata node
 
 # Enter the group to add nodes inside it
 group.begin()
@@ -255,7 +309,7 @@ input_node.addKnob(handles_knob)
 
 addhandles_knob = nuke.Int_Knob("addhandles", "Add Handles")
 input_node.addKnob(addhandles_knob)
-input_node["addhandles"].setValue(]] .. FRAME_HANDLES .. [[)
+input_node["addhandles"].setValue(]] .. DEFAULT_HANDLES .. [[)
 
 # Create FrameRange nodes
 original_range = nuke.createNode("FrameRange")
@@ -307,6 +361,13 @@ nuke.autoplace_all()
 # Select the group for easier access
 group.setSelected(True)
 
+# Close all node panels
+for node in nuke.allNodes():
+    try:
+        node.hideControlPanel()
+    except:
+        pass  # Some nodes might not have panels, so ignore errors
+
 print("Nuke setup created successfully")
 ]]
         
@@ -324,8 +385,8 @@ print("Nuke setup created successfully")
         print("End Frame:", endFrame)
         print("Sequence First Frame:", firstFrame)
         print("Sequence Last Frame:", lastFrame)
-        print("Handles:", FRAME_HANDLES)
-        print("Colorspace:", NUKE_COLORSPACE)
+        print("Handles:", DEFAULT_HANDLES)
+        print("Colorspace:", DEFAULT_COLORSPACE)
         
         -- Print Nuke setup with clear separation
         print("\n=====================================")
