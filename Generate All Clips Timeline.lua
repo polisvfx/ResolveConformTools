@@ -40,8 +40,8 @@ end
 function sort_clip_infos_by_reel_name(clip_infos)
     -- In place sort by reel name metadata
     table.sort(clip_infos, function(a, b)
-        local reel_name_a = a.mediaPoolItem:GetMetadata("Reel Name") or ""
-        local reel_name_b = b.mediaPoolItem:GetMetadata("Reel Name") or ""
+        local reel_name_a = a.mediaPoolItem:GetClipProperty("Reel Name") or ""
+        local reel_name_b = b.mediaPoolItem:GetClipProperty("Reel Name") or ""
         return reel_name_a < reel_name_b
     end)
 end
@@ -53,21 +53,67 @@ function sort_clip_infos_by_timeline_inpoint(clip_infos)
     end)
 end
 
+function check_clip_infos_overlap(clip_info_a, clip_info_b, connection_threshold)
+    -- Handle normal case
+    if clip_info_a.startFrame <= clip_info_a.endFrame and
+       clip_info_b.startFrame <= clip_info_b.endFrame then
+        return not (clip_info_a.endFrame < clip_info_b.startFrame - connection_threshold or 
+                   clip_info_b.endFrame < clip_info_a.startFrame - connection_threshold)
+    -- Handle case where one or both clips have reversed frame order
+    else
+        -- Normalize the start/end frames for comparison
+        local start_a = math.min(clip_info_a.startFrame, clip_info_a.endFrame)
+        local end_a = math.max(clip_info_a.startFrame, clip_info_a.endFrame)
+        local start_b = math.min(clip_info_b.startFrame, clip_info_b.endFrame)
+        local end_b = math.max(clip_info_b.startFrame, clip_info_b.endFrame)
+        
+        return not (end_a < start_b - connection_threshold or end_b < start_a - connection_threshold)
+    end
+end
+
 function merge_clip_infos(clip_info_a, clip_info_b)
     -- Return new clipinfo that spans clip_info_a and clip_info_b
     assert(clip_info_a.mediaPoolItem == clip_info_b.mediaPoolItem,
         "merge_clip_infos: Cannot merge clip infos from different media pool items")
+    
+    -- Determine if either clip has reversed start/end frames
+    local a_reversed = clip_info_a.startFrame > clip_info_a.endFrame
+    local b_reversed = clip_info_b.startFrame > clip_info_b.endFrame
+    
+    -- For comparison and merging, normalize the frame ranges
+    local a_min = a_reversed and clip_info_a.endFrame or clip_info_a.startFrame
+    local a_max = a_reversed and clip_info_a.startFrame or clip_info_a.endFrame
+    local b_min = b_reversed and clip_info_b.endFrame or clip_info_b.startFrame
+    local b_max = b_reversed and clip_info_b.startFrame or clip_info_b.endFrame
+    
+    -- Create the merged clip with the normalized frame range
+    local merged_min = math.min(a_min, b_min)
+    local merged_max = math.max(a_max, b_max)
+    
+    -- Debug info
+    print("Merging clips with frames:")
+    print("  A: " .. clip_info_a.startFrame .. " to " .. clip_info_a.endFrame .. 
+          (a_reversed and " (reversed)" or ""))
+    print("  B: " .. clip_info_b.startFrame .. " to " .. clip_info_b.endFrame .. 
+          (b_reversed and " (reversed)" or ""))
+    print("  Merged: " .. merged_min .. " to " .. merged_max)
+    
+    -- Keep track of if either of the original clips was reversed
+    local is_reversed = a_reversed or b_reversed
+    
+    -- Preserve retime information from either clip
+    local is_retimed = clip_info_a.isRetimed or clip_info_b.isRetimed
+    local retimePercentage = clip_info_a.retimePercentage or clip_info_b.retimePercentage
+    
     return {
         mediaPoolItem = clip_info_a.mediaPoolItem,
-        startFrame = math.min(clip_info_a.startFrame, clip_info_b.startFrame),
-        endFrame = math.max(clip_info_a.endFrame, clip_info_b.endFrame),
-        timelineInpoint = clip_info_a.timelineInpoint -- Keep the first clip's inpoint for sorting
+        startFrame = merged_min,
+        endFrame = merged_max,
+        timelineInpoint = clip_info_a.timelineInpoint, -- Keep the first clip's inpoint for sorting
+        isReversed = is_reversed,
+        isRetimed = is_retimed,
+        retimePercentage = retimePercentage
     }
-end
-
-function check_clip_infos_overlap(clip_info_a, clip_info_b, connection_threshold)
-    return not (clip_info_a.endFrame < clip_info_b.startFrame - connection_threshold or clip_info_b.endFrame <
-               clip_info_a.startFrame - connection_threshold)
 end
 
 function merge_clip_infos_if_close(clip_info_a, clip_info_b, connection_threshold)
@@ -152,23 +198,26 @@ function areClipsDuplicates(clip1, clip2)
     local path1 = clip1.mediaPoolItem:GetClipProperty("File Path")
     local path2 = clip2.mediaPoolItem:GetClipProperty("File Path")
     
+    -- Fix for false positive matches - require both path match AND same name
     -- Compare file paths and ensure they're not the same instance
     if path1 and path2 and path1 == path2 then
-        -- Ensure they're not the same clip instance
-        if clip1.startFrame ~= clip2.startFrame or 
-           clip1.trackIndex ~= clip2.trackIndex then
-            return true
+        local name1 = clip1.mediaPoolItem:GetName()
+        local name2 = clip2.mediaPoolItem:GetName()
+        
+        -- Names must also match to be considered duplicates
+        if name1 == name2 then
+            -- Ensure they're not the same clip instance on the timeline
+            if clip1.startFrame ~= clip2.startFrame or 
+               clip1.trackIndex ~= clip2.trackIndex then
+                return true
+            end
+        else
+            -- Different names means different clips, even if path is the same
+            return false
         end
     end
     
-    -- Fallback: Check if names match (less reliable)
-    if clip1.name == clip2.name and clip1.name ~= "" then
-        if clip1.startFrame ~= clip2.startFrame or 
-           clip1.trackIndex ~= clip2.trackIndex then
-            return true
-        end
-    end
-    
+    -- Return false for all other cases
     return false
 end
 
@@ -260,7 +309,7 @@ function findAndMarkDuplicates(timeline)
     
     -- Color palette for markers (using the documented marker colors)
     local colors = {
-        "Red", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "Fuchsia"
+        "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "Fuchsia", "Lavender", "Rose", "Cocoa", "Sand", "Sky", "Mint", "Lemon"
     }
     
     -- Mark duplicates with colors
@@ -319,6 +368,81 @@ function findAndMarkDuplicates(timeline)
 end
 -- END DUPLICATE MARKER FUNCTIONS
 
+-- RETIME DETECTION FUNCTION
+-- Helper function to check retiming properties
+function checkRetimeProperties(clip)
+    -- Check for retiming property
+    local speed = nil
+    local success = pcall(function() speed = tonumber(clip.clip:GetClipProperty("Speed")) end)
+    
+    -- If speed is not 100% (normal speed), it's retimed
+    if success and speed and speed ~= 100.0 then
+        print("Detected retimed clip via property: " .. clip.name .. " with speed: " .. speed .. "%")
+        clip.retimePercentage = speed -- Store for marker text
+        return true
+    end
+    
+    -- Check if any other retiming attributes are present
+    local retiming_attributes = {
+        "Retime Process", -- Check for alternative retime processes
+        "Motion Estimation", -- Motion estimation settings
+        "Frame Interpolation", -- Optical flow, nearest, etc.
+        "Retime Curve" -- Custom speed curve
+    }
+    
+    for _, attr in ipairs(retiming_attributes) do
+        local value = nil
+        local attr_success = pcall(function() value = clip.clip:GetClipProperty(attr) end)
+        if attr_success and value and value ~= "" and value ~= "None" then
+            print("Detected retimed clip via property: " .. clip.name .. " with " .. attr .. ": " .. value)
+            return true
+        end
+    end
+    
+    return false
+end
+
+function isClipRetimed(clip)
+    -- Check if clip and clip.clip are valid
+    if not clip or not clip.clip then
+        print("Warning: Invalid clip object in isClipRetimed")
+        return false
+    end
+    
+    -- Minimum difference thresholds (same as in Clipmismatch.txt)
+    local MIN_FRAME_DIFF = 3
+    local MIN_PERCENT_DIFF = 3.0
+    local retimePercentage = 100.0
+    
+    -- Safely get durations using pcall
+    local timelineDuration, sourceDuration = 0, 0
+    local success = pcall(function()
+        timelineDuration = clip.clip:GetEnd() - clip.clip:GetStart()
+        sourceDuration = clip.clip:GetSourceEndFrame() - clip.clip:GetSourceStartFrame()
+    end)
+    
+    if not success or sourceDuration == 0 then
+        print("Warning: Could not calculate durations for clip: " .. clip.name)
+        -- Fall back to checking properties
+        return checkRetimeProperties(clip)
+    end
+    
+    -- Calculate differences
+    local frameDiff = math.abs(timelineDuration - sourceDuration)
+    retimePercentage = (timelineDuration / sourceDuration) * 100
+    local percentDiff = math.abs(retimePercentage - 100)
+    
+    -- Check if significant mismatch exists
+    if frameDiff > MIN_FRAME_DIFF and percentDiff > MIN_PERCENT_DIFF then
+        print("Detected retimed clip: " .. clip.name .. " with speed: " .. string.format("%.1f", retimePercentage) .. "%")
+        clip.retimePercentage = retimePercentage -- Store for marker text
+        return true
+    end
+    
+    -- Fall back to property checks if no duration mismatch found
+    return checkRetimeProperties(clip)
+end
+
 -- MAIN SCRIPT EXECUTION
 function main()
     -- Draw window to get user parameters.
@@ -374,8 +498,8 @@ function main()
                 }, 
                 ui:TextEdit{
                     ID = "ConnectionThreshold",
-                    Text = "24",
-                    PlaceholderText = "24"
+                    Text = "25",
+                    PlaceholderText = "25"
                 }
             },
             ui:CheckBox{
@@ -384,11 +508,18 @@ function main()
             },
             ui:CheckBox{
                 ID = "videoOnly",
-                Text = "Video Only (No Audio)"
+                Text = "Video Only (No Audio)",
+				Checked = true
             },
             ui:CheckBox{
                 ID = "markDuplicates",
-                Text = "Mark Duplicate Clips with Colored Markers"
+                Text = "Mark Duplicate Clips with Colored Markers",
+				Checked = true
+            },
+			ui:CheckBox{
+				ID = "markRetimedClips",
+				Text = "Mark Retimed Clips with Red Markers",
+				Checked = true
             },
             ui:HGroup{
                 ID = "buttons",
@@ -449,6 +580,7 @@ function main()
         video_only = itm.videoOnly.Checked
         sorting_method = itm.sortingMethod.CurrentText
         mark_duplicates = itm.markDuplicates.Checked
+		mark_retimed_clips = itm.markRetimedClips.Checked
 
         -- Get timelines
         resolve = Resolve()
@@ -458,8 +590,7 @@ function main()
         num_timelines = project:GetTimelineCount()
         selected_bin = media_pool:GetCurrentFolder()
 
-        -- Iterate through timelines, figure out what clips we need and what frames are required.
-        -- We'll make a table where the key is a clip identifier and the value is a clipinfo.
+        -- Initialize table to store clips
         local clips = {}
 
         -- Mapping of timeline name to timeline object
@@ -469,60 +600,196 @@ function main()
             project_timelines[runner_timeline:GetName()] = runner_timeline
         end
 
-        -- Iterate through timelines in the current folder.
-        local selected_clips
+        -- Safely get selected clips
+        local selected_clips = {}
         if itm.selectionMethod.CurrentText == "Current Bin" then
-            selected_clips = selected_bin:GetClipList()
-        elseif itm.selectionMethod.CurrentText == "Current Selection" then
-            selected_clips = media_pool:GetSelectedClips()
-        else
-            assert(false, "Unknown selection method.")
-        end
-        
-        for _, media_pool_item in pairs(selected_clips) do
-            -- Check if it's a timeline
-            if type(media_pool_item) == nil or type(media_pool_item) == "number" then
-                print("Skipping", media_pool_item)
-            elseif media_pool_item:GetClipProperty("Type") == "Timeline" then
-                desired_timeline_name = media_pool_item:GetName()
-                curr_timeline = project_timelines[desired_timeline_name]
-
-                num_tracks = curr_timeline:GetTrackCount("video")
-                for track_idx = 1, num_tracks do
-                    track_items = curr_timeline:GetItemListInTrack("video", track_idx)
-                    for _, track_item in pairs(track_items) do
-                        if (track_item == nil or type(track_item) == "number") then
-                            print("Skipping ", track_item)
-                        elseif allow_disabled_clips or track_item:GetClipEnabled() then
-                            -- Add clip and clipinfo to clips.
-                            if (track_item:GetMediaPoolItem() == nil) then
-                                print("could not retrieve media item for clip ", track_item:GetName())
-                            else
-                                media_item = track_item:GetMediaPoolItem()
-                                id = media_item:GetMediaId()
-                                local start_frame = track_item:GetSourceStartFrame()
-                                local end_frame = track_item:GetSourceEndFrame()
-                                if clips[id] == nil then
-                                    clips[id] = {}
-                                end
-                                clip_info = {
-                                    mediaPoolItem = media_item,
-                                    startFrame = start_frame,
-                                    endFrame = end_frame,
-                                    timelineInpoint = track_item:GetStart() -- Store the inpoint on timeline for sorting
-                                }
-                                clips[id][#clips[id] + 1] = clip_info
-                            end
-                        end
-                    end
+            if selected_bin then
+                local bin_clips = selected_bin:GetClipList()
+                if bin_clips then
+                    selected_clips = bin_clips
                 end
             end
+        elseif itm.selectionMethod.CurrentText == "Current Selection" then
+            local sel_clips = media_pool:GetSelectedClips()
+            if sel_clips then
+                selected_clips = sel_clips
+            end
+        else
+            print("Unknown selection method.")
+            return
+        end
+
+        -- Check if we have any clips to process
+        local has_clips = false
+        for _, _ in pairs(selected_clips) do
+            has_clips = true
+            break
+        end
+
+        if not has_clips then
+            print("No clips selected or found in bin. Please select clips or timelines.")
+            return
+        end
+
+        print("Processing selected clips...")
+        
+        -- Process each selected clip
+        for _, media_pool_item in pairs(selected_clips) do
+            -- Skip invalid items
+            if type(media_pool_item) == "nil" or type(media_pool_item) == "number" then
+                print("Skipping invalid item")
+                goto continue
+            end
+            
+            -- Try to get clip property to check if it's a timeline
+            local clip_type = ""
+            pcall(function() clip_type = media_pool_item:GetClipProperty("Type") end)
+            
+            if clip_type == "Timeline" then
+                local timeline_name = media_pool_item:GetName()
+                print("Processing timeline: " .. timeline_name)
+                
+                local curr_timeline = project_timelines[timeline_name]
+                if not curr_timeline then
+                    print("Timeline not found in project: " .. timeline_name)
+                    goto continue
+                end
+                
+                local num_tracks = curr_timeline:GetTrackCount("video")
+                for track_idx = 1, num_tracks do
+                    local track_items = curr_timeline:GetItemListInTrack("video", track_idx)
+                    if not track_items then
+                        print("No items in track " .. track_idx)
+                        goto continue_track
+                    end
+                    
+                    for item_index, track_item in ipairs(track_items) do
+                        -- Check item validity with more detailed reporting
+                        if not track_item then
+                            print("Track item #" .. item_index .. " is nil")
+                            goto continue_item
+                        end
+                        
+                        -- Try to get name for better error reporting
+                        local item_name = "Unknown"
+                        pcall(function() item_name = track_item:GetName() end)
+                        
+                        -- Print detailed information about the clip
+                        print("Processing item #" .. item_index .. ": " .. item_name)
+                        
+                        -- Check if clip is enabled
+                        local is_enabled = true
+                        pcall(function() is_enabled = track_item:GetClipEnabled() end)
+                        
+                        if allow_disabled_clips or is_enabled then
+                            local media_item = nil
+                            local get_media_success = pcall(function() 
+                                media_item = track_item:GetMediaPoolItem() 
+                            end)
+                            
+                            if not get_media_success or not media_item then
+                                print("  Could not retrieve media item for clip: " .. item_name)
+                                goto continue_item
+                            end
+                            
+                            local id = nil
+                            local get_id_success = pcall(function() id = media_item:GetMediaId() end)
+                            
+                            if not get_id_success or not id then
+                                print("  Could not retrieve media ID for clip: " .. item_name)
+                                goto continue_item
+                            end
+                            
+                            -- Get source frame range
+                            local start_frame, end_frame
+                            local frame_success = pcall(function()
+                                start_frame = track_item:GetSourceStartFrame()
+                                end_frame = track_item:GetSourceEndFrame() - 1
+                            end)
+                            
+                            if not frame_success or not start_frame or not end_frame then
+                                print("  Could not retrieve frame range for clip: " .. item_name)
+                                goto continue_item
+                            end
+                            
+                            -- Check if reversed
+                            local is_reversed = start_frame > end_frame
+                            
+                            -- Always create clip info regardless of reversed status
+                            if is_reversed then
+                                print("  FOUND REVERSED CLIP: " .. item_name)
+                                print("  Source frames: " .. start_frame .. " to " .. end_frame)
+                            end
+                            
+                            if not clips[id] then
+                                clips[id] = {}
+                            end
+                            
+                            -- Check if clip is retimed (before adding to tracking table)
+                            local is_retimed = false
+                            local retime_percentage = nil
+                            
+                            if mark_retimed_clips then
+                                -- Create temporary clip data structure for retime check
+                                local temp_clip = {
+                                    clip = track_item,
+                                    mediaPoolItem = media_item,
+                                    name = item_name,
+                                    startFrame = track_item:GetStart(),
+                                    trackIndex = track_idx
+                                }
+                                
+                                -- Check if retimed using the same detection function
+                                is_retimed = isClipRetimed(temp_clip)
+                                if is_retimed then
+                                    print("  FOUND RETIMED CLIP: " .. item_name)
+                                    if temp_clip.retimePercentage then
+                                        print("  Speed: " .. temp_clip.retimePercentage .. "%")
+                                        retime_percentage = temp_clip.retimePercentage
+                                    end
+                                end
+                            end
+                            
+                            -- Create the clip info with the original frame values
+                            local clip_info = {
+                                mediaPoolItem = media_item,
+                                startFrame = start_frame,
+                                endFrame = end_frame,
+                                timelineInpoint = track_item:GetStart(),
+                                isReversed = is_reversed,
+                                isRetimed = is_retimed,
+                                retimePercentage = retime_percentage
+                            }
+                            
+                            -- Always add the clip to our tracking table
+                            table.insert(clips[id], clip_info)
+                            print("  Added clip to processing list: " .. item_name .. 
+                                  " (Start: " .. start_frame .. ", End: " .. end_frame .. ")")
+                        else
+                            print("  Skipping disabled clip: " .. item_name)
+                        end
+                        
+                        ::continue_item::
+                    end
+                    
+                    ::continue_track::
+                end
+            else
+                print("Skipping non-timeline item: " .. media_pool_item:GetName())
+            end
+            
+            ::continue::
+        end
+
+        if next(clips) == nil then
+            print("No valid clips found to process.")
+            return
         end
 
         print("Unmerged clips:")
         print_table(clips)
 
-        -- for each clips[id], merge clip_infos that are less than a certain amount of frames apart
+        -- For each clips[id], merge clip_infos that are less than a certain amount of frames apart
         for id, clip_infos in pairs(clips) do
             clips[id] = merge_clip_infos_if_close_all(clip_infos, connection_threshold)
         end
@@ -562,13 +829,6 @@ function main()
                 return a.timelineInpoint < b.timelineInpoint
             end)
         elseif sorting_method == "Reel Name" then
-            -- First, let's debug by printing the reel names
-            print("Sorting by Reel Name - showing all clip reel names:")
-            for i, clip_info in ipairs(all_clip_infos) do
-                local reel_name = clip_info.mediaPoolItem:GetClipProperty("Reel Name") or "NO_REEL_NAME"
-                print("Clip #" .. i .. ": " .. clip_info.mediaPoolItem:GetName() .. " - Reel Name: " .. reel_name)
-            end
-            
             -- Now sort by reel name, falling back to filename if no reel name is present
             table.sort(all_clip_infos, function(a, b)
                 local reel_name_a = a.mediaPoolItem:GetClipProperty("Reel Name") or ""
@@ -603,15 +863,6 @@ function main()
                     return a.timelineInpoint < b.timelineInpoint
                 end
             end)
-            
-            -- Print the sorted order for verification
-            print("After sorting - clips in sorted order:")
-            for i, clip_info in ipairs(all_clip_infos) do
-                local reel_name = clip_info.mediaPoolItem:GetClipProperty("Reel Name") or "NO_REEL_NAME"
-                local inpoint = clip_info.timelineInpoint or 0
-                print("Position #" .. i .. ": " .. clip_info.mediaPoolItem:GetName() .. 
-                      " - Reel Name: " .. reel_name .. " - Timeline Inpoint: " .. inpoint)
-            end
         elseif sorting_method == "None" then
             -- No sorting, leave in original order after merging
             print("No sorting applied")
@@ -627,9 +878,110 @@ function main()
         assert(project:SetCurrentTimeline(new_timeline), "couldn't set current timeline to the new timeline")
 
         -- Add clips in the sorted order
-        for _, clip_info in ipairs(all_clip_infos) do
-            media_pool:AppendToTimeline({clip_info})
+        local append_success_count = 0
+        local append_error_count = 0
+        
+        for i, clip_info in ipairs(all_clip_infos) do
+            print("Adding clip #" .. i .. " to timeline:")
+            print("  Clip name: " .. clip_info.mediaPoolItem:GetName())
+            print("  Frame range: " .. clip_info.startFrame .. " to " .. clip_info.endFrame)
+            
+            -- Add information about clip status
+            local status_info = ""
+            if clip_info.isReversed then
+                status_info = "REVERSED"
+            end
+            if clip_info.isRetimed then
+                if status_info ~= "" then
+                    status_info = status_info .. ", RETIMED"
+                else
+                    status_info = "RETIMED"
+                end
+            end
+            if status_info ~= "" then
+                print("  Special clip status: " .. status_info)
+            end
+            
+            -- For reversed clips, create a normalized version
+            if clip_info.isReversed then
+                print("  Using special handling for reversed clip")
+                
+                -- Create a new timeline item with the clip playing in reverse
+                local success = false
+                
+                -- Try different approaches
+                -- 1. First try: Swap start/end frames and preserve speed direction
+                local swap_approach = {
+                    mediaPoolItem = clip_info.mediaPoolItem,
+                    startFrame = clip_info.endFrame,  -- Swap start/end for reversed clip
+                    endFrame = clip_info.startFrame,
+                    importVideo = true,
+                    importAudio = true
+                }
+                
+                print("  Trying approach 1: Swapped start/end frames")
+                success = pcall(function() media_pool:AppendToTimeline({swap_approach}) end)
+                
+                -- 2. Second try: Use normalized frame range and apply speed change after
+                if not success then
+                    print("  Approach 1 failed, trying approach 2: Add normalized and modify speed")
+                    
+                    local normalized_info = {
+                        mediaPoolItem = clip_info.mediaPoolItem,
+                        startFrame = math.min(clip_info.startFrame, clip_info.endFrame),
+                        endFrame = math.max(clip_info.startFrame, clip_info.endFrame)
+                    }
+                    
+                    -- Add to timeline
+                    success = pcall(function() 
+                        media_pool:AppendToTimeline({normalized_info})
+                        
+                        -- Try to get the added clip and modify its speed
+                        local new_timeline = project:GetCurrentTimeline()
+                        if new_timeline then
+                            local tracks = new_timeline:GetTrackCount("video")
+                            if tracks > 0 then
+                                local items = new_timeline:GetItemListInTrack("video", 1)
+                                if items and #items > 0 then
+                                    local latest_item = items[#items] -- Get most recently added item
+                                    if latest_item then
+                                        -- Try to set speed to negative to play in reverse
+                                        latest_item:SetClipProperty("Speed", "-100")
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                end
+                
+                -- 3. Last resort: Try with original values
+                if not success then
+                    print("  Approach 2 failed, trying original values as last resort")
+                    success = pcall(function() media_pool:AppendToTimeline({clip_info}) end)
+                end
+                
+                if success then
+                    print("  Successfully added reversed clip")
+                    append_success_count = append_success_count + 1
+                else
+                    print("  Failed to add reversed clip after all attempts")
+                    append_error_count = append_error_count + 1
+                end
+            else
+                -- For normal clips, use standard approach
+                local success = pcall(function() media_pool:AppendToTimeline({clip_info}) end)
+                
+                if success then
+                    append_success_count = append_success_count + 1
+                else
+                    print("  Failed to add normal clip: " .. clip_info.mediaPoolItem:GetName())
+                    append_error_count = append_error_count + 1
+                end
+            end
         end
+        
+        print("Clip addition summary: " .. append_success_count .. " succeeded, " .. 
+              append_error_count .. " failed")
 
         print("New timeline created: " .. dst_timeline_name)
         
@@ -643,6 +995,57 @@ function main()
         if mark_duplicates then
             print("Marking duplicates in the new timeline...")
             findAndMarkDuplicates(new_timeline)
+        end
+        
+        -- Mark retimed clips if option is selected
+        if mark_retimed_clips then
+            print("Marking retimed clips in the new timeline...")
+            local clipList = getAllClips(new_timeline)
+            local markerCount = 0
+            local successCount = 0
+            
+            -- Loop through all clips on the new timeline
+            for i, timeline_clip in ipairs(clipList) do
+                -- Find the matching original clip_info to determine if it was retimed
+                local isMatched = false
+                for _, clip_info in ipairs(all_clip_infos) do
+                    if timeline_clip.mediaPoolItem:GetName() == clip_info.mediaPoolItem:GetName() and
+                       timeline_clip.clip:GetSourceStartFrame() >= math.min(clip_info.startFrame, clip_info.endFrame) and
+                       timeline_clip.clip:GetSourceEndFrame() <= math.max(clip_info.startFrame, clip_info.endFrame) + 1 then
+                        
+                        -- If the original clip was marked retimed, mark this clip too
+                        if clip_info.isRetimed then
+                            -- Add marker to the TimelineItem at 50% of the clip duration
+                            local sourceStartFrame = timeline_clip.clip:GetSourceStartFrame()
+                            local clipDuration = timeline_clip.clip:GetDuration()
+                            local markerPosition = sourceStartFrame + math.floor(clipDuration * 0.5)
+                            
+                            -- Use red color for retimed clips
+                            local markerText = "Retimed Clip"
+                            local speedValue = clip_info.retimePercentage or "Unknown"
+                            
+                            local success = pcall(function() 
+                                return timeline_clip.clip:AddMarker(markerPosition, "Red", markerText, 
+                                                 "Manual check recommended. Speed: " .. tostring(speedValue) .. "%", 1, "")
+                            end)
+                            
+                            markerCount = markerCount + 1
+                            
+                            if success then
+                                successCount = successCount + 1
+                                print("  Added retime marker to clip: " .. timeline_clip.name)
+                            else
+                                print("  Failed to add retime marker to clip: " .. timeline_clip.name)
+                            end
+                            
+                            isMatched = true
+                            break
+                        end
+                    end
+                end
+            end
+            
+            print("Successfully added " .. successCount .. " retime markers out of " .. markerCount .. " attempts.")
         end
 
         print("Done!")
