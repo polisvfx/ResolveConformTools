@@ -62,8 +62,8 @@ function AddMarker(item, markerName, markerColor)
     local sourceStartFrame = item:GetSourceStartFrame() 
     local clipDuration = item:GetDuration()
     
-    -- Calculate 50% of the clip duration
-    local offsetFrame = math.floor(clipDuration * 0.5)
+    -- Calculate 75% of the clip duration
+    local offsetFrame = math.floor(clipDuration * 0.75)
     
     -- Calculate marker position by adding source start frame and offset
     local markerPosition = sourceStartFrame + offsetFrame
@@ -329,7 +329,7 @@ function Main()
             else
                 -- Shot already has value, determine marker color based on if values match
                 local markerShotValue = string.format(formatString, shotNumber)
-                local markerColor = "Red" -- Default color
+                local markerColor = "Orange" -- Default color
                 
                 -- If the current Shot value equals what would be assigned, use green marker
                 if currentShot == markerShotValue then
