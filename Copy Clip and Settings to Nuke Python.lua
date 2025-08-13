@@ -1,6 +1,6 @@
 -- User editable variables
-local DEFAULT_HANDLES = 15          -- Default number of handles to add
-local DEFAULT_COLORSPACE = "ARRI LogC4" -- Default colorspace for Read node
+local DEFAULT_HANDLES = 12          -- Default number of handles to add
+local DEFAULT_COLORSPACE = "ARRI LogC3 (EI800)" -- Default colorspace for Read node
 -- You can change these values to your preferences
 
 -- Get the current project
