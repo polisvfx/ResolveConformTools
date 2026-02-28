@@ -1,8 +1,11 @@
 --[[
 Timeline Duplicate Clip Marker - DaVinci Resolve Script
-This script scans the current timeline for duplicate clips and 
-marks them with colored markers to easily identify them.
+Version: 1.2 (Corrected Marker Placement)
+
+This script scans the current timeline for duplicate clips (including image sequences)
+and marks them with colored markers to easily identify them.
 Each set of duplicates gets its own color for easy identification.
+Markers are placed at 25% of the clip's duration *within its visible range on the timeline*.
 ]]
 
 -- Import the required modules
@@ -17,172 +20,182 @@ local colors = {
     "Red", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "Fuchsia"
 }
 
--- Function to determine if two clips are duplicates
-function areClipsDuplicates(clip1, clip2)
-    -- Check if they reference the same media
-    local path1 = clip1.mediaPoolItem:GetClipProperty("File Path")
-    local path2 = clip2.mediaPoolItem:GetClipProperty("File Path")
-    
-    -- Compare file paths and ensure they're not the same instance
-    if path1 and path2 and path1 == path2 then
-        -- Ensure they're not the same clip instance
-        if clip1.startFrame ~= clip2.startFrame or 
-           clip1.trackIndex ~= clip2.trackIndex then
+-- Function to determine if two clips are duplicates (Same as previous version 1.1)
+function areClipsDuplicates(clipInfo1, clipInfo2)
+    if not clipInfo1.mediaPoolItem or not clipInfo2.mediaPoolItem then
+        -- print("  Skipping comparison: One or both clips lack MediaPoolItem.") -- Less verbose
+        return false
+    end
+    if clipInfo1.mediaPoolItem == clipInfo2.mediaPoolItem then
+        if clipInfo1.clip:GetStart() ~= clipInfo2.clip:GetStart() or
+           clipInfo1.trackIndex ~= clipInfo2.trackIndex then
+             -- print("  Match found based on MediaPoolItem reference.") -- Less verbose
             return true
         end
     end
-    
-    -- Fallback: Check if names match (less reliable)
-    if clip1.name == clip2.name and clip1.name ~= "" then
-        if clip1.startFrame ~= clip2.startFrame or 
-           clip1.trackIndex ~= clip2.trackIndex then
+    -- Fallback check (less likely needed but safe)
+    local mediaId1 = clipInfo1.mediaPoolItem:GetMediaId()
+    local mediaId2 = clipInfo2.mediaPoolItem:GetMediaId()
+    if mediaId1 and mediaId2 and mediaId1 == mediaId2 and mediaId1 ~= "" then
+        if clipInfo1.clip:GetStart() ~= clipInfo2.clip:GetStart() or
+           clipInfo1.trackIndex ~= clipInfo2.trackIndex then
+            -- print("  Match found based on MediaID.") -- Less verbose
             return true
         end
     end
-    
     return false
 end
 
--- Function to get all clips from the timeline
+
+-- Function to get all clips from the timeline (Same as previous version 1.1)
 function getAllClips()
     local clipList = {}
     if timeline then
         local tracksCount = timeline:GetTrackCount("video")
-        print("Found " .. tracksCount .. " video tracks")
-        
+        print("Scanning " .. tracksCount .. " video tracks...")
+
         for trackIndex = 1, tracksCount do
-            local clips = timeline:GetItemListInTrack("video", trackIndex)
-            if clips then
-                print("Track " .. trackIndex .. ": Found " .. #clips .. " clips")
-                
-                for clipIndex, clip in ipairs(clips) do
+            local clipsInTrack = timeline:GetItemListInTrack("video", trackIndex)
+            if clipsInTrack then
+                -- print("Track " .. trackIndex .. ": Found " .. #clipsInTrack .. " clips") -- Less verbose
+
+                for clipIndex, clip in ipairs(clipsInTrack) do
                     local mediaPoolItem = clip:GetMediaPoolItem()
                     if mediaPoolItem then
-                        local filePath = mediaPoolItem:GetClipProperty("File Path")
-                        print("Clip " .. clipIndex .. " on track " .. trackIndex .. ": " .. clip:GetName())
-                        print("  File Path: " .. (filePath or "N/A"))
-                        
+                        local clipName = clip:GetName()
                         table.insert(clipList, {
                             clip = clip,
                             mediaPoolItem = mediaPoolItem,
-                            startFrame = clip:GetStart(),
-                            name = clip:GetName(),
+                            startFrame = clip:GetStart(), -- Timeline start frame
+                            name = clipName,
                             trackIndex = trackIndex
                         })
                     else
-                        print("Clip " .. clipIndex .. " on track " .. trackIndex .. " has no media pool item")
+                         -- Print only if verbose debugging is needed
+                         -- print("  Clip " .. clipIndex .. " on track " .. trackIndex .. " ('" .. clip:GetName() .."') has no associated Media Pool item. Skipping.")
                     end
                 end
-            else
-                print("No clips found in track " .. trackIndex)
             end
         end
     end
-    
-    print("Total clips found: " .. #clipList)
+
+    print("Total valid clips collected for analysis: " .. #clipList)
     return clipList
 end
 
+
 -- Main function to find and mark duplicates
 function findAndMarkDuplicates()
-    -- Check if we have an active timeline
     if not timeline then
-        print("No timeline is open. Please open a timeline.")
+        print("ERROR: No timeline is open. Please open a timeline.")
         return
     end
-    
-    -- Get all clips from the timeline
+
     local clips = getAllClips()
-    if #clips == 0 then
-        print("No clips found in the timeline.")
+    if #clips < 2 then
+        print("Not enough clips found in the timeline to search for duplicates.")
         return
     end
-    
+
     print("Scanning for duplicates among " .. #clips .. " clips...")
-    
-    -- Find duplicates
+
     local duplicateSets = {}
-    local processedClips = {}
-    
+    local processedIndices = {}
+
     for i = 1, #clips do
-        if not processedClips[i] then
-            local currentSet = {clips[i]}
-            processedClips[i] = true
-            
+        if not processedIndices[i] then
+            local currentSet = nil
             for j = i + 1, #clips do
-                if not processedClips[j] then
-                    print("Comparing clip " .. i .. " (" .. clips[i].name .. ") with clip " .. 
-                          j .. " (" .. clips[j].name .. ")")
-                          
+                if not processedIndices[j] then
                     if areClipsDuplicates(clips[i], clips[j]) then
-                        print("  MATCH FOUND!")
+                        if not currentSet then
+                            currentSet = { clips[i] }
+                            processedIndices[i] = true
+                        end
                         table.insert(currentSet, clips[j])
-                        processedClips[j] = true
+                        processedIndices[j] = true
                     end
                 end
             end
-            
-            if #currentSet > 1 then
+            if currentSet then
                 table.insert(duplicateSets, currentSet)
-                print("Found duplicate set with " .. #currentSet .. " clips")
+                -- print("Found duplicate set with " .. #currentSet .. " clips (Source: '" .. clips[i].name .."')") -- Less verbose
             end
         end
     end
-    
+
     -- Mark duplicates with colors
-    local markerCount = 0
-    local successCount = 0
-    
-    for setIndex, duplicateSet in ipairs(duplicateSets) do
-        local colorIndex = (setIndex - 1) % #colors + 1
-        local color = colors[colorIndex]
-        
-        print("Marking duplicate set " .. setIndex .. " with " .. #duplicateSet .. " clips (Color: " .. color .. ")")
-        
-        for i, clip in ipairs(duplicateSet) do
-            local markerText = "Dup Set #" .. setIndex .. " (" .. i .. "/" .. #duplicateSet .. ")"
-            
-            -- Add marker to the TimelineItem at 25% of the clip duration
-            local sourceStartFrame = clip.clip:GetSourceStartFrame()
-            local clipDuration = clip.clip:GetDuration()
-            local offsetFrame = math.floor(clipDuration * 0.25)  -- 25% of clip duration
-            local markerPosition = sourceStartFrame + offsetFrame
-            local success = clip.clip:AddMarker(markerPosition, color, markerText, "Duplicate clip detected", 1, "")
-            
-            markerCount = markerCount + 1
-            
-            if success then
-                successCount = successCount + 1
-                print("  Added marker to clip: " .. clip.name)
-            else
-                print("  Failed to add marker to clip: " .. clip.name)
-            end
-        end
-    end
-    
-    -- Show results
+    local totalMarkersAttempted = 0
+    local totalMarkersSucceeded = 0
+
     if #duplicateSets > 0 then
-        print("Found " .. #duplicateSets .. " sets of duplicates with " .. markerCount .. " total clips.")
-        print("Successfully added " .. successCount .. " markers out of " .. markerCount .. " attempts.")
-        
-        if successCount == 0 then
-            print("WARNING: Unable to add markers. This could be due to timeline permissions.")
-            print("Duplicate sets were found as follows:")
-            for i, set in ipairs(duplicateSets) do
-                local clipNames = {}
-                for j, clip in ipairs(set) do
-                    table.insert(clipNames, clip.name)
+        print("\nMarking " .. #duplicateSets .. " duplicate sets...")
+        for setIndex, duplicateSet in ipairs(duplicateSets) do
+            local colorIndex = (setIndex - 1) % #colors + 1
+            local color = colors[colorIndex]
+
+            print(string.format("Marking Set #%d (%d clips) with Color: %s", setIndex, #duplicateSet, color))
+
+            for i, clipInfo in ipairs(duplicateSet) do
+                local markerText = "Dup Set #" .. setIndex .. " (" .. i .. "/" .. #duplicateSet .. ")"
+                local markerNote = "Duplicate of source: " .. clipInfo.name
+
+                -- *** CORRECTED MARKER PLACEMENT LOGIC ***
+                local timelineDuration = clipInfo.clip:GetDuration()
+                local sourceStartFrame = clipInfo.clip:GetLeftOffset() -- Start frame within the source media
+
+                if timelineDuration and sourceStartFrame and timelineDuration > 0 then
+                    -- Calculate the offset *within the timeline duration*
+                    local offsetInTimeline = math.floor(timelineDuration * 0.25)
+
+                    -- Calculate the target frame *relative to the source media start*
+                    local markerFrameId = sourceStartFrame + offsetInTimeline
+
+                    -- Add the marker using the calculated source frame ID
+                    -- AddMarker(frameId, colorName, name, note, duration)
+                    local success = clipInfo.clip:AddMarker(markerFrameId, color, markerText, markerNote, 1)
+
+                    totalMarkersAttempted = totalMarkersAttempted + 1
+
+                    if success then
+                        totalMarkersSucceeded = totalMarkersSucceeded + 1
+                        print(string.format("  [%d/%d] Added marker to '%s' on T%d @ timeline %d (Source Frame: %d)",
+                                            i, #duplicateSet, clipInfo.name, clipInfo.trackIndex, clipInfo.clip:GetStart(), markerFrameId))
+                    else
+                        print(string.format("  [%d/%d] FAILED to add marker to '%s' on T%d @ timeline %d (Target Source Frame: %d)",
+                                            i, #duplicateSet, clipInfo.name, clipInfo.trackIndex, clipInfo.clip:GetStart(), markerFrameId))
+                    end
+                elseif not timelineDuration or timelineDuration <= 0 then
+                     print(string.format("  [%d/%d] Skipped marker for '%s' on T%d (0 or invalid duration: %s)",
+                                        i, #duplicateSet, clipInfo.name, clipInfo.trackIndex, tostring(timelineDuration)))
+                elseif not sourceStartFrame then
+                     print(string.format("  [%d/%d] Skipped marker for '%s' on T%d (Could not get source start frame)",
+                                        i, #duplicateSet, clipInfo.name, clipInfo.trackIndex))
                 end
-                print("Set #" .. i .. ": " .. table.concat(clipNames, ", "))
             end
         end
+
+        -- Show final results
+        print("\n--- Summary ---")
+        print("Found " .. #duplicateSets .. " sets of duplicate clips.")
+        print("Attempted to add " .. totalMarkersAttempted .. " markers.")
+        print("Successfully added " .. totalMarkersSucceeded .. " markers.")
+
+        if totalMarkersSucceeded < totalMarkersAttempted then
+            print("WARNING: Some markers could not be added. This might indicate issues like locked tracks, markers outside the valid source frame range, or other timeline problems.")
+        end
+         if totalMarkersSucceeded == 0 and totalMarkersAttempted > 0 then
+             print("ERROR: Failed to add any markers. Please check track locks, script permissions, and ensure clips have valid source ranges.")
+         end
+
     else
-        print("No duplicate clips were found.")
-        print("If you believe there are duplicates, check if:")
-        print("1. The duplicates have the same source file path or name")
-        print("2. The clips are on video tracks (audio duplicates are not detected)")
+        print("\n--- Summary ---")
+        print("No duplicate clips were found in the timeline.")
+        print("(Checked based on underlying Media Pool source items)")
     end
 end
 
--- Run the script
+-- Run the main function
+print("--- Starting Timeline Duplicate Clip Marker Script (v1.2) ---")
 findAndMarkDuplicates()
+print("--- Script Finished ---")

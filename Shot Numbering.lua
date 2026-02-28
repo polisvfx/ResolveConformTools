@@ -1,8 +1,13 @@
 #!/usr/bin/env lua
 
 -- Script to set Shot metadata field for clips in the timeline
--- Allows configuration of padding, increments, and whether to clear existing Shot values
--- Places markers at 50% of clip duration for clips that already have Shot metadata
+-- Version: 1.4 (Strict Sequential Numbering, Duplicates Marked)
+-- Assigns sequential shot numbers based strictly on timeline order.
+-- 'Shot' metadata is set ONLY on the first instance of each source clip encountered.
+-- Duplicate instances have their 'Shot' metadata UNCHANGED, but receive a marker
+-- showing the sequential number they consumed in the timeline order.
+-- Every clip consumes a number in the sequence.
+-- Allows configuration of padding, increments, and overwriting existing values.
 
 -- Get Resolve API and Fusion object
 local resolve = bmd.scriptapp("Resolve")
@@ -20,343 +25,268 @@ end
 
 local mediaPool = project:GetMediaPool()
 
--- Function to get all timeline items ordered by their position
+-- Function to get all timeline items ordered by their position (No changes needed)
 function GetOrderedTimelineItems()
     local trackTypes = {"video"}
     local allItems = {}
-    
-    -- Loop through track types
     for _, trackType in ipairs(trackTypes) do
         local trackCount = timeline:GetTrackCount(trackType)
-        
-        -- Process video tracks in reverse (higher tracks first)
         for trackIndex = trackCount, 1, -1 do
             local trackItems = timeline:GetItemListInTrack(trackType, trackIndex)
-            
-            -- Add track index and type information to each item
-            for _, item in ipairs(trackItems) do
-                table.insert(allItems, {
-                    item = item,
-                    start = item:GetStart(),
-                    trackType = trackType,
-                    trackIndex = trackIndex
-                })
+            if trackItems then
+                for _, item in ipairs(trackItems) do
+                    table.insert(allItems, {
+                        item = item,
+                        start = item:GetStart(),
+                        trackType = trackType,
+                        trackIndex = trackIndex
+                    })
+                end
             end
         end
     end
-    
-    -- Sort items by start frame first, then by track index (lower track index wins on tie)
     table.sort(allItems, function(a, b)
         if a.start == b.start then
             return a.trackIndex < b.trackIndex
         end
         return a.start < b.start
     end)
-    
     return allItems
 end
 
--- Function to add marker at 50% of clip length with specified color
-function AddMarker(item, markerName, markerColor)
-    -- Get source start frame and clip duration
-    local sourceStartFrame = item:GetSourceStartFrame() 
-    local clipDuration = item:GetDuration()
-    
-    -- Calculate 75% of the clip duration
-    local offsetFrame = math.floor(clipDuration * 0.75)
-    
-    -- Calculate marker position by adding source start frame and offset
-    local markerPosition = sourceStartFrame + offsetFrame
-    
-    -- Add the marker with specified color and "Shotnumber" as the note
-    local success = item:AddMarker(markerPosition, markerColor, markerName, "Shotnumber", 1)
-    
-    if success then
-        print(string.format("  Added %s marker '%s' at position %d", markerColor, markerName, markerPosition))
+-- CORRECTED AddMarker FUNCTION (No changes needed from v1.2)
+function AddMarker(item, markerName, markerColor, markerNote)
+    markerNote = markerNote or "Shotnumber Status" -- Default note if not provided
+    local sourceSegmentStartFrame = item:GetLeftOffset()
+    local timelineDuration = item:GetDuration()
+    if sourceSegmentStartFrame ~= nil and timelineDuration ~= nil and timelineDuration > 0 then
+        local offsetInTimeline = math.floor(timelineDuration * 0.75) -- 75% placement
+        local markerFrameId = sourceSegmentStartFrame + offsetInTimeline
+        -- AddMarker(frameId, colorName, name, note, duration)
+        local success = item:AddMarker(markerFrameId, markerColor, markerName, markerNote, 1)
+        if success then
+            -- Verbose logging can be enabled if needed
+            -- print(string.format("  Added %s marker '%s' at Source Frame %d", markerColor, markerName, markerFrameId))
+        else
+            print(string.format("  FAILED to add %s marker '%s' to clip '%s' at target Source Frame %d", markerColor, markerName, item:GetName(), markerFrameId))
+        end
+        return success
     else
-        print(string.format("  Failed to add %s marker to clip", markerColor))
+         -- Verbose logging can be enabled if needed
+         -- print(string.format("  Skipped adding marker '%s' to clip '%s' - Invalid duration/offset", markerName, item:GetName()))
+        return false
     end
-    
-    return success
 end
 
--- Function to clear all markers with the "Shotnumber" note
-function ClearShotNumberMarkers()
+
+-- Function to clear all markers with a specific note (No changes needed)
+function ClearMarkersByNote(noteToClear)
     local items = GetOrderedTimelineItems()
     local clearedCount = 0
-    
-    print("Clearing all Shot Number markers...")
-    
+    print(string.format("Clearing all markers with note '%s'...", noteToClear))
     for _, itemData in ipairs(items) do
         local timelineItem = itemData.item
-        
-        -- Get all markers on this clip
         local markers = timelineItem:GetMarkers()
-        
-        -- Check if we got any markers
-        if markers then
-            local markersDeleted = false
-            
-            -- Loop through all markers and delete those with "Shotnumber" note
-            for frameIdx, markerInfo in pairs(markers) do
-                if markerInfo.note == "Shotnumber" then
-                    timelineItem:DeleteMarkerAtFrame(frameIdx)
-                    markersDeleted = true
+        if type(markers) == "table" then
+            local markersDeletedOnThisClip = false
+            for frameId, markerInfo in pairs(markers) do
+                if markerInfo and markerInfo.note == noteToClear then
+                    if timelineItem:DeleteMarkerAtFrame(frameId) then
+                        markersDeletedOnThisClip = true
+                    else
+                         print(string.format("  WARNING: Failed to delete marker at frame %d from clip '%s'", frameId, timelineItem:GetName()))
+                    end
                 end
             end
-            
-            if markersDeleted then
-                clearedCount = clearedCount + 1
-            end
+            if markersDeletedOnThisClip then clearedCount = clearedCount + 1 end
         end
     end
-    
-    print(string.format("Completed: Cleared Shot Number markers from %d clips", clearedCount))
+    print(string.format("Completed: Cleared '%s' markers from %d clips", noteToClear, clearedCount))
     return clearedCount
 end
 
--- Function to clear all Shot metadata
+
+-- Function to clear all Shot metadata (No changes needed)
 function ClearAllShotMetadata()
     local items = GetOrderedTimelineItems()
     local clearedCount = 0
-    
-    print("Clearing all Shot metadata values...")
-    
+    print("Clearing all 'Shot' metadata values...")
     for _, itemData in ipairs(items) do
         local timelineItem = itemData.item
         local mediaPoolItem = timelineItem:GetMediaPoolItem()
-        
         if mediaPoolItem then
-            local metadata = mediaPoolItem:GetMetadata()
-            local currentShot = metadata["Shot"]
-            
-            if currentShot ~= nil and currentShot ~= "" then
-                mediaPoolItem:SetMetadata("Shot", "")
-                clearedCount = clearedCount + 1
-                print(string.format("  Cleared Shot value '%s' from clip '%s'", 
-                    currentShot, mediaPoolItem:GetName()))
+            local currentShot = mediaPoolItem:GetMetadata("Shot")
+            if currentShot and currentShot ~= "" then
+                if mediaPoolItem:SetMetadata("Shot", "") then
+                    clearedCount = clearedCount + 1
+                else
+                     print(string.format("  WARNING: Failed to clear Shot value '%s' from clip '%s'", currentShot, mediaPoolItem:GetName()))
+                end
             end
         end
     end
-    
     print(string.format("Completed: Cleared Shot metadata from %d clips", clearedCount))
     return clearedCount
 end
 
--- Function to show configuration dialog
+
+-- Function to show configuration dialog (Updated title/note)
 function ShowConfigDialog()
-    -- Create a new dialog window using Fusion UI Manager
     local ui = fusion.UIManager
     local disp = bmd.UIDispatcher(ui)
-    
-    -- Default values
-    local paddingValue = 4
-    local incrementValue = 10
-    local clearExistingValue = false
-    
-    local configWindow = disp:AddWindow({
-        WindowTitle = "Shot Number Configuration",
-        ID = "ConfigWin",
-        Geometry = { 100, 100, 400, 200 },
-        Spacing = 10,
-        
-        ui:VGroup{
-            ID = "root",
-            
-            -- Padding setting
-            ui:HGroup{
-                ui:Label{ ID = "PaddingLabel", Text = "Number Padding:" },
-                ui:SpinBox{ 
-                    ID = "PaddingInput", 
-                    Value = paddingValue, 
-                    Minimum = 1, 
-                    Maximum = 10,
-                    Events = { ValueChanged = true }
-                }
-            },
-            
-            -- Increment setting
-            ui:HGroup{
-                ui:Label{ ID = "IncrementLabel", Text = "Increment By:" },
-                ui:SpinBox{ 
-                    ID = "IncrementInput", 
-                    Value = incrementValue, 
-                    Minimum = 1, 
-                    Maximum = 100,
-                    Events = { ValueChanged = true }
-                }
-            },
-            
-            -- Clear Shot values option
-            ui:CheckBox{ 
-                ID = "ClearCheckBox", 
-                Text = "Overwrite Shot Numbers (clear existing values)", 
-                Checked = clearExistingValue,
-                Events = { Clicked = true }
-            },
-            
-            -- Spacing
-            ui:VGap(20),
-            
-            -- Buttons
-            ui:HGroup{
-                ui:Button{ ID = "CancelButton", Text = "Cancel" },
-                ui:Button{ ID = "OKButton", Text = "OK" }
-            }
+    local config = { padding = 4, increment = 10, clearExisting = false }
+    local result = nil
+    local win = disp:AddWindow({
+        WindowTitle = "Shot Number Configuration v1.4", ID = "ConfigWin", Geometry = { 100, 100, 420, 270 }, Spacing = 10, -- Wider/Taller
+        ui:VGroup{ ID = "root", Weight = 1.0,
+            ui:HGroup{ ui:Label{ Text = "Number Padding:", Weight = 0.3 }, ui:SpinBox{ ID = "PaddingInput", Value = config.padding, Minimum = 1, Maximum = 10, Weight = 0.7 } },
+            ui:HGroup{ ui:Label{ Text = "Increment By:", Weight = 0.3 }, ui:SpinBox{ ID = "IncrementInput", Value = config.increment, Minimum = 1, Maximum = 1000, Weight = 0.7 } },
+            ui:CheckBox{ ID = "ClearCheckBox", Text = "Overwrite existing 'Shot' metadata (on first instances)", Checked = config.clearExisting },
+            ui:VGap(10),
+            ui:Label{ Text = "Note: Sets 'Shot' metadata using a strict sequential number only on the FIRST instance of a source clip. Duplicates consume a number but get a marker instead; metadata is unchanged.", WordWrap = true},
+            ui:VGap(15),
+            ui:Button{ ID = "ClearMarkersButton", Text = "Clear 'Shotnumber Status' Markers Now" },
+            ui:VGap(15),
+            ui:HGroup{ Weight = 0, ui:Button{ ID = "CancelButton", Text = "Cancel" }, ui:Button{ ID = "OKButton", Text = "Run Numbering" } }
         }
     })
-    
-    -- Configuration result to return
-    local result = nil
-    
-    -- Event handlers for input changes
-    function configWindow.On.PaddingInput.ValueChanged(ev)
-        paddingValue = ev.Value
+    local itm = win:GetItems()
+    function win.On.ConfigWin.Close(ev) disp:ExitLoop() end
+    function win.On.CancelButton.Clicked(ev) result = nil; disp:ExitLoop() end
+    function win.On.OKButton.Clicked(ev)
+        config.padding = itm.PaddingInput.Value; config.increment = itm.IncrementInput.Value; config.clearExisting = itm.ClearCheckBox.Checked
+        result = config; disp:ExitLoop()
     end
-    
-    function configWindow.On.IncrementInput.ValueChanged(ev)
-        incrementValue = ev.Value
+    function win.On.ClearMarkersButton.Clicked(ev)
+        print("\n--- Clearing Markers via Button ---")
+        local cleared = ClearMarkersByNote("Shotnumber Status")
+        itm.ClearMarkersButton.Text = string.format("Cleared Status Markers (%d clips)", cleared)
+        print("--- Marker Clearing Complete ---")
     end
-    
-    function configWindow.On.ClearCheckBox.Clicked(ev)
-        clearExistingValue = not clearExistingValue
-        print("Checkbox clicked - new value:", clearExistingValue)
-    end
-    
-    -- Function to handle the window closed event
-    function configWindow.On.ConfigWin.Close(ev)
-        disp:ExitLoop()
-    end
-    
-    -- Function to handle the Cancel button
-    function configWindow.On.CancelButton.Clicked(ev)
-        result = nil
-        configWindow:Hide()
-        disp:ExitLoop()
-    end
-    
-    -- Function to handle the OK button
-    function configWindow.On.OKButton.Clicked(ev)
-        -- Debug print for checkbox state
-        print("Checkbox state before storing result:", clearExistingValue)
-        
-        -- Store result using the current values
-        result = {
-            padding = paddingValue,
-            increment = incrementValue,
-            clearExisting = clearExistingValue
-        }
-        
-        -- Debug print for result
-        print("Stored in result:", result.clearExisting)
-        
-        -- Hide the window and exit loop
-        configWindow:Hide()
-        disp:ExitLoop()
-    end
-    
-    -- Show the window and run the event loop
-    configWindow:Show()
-    disp:RunLoop()
-    
-    -- Return the configuration values
+    win:Show(); disp:RunLoop(); win:Hide()
     return result
 end
 
--- Main script execution
+
+-- *** REVISED Main script execution (Strict Sequential, Duplicates Marked) ***
 function Main()
-    -- Show configuration dialog to get user settings
     local config = ShowConfigDialog()
-    
-    -- If user canceled, exit
-    if config == nil then
-        print("Operation canceled by user")
-        return false
-    end
-    
-    -- Apply configuration
+    if config == nil then print("\nOperation canceled by user."); return false end
+
     local padding = config.padding
     local shotStep = config.increment
     local clearExisting = config.clearExisting
-    
-    -- Debug config values
-    print("\nConfiguration:")
-    print(string.format("  Padding: %d", padding))
-    print(string.format("  Increment: %d", shotStep))
-    print(string.format("  Clear Existing Shot Metadata: %s", clearExisting and "Yes" or "No"))
-    
-    -- Set up shot number format string based on padding
-    local formatString = "%0" .. padding .. "d"
-    
-    -- First, clear all Shot Number markers
-    ClearShotNumberMarkers()
-    
-    -- Clear Shot metadata if option is enabled
+    local formatString = "%0" .. tostring(padding) .. "d"
+    local markerNote = "Shotnumber Status"
+
+    print("\n--- Starting Shot Numbering (v1.4 - Strict Sequential, Duplicates Marked) ---")
+    print("Configuration:")
+    print(string.format("  Padding: %d, Increment: %d, Overwrite Existing (First Instances): %s", padding, shotStep, clearExisting and "Yes" or "No"))
+
     if clearExisting then
-        print("\nClearing all existing Shot metadata as requested...")
         ClearAllShotMetadata()
+        -- ClearMarkersByNote(markerNote) -- Optional
     else
-        print("\nPreserving existing Shot metadata as requested")
+        print("\nPreserving existing 'Shot' metadata where found.")
     end
-    
-    -- Now process clips to set new Shot values
+
     local items = GetOrderedTimelineItems()
-    local shotNumber = shotStep -- Start with the same value as increment (e.g., 5, 10, etc.)
-    local modifiedCount = 0
-    local skippedCount = 0
-    
-    print("\nProcessing " .. #items .. " timeline items for Shot assignment...")
-    print(string.format("Using padding: %d, increment: %d", padding, shotStep))
-    print(string.format("Starting number: %s", string.format(formatString, shotNumber)))
-    
+    if #items == 0 then print("\nNo video clips found on the timeline."); return false end
+
+    -- Tracks MediaPoolItems already processed to identify first instances
+    local processedMediaPoolItems = {} -- Key: mediaPoolItem, Value: true
+
+    -- SINGLE counter for the sequential number based on timeline position
+    local currentShotNumberValue = shotStep
+
+    local modifiedCount = 0       -- Metadata was set/changed (on first instances)
+    local duplicateMarkerCount = 0  -- Marker added for a duplicate instance
+    local firstInstanceSkippedCount = 0 -- First instance skipped due to existing value (clearExisting=false)
+    local firstInstanceMarkerCount = 0 -- Markers added to first instances (Green/Red for skipped)
+
+    print(string.format("\nProcessing %d timeline items...", #items))
+    print(string.format("Using format: '%s', Starting number: %s", formatString, string.format(formatString, currentShotNumberValue)))
+
     for i, itemData in ipairs(items) do
         local timelineItem = itemData.item
         local mediaPoolItem = timelineItem:GetMediaPoolItem()
-        
+
+        -- Calculate the sequential number string for THIS clip position
+        local currentSequentialShotString = string.format(formatString, currentShotNumberValue)
+
         if mediaPoolItem then
-            -- Check if Shot metadata is already set
-            local metadata = mediaPoolItem:GetMetadata()
-            local currentShot = metadata["Shot"]
-            
-            if currentShot == nil or currentShot == "" then
-                -- Format shot number with configured padding
-                local shotValue = string.format(formatString, shotNumber)
-                mediaPoolItem:SetMetadata("Shot", shotValue)
-                modifiedCount = modifiedCount + 1
-                print(string.format("Set %s for clip '%s' (timeline pos: %d, track: %s%d)", 
-                    shotValue, mediaPoolItem:GetName(), timelineItem:GetStart(), 
-                    itemData.trackType, itemData.trackIndex))
-            else
-                -- Shot already has value, determine marker color based on if values match
-                local markerShotValue = string.format(formatString, shotNumber)
-                local markerColor = "Orange" -- Default color
-                
-                -- If the current Shot value equals what would be assigned, use green marker
-                if currentShot == markerShotValue then
-                    markerColor = "Green"
-                    print(string.format("Skipped clip '%s' - already has correct Shot value: '%s' (green marker added)", 
-                        mediaPoolItem:GetName(), currentShot))
+            local clipName = mediaPoolItem:GetName() or "Unnamed Clip"
+            local clipInfoStr = string.format("'%s' (T%d @ %d)", clipName, itemData.trackIndex, itemData.start)
+
+            -- === Check if this is the first time seeing this source clip ===
+            if not processedMediaPoolItems[mediaPoolItem] then
+                -- *** FIRST INSTANCE ***
+                processedMediaPoolItems[mediaPoolItem] = true -- Mark as seen
+
+                local currentShotMetadata = mediaPoolItem:GetMetadata("Shot")
+
+                if clearExisting or not currentShotMetadata or currentShotMetadata == "" then
+                    -- Assign current sequential number: Overwriting OR field was empty
+                    if mediaPoolItem:SetMetadata("Shot", currentSequentialShotString) then
+                        print(string.format("Set First Instance %s Shot to '%s'", clipInfoStr, currentSequentialShotString))
+                        modifiedCount = modifiedCount + 1
+                        -- Optional: Add "New" marker (Blue)
+                        -- if AddMarker(timelineItem, currentSequentialShotString, "Blue", markerNote) then firstInstanceMarkerCount = firstInstanceMarkerCount + 1 end
+                    else
+                        print(string.format("WARNING: Failed to set first instance %s Shot to '%s'", clipInfoStr, currentSequentialShotString))
+                        -- Optional: Add "Error" marker (Orange)
+                        -- if AddMarker(timelineItem, currentSequentialShotString, "Orange", markerNote) then firstInstanceMarkerCount = firstInstanceMarkerCount + 1 end
+                    end
                 else
-                    print(string.format("Skipped clip '%s' - has different Shot value: '%s' vs new '%s' (red marker added)", 
-                        mediaPoolItem:GetName(), currentShot, markerShotValue))
+                    -- Preserve existing number on first instance
+                    firstInstanceSkippedCount = firstInstanceSkippedCount + 1
+                    local markerColor = "Orange" -- Default for skipped/preserved
+
+                    if currentShotMetadata == currentSequentialShotString then
+                        markerColor = "Green" -- Matches the sequential number it *would* have received
+                        print(string.format("Skipped First Instance %s - Preserved correct Shot: '%s' (Added Green marker)", clipInfoStr, currentShotMetadata))
+                    else
+                        markerColor = "Red" -- Preserved, but *doesn't* match the sequence this time
+                        print(string.format("Skipped First Instance %s - Preserved different Shot: '%s' (sequential #: '%s') (Added Red marker)", clipInfoStr, currentShotMetadata, currentSequentialShotString))
+                    end
+                    -- Add marker indicating status, showing preserved value
+                    if AddMarker(timelineItem, currentShotMetadata .. " (Preserved)", markerColor, markerNote) then
+                        firstInstanceMarkerCount = firstInstanceMarkerCount + 1
+                    end
                 end
-                
-                -- Add the marker with appropriate color
-                AddMarker(timelineItem, markerShotValue, markerColor)
-                skippedCount = skippedCount + 1
+            else
+                -- *** DUPLICATE INSTANCE ***
+                print(string.format("Duplicate Instance %s - Metadata unchanged. Adding marker with sequential number '%s'", clipInfoStr, currentSequentialShotString))
+                duplicateMarkerCount = duplicateMarkerCount + 1
+
+                -- ** Do NOT modify 'Shot' metadata **
+
+                -- Add marker showing the sequential number this duplicate consumed
+                if not AddMarker(timelineItem, currentSequentialShotString, "Cyan", markerNote .. " - Duplicate") then
+                     print(string.format("  WARNING: Failed to add duplicate marker to %s", clipInfoStr))
+                end
             end
         else
-            print("Warning: Couldn't find media pool item for a timeline item")
+             print(string.format("Warning: Skipping item at T%d @ %d - Could not get Media Pool Item.", itemData.trackIndex, itemData.start))
+             -- Still consumes a number in the sequence
         end
-        
-        -- Increment shot number for next item
-        shotNumber = shotNumber + shotStep
-    end
-    
-    print(string.format("\nCompleted: %d clips modified, %d clips skipped (already had Shot metadata)", 
-        modifiedCount, skippedCount))
+
+        -- ** Increment the sequential number counter for the NEXT clip **
+        currentShotNumberValue = currentShotNumberValue + shotStep
+
+    end -- End of loop through items
+
+    print("\n--- Shot Numbering Summary ---")
+    print(string.format("Clips processed: %d", #items))
+    print(string.format("  'Shot' metadata set/overwritten (on first instances): %d", modifiedCount))
+    print(string.format("  First instances skipped (metadata preserved): %d", firstInstanceSkippedCount))
+    print(string.format("  Markers added for duplicate instances: %d", duplicateMarkerCount))
+    print(string.format("  Markers added for skipped first instances: %d", firstInstanceMarkerCount))
+    print(string.format("  Total markers added: %d", duplicateMarkerCount + firstInstanceMarkerCount))
+
     return true
 end
 
 -- Run the script
 Main()
+print("\n--- Script Finished ---")
