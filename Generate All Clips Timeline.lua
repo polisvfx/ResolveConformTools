@@ -92,6 +92,7 @@ function merge_clip_infos(clip_info_a, clip_info_b)
         isReversed = clip_info_a.isReversed or clip_info_b.isReversed,
         isRetimed = clip_info_a.isRetimed or clip_info_b.isRetimed,
         isFrameHold = (clip_info_a.isFrameHold and clip_info_b.isFrameHold) or false,
+        isNonLinearRetime = clip_info_a.isNonLinearRetime or clip_info_b.isNonLinearRetime or false,
         retimePercentage = clip_info_a.retimePercentage or clip_info_b.retimePercentage
     }
 end
@@ -354,22 +355,30 @@ function checkRetimeProperties(clip)
     -- Check for retiming property
     local speed = nil
     local success = pcall(function() speed = tonumber(clip.clip:GetClipProperty("Speed")) end)
-    
+
     -- If speed is not 100% (normal speed), it's retimed
     if success and speed and speed ~= 100.0 then
         print("Detected retimed clip via property: " .. clip.name .. " with speed: " .. speed .. "%")
         clip.retimePercentage = speed -- Store for marker text
         return true
     end
-    
-    -- Check if any other retiming attributes are present
+
+    -- Check for non-linear retime (speed curve/ramp)
+    local retimeCurve = nil
+    pcall(function() retimeCurve = clip.clip:GetClipProperty("Retime Curve") end)
+    if retimeCurve and retimeCurve ~= "" and retimeCurve ~= "None" then
+        print("Detected non-linear retimed clip via Retime Curve: " .. clip.name .. " (" .. retimeCurve .. ")")
+        clip.isNonLinearRetime = true
+        return true
+    end
+
+    -- Check other retiming attributes
     local retiming_attributes = {
-        "Retime Process", -- Check for alternative retime processes
-        "Motion Estimation", -- Motion estimation settings
-        "Frame Interpolation", -- Optical flow, nearest, etc.
-        "Retime Curve" -- Custom speed curve
+        "Retime Process",
+        "Motion Estimation",
+        "Frame Interpolation",
     }
-    
+
     for _, attr in ipairs(retiming_attributes) do
         local value = nil
         local attr_success = pcall(function() value = clip.clip:GetClipProperty(attr) end)
@@ -378,7 +387,7 @@ function checkRetimeProperties(clip)
             return true
         end
     end
-    
+
     return false
 end
 
@@ -732,6 +741,7 @@ function main()
 
                             -- Check if clip is retimed (before adding to tracking table)
                             local is_retimed = false
+                            local is_non_linear_retime = false
                             local retime_percentage = nil
 
                             if is_frame_hold then
@@ -757,6 +767,10 @@ function main()
                                         print("  Speed: " .. temp_clip.retimePercentage .. "%")
                                         retime_percentage = temp_clip.retimePercentage
                                     end
+                                    if temp_clip.isNonLinearRetime then
+                                        is_non_linear_retime = true
+                                        print("  Non-linear retime (speed curve) detected")
+                                    end
                                 end
                             end
 
@@ -771,6 +785,7 @@ function main()
                                 isReversed = is_reversed,
                                 isRetimed = is_retimed,
                                 isFrameHold = is_frame_hold,
+                                isNonLinearRetime = is_non_linear_retime or false,
                                 retimePercentage = retime_percentage
                             }
 
@@ -904,6 +919,7 @@ function main()
             local status_parts = {}
             if clip_info.isReversed then table.insert(status_parts, "REVERSED") end
             if clip_info.isFrameHold then table.insert(status_parts, "FRAME HOLD") end
+            if clip_info.isNonLinearRetime then table.insert(status_parts, "NON-LINEAR RETIME") end
             if clip_info.isRetimed then table.insert(status_parts, "RETIMED") end
             if #status_parts > 0 then
                 print("  Original clip status: " .. table.concat(status_parts, ", "))
@@ -962,11 +978,17 @@ function main()
                             local clipDuration = timeline_clip.clip:GetDuration()
                             local markerPosition = sourceStartFrame + math.floor(clipDuration * 0.5)
 
-                            -- Distinguish frame holds from speed changes in marker text
+                            -- Distinguish frame holds, non-linear retimes, and linear retimes
                             local markerText, markerNote
                             if clip_info.isFrameHold then
                                 markerText = "Frame Hold"
                                 markerNote = "Source clip used a frame hold (freeze frame). Manual check recommended."
+                            elseif clip_info.isNonLinearRetime then
+                                markerText = "Non-Linear Retime"
+                                markerNote = "Speed curve/ramp detected. Source range may not cover all frames used. Manual check recommended."
+                                if clip_info.isReversed then
+                                    markerNote = markerNote .. " (originally reversed)"
+                                end
                             else
                                 local speedValue = clip_info.retimePercentage or "Unknown"
                                 markerText = "Retimed Clip"
