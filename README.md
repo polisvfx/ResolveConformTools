@@ -27,9 +27,16 @@ For each additional instance of a source clip, resolve will skip a count and add
 
 Once the script has run its course you could batch rename the clip events by selecting them and entering the Clip Attributes. There you would use any naming of your choice in combination with the %Shot token.
 
-If you are only using trims, duplicates shouldnt be of concern. 
+If you are only using trims, duplicates shouldnt be of concern.
 
 ![grafik](https://github.com/user-attachments/assets/46afb03e-5933-418f-8643-7c8608643081)
+
+### Shot Numbering - Clip Name (Resolve 20.2+)
+An alternative approach that uses the `TimelineItem:SetName()` API introduced in DaVinci Resolve 20.2 to apply sequential shot numbers directly to the clip name on the timeline. Unlike the metadata-based version, each timeline instance is renamed independently — duplicate source clips are not an issue.
+- Configurable prefix (default: `SH_`), padding, and increment
+- Option to append the original clip name as a suffix
+- Restore button to revert all timeline clips back to their original Media Pool names
+- Does not modify the source Media Pool item
 
 
 ## Copy to Nuke Simple
