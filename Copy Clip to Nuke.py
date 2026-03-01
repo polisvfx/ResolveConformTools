@@ -268,10 +268,26 @@ def get_selected_clip_data(timeline, selected_item) -> Optional[ClipData]:
 
     frame_match = re.search(r"\[(\d+)-(\d+)\]", nuke_path)
     if frame_match:
-        first_frame = int(frame_match.group(1))
-        last_frame = int(frame_match.group(2))
-        nuke_path = re.sub(r"\[\d+-\d+\]", "####", nuke_path)
+        first_str, last_str = frame_match.group(1), frame_match.group(2)
+        first_frame = int(first_str)
+        last_frame = int(last_str)
+        # Derive padding from the digit count (preserves leading zeros)
+        padding = max(len(first_str), len(last_str))
+        hashes = "#" * padding
+        nuke_path = re.sub(r"\[\d+-\d+\]", hashes, nuke_path)
     else:
+        # Try to detect a trailing frame number before the file extension
+        # e.g. "clip_name_100000.exr" -> "clip_name_######.exr"
+        num_match = re.search(r"(\d+)(?=\.\w+$)", nuke_path)
+        if num_match:
+            frame_str = num_match.group(1)
+            first_frame = int(frame_str)
+            padding = len(frame_str)
+            hashes = "#" * padding
+            nuke_path = (nuke_path[:num_match.start()]
+                         + hashes
+                         + nuke_path[num_match.end():])
+
         for prop in ("Frames", "Full Duration", "Duration"):
             val = media_pool_item.GetClipProperty(prop)
             if val:
