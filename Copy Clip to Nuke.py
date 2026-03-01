@@ -160,6 +160,16 @@ def save_settings(project, settings: NukeSettings) -> None:
         print(f"  Could not save settings: {e}")
 
 
+def has_saved_settings(project) -> bool:
+    """Check whether settings have been previously saved for this project."""
+    try:
+        key = _prefs_key(project)
+        fusion = resolve.Fusion()  # noqa: F821
+        return fusion.GetData(f"{key}.output_mode") is not None
+    except Exception:
+        return False
+
+
 def load_settings(project) -> NukeSettings:
     """Load previously saved settings for this project, falling back to defaults."""
     settings = NukeSettings()
@@ -894,4 +904,6 @@ def main():
     print(f"\n{'=' * 45}")
 
 
-main()
+# Guard: skip auto-execution when loaded by the Quick variant
+if not globals().get("_NUKE_EXPORT_IMPORTED"):
+    main()
