@@ -52,6 +52,11 @@ Features a UI dialog with configurable settings:
 
 Both modes create: Read node -> ModifyMetaData (reel name) -> ShotSetup group (frame range management, TimeOffset to rebase to frame 1001 +/- handles).
 
+Settings are remembered per-project across runs and even Resolve restarts.
+
+### Copy Clip to Nuke — Quick
+A companion script that skips the settings dialog entirely when settings have already been configured for the current project. On first use (no saved settings) it opens the full UI; after that it immediately copies to clipboard using the last-used settings. Use the main "Copy Clip to Nuke" script whenever you want to change settings.
+
 ### Legacy Lua Scripts (Deprecated)
 The original Lua scripts (`Copy Clip to Nuke Simple.lua` and `Copy Clip and Settings to Nuke Python.lua`) are still included but deprecated in favour of the unified Python version above.
 
