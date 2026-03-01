@@ -39,19 +39,23 @@ An alternative approach that uses the `TimelineItem:SetName()` API introduced in
 - Does not modify the source Media Pool item
 
 
-## Copy to Nuke Simple
-This grabs the selected clips filepath and edit information along with its reelname and puts it into the workstations clipboard in a Nuke-readable format. You can then simple paste it into your Nuke nodegraph.
+## Copy Clip to Nuke (Python)
+A unified Python rewrite that replaces both the old "Copy to Nuke Simple" and "Copy Clip and Settings to Nuke Python" Lua scripts. Copies the selected clip's file path, editorial data, and metadata to the clipboard in a Nuke-ready format.
 
-It also sets a readnode Input Transform, creates a group that makes sure the Clip starts at frame 1001 (+-Handles)
-Handles and Colorspace are exposed at the top of the script for you to edit to your liking.
+Features a UI dialog with configurable settings:
+- **Output Mode**: Python (Script Editor) or TCL (Node Graph Paste)
+- **Handles**: Configurable frame handles (default 12)
+- **Colorspace**: Dropdown presets (ARRI LogC4, LogC3, REDLog3G10, S-Log3, ACEScg, etc.) with a free-text field for custom values
+- **Format Name**: Name for the Nuke format entry (default "Plate")
+- **Set Project Settings**: Optionally sets Nuke project format, FPS, and frame range (Python mode only)
+- **Clear Existing Nodes**: Optional destructive clear of all nodes before setup (off by default)
 
-## Copy Clip and Settings to Nuke Python
-This is an advanced version that does the same as the simple version but also alters the Nuke Scripts settings: Plate Format, FPS, Framerange.
-Because of this functionality, the clipboard contents have to be copied into the script editor end run from there.
-This is mainly for setting up new scripts as it will override settings.
+Both modes create: Read node -> ModifyMetaData (reel name) -> ShotSetup group (frame range management, TimeOffset to rebase to frame 1001 +/- handles).
 
-It also sets a readnode Input Transform, creates a group that makes sure the Clip starts at frame 1001 (+-Handles)
-Handles and Colorspace are exposed at the top of the script for you to edit to your liking.
+Settings are remembered per-project across runs and even Resolve restarts.
+
+### Copy Clip to Nuke — Quick
+A companion script that skips the settings dialog entirely when settings have already been configured for the current project. On first use (no saved settings) it opens the full UI; after that it immediately copies to clipboard using the last-used settings. Use the main "Copy Clip to Nuke" script whenever you want to change settings.
 
 
 ## Future Features
