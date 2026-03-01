@@ -32,6 +32,8 @@ DEFAULT_COLORSPACE = "ARRI LogC4"
 DEFAULT_FORMAT_NAME = "Plate"
 DEFAULT_START_FRAME = 1001
 
+PREFS_KEY = "ResolveConformTools.CopyClipToNuke"
+
 COLORSPACE_PRESETS = [
     "ARRI LogC4",
     "ARRI LogC3 (EI800)",
@@ -125,6 +127,73 @@ def copy_to_clipboard(text: str) -> bool:
     except Exception as e:
         print(f"Error copying to clipboard: {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Settings Persistence (per-project via fu.SetData / fu.GetData)
+# ---------------------------------------------------------------------------
+
+def _prefs_key(project) -> str:
+    """Return a project-scoped preferences key."""
+    project_id = ""
+    try:
+        project_id = project.GetUniqueId()
+    except Exception:
+        pass
+    if project_id:
+        return f"{PREFS_KEY}.{project_id}"
+    return PREFS_KEY
+
+
+def save_settings(project, settings: NukeSettings) -> None:
+    """Persist the current UI settings for this project."""
+    try:
+        key = _prefs_key(project)
+        fusion = resolve.Fusion()  # noqa: F821
+        fusion.SetData(f"{key}.handles", settings.handles)
+        fusion.SetData(f"{key}.colorspace", settings.colorspace)
+        fusion.SetData(f"{key}.format_name", settings.format_name)
+        fusion.SetData(f"{key}.clear_existing_nodes", settings.clear_existing_nodes)
+        fusion.SetData(f"{key}.set_project_settings", settings.set_project_settings)
+        fusion.SetData(f"{key}.output_mode", settings.output_mode)
+    except Exception as e:
+        print(f"  Could not save settings: {e}")
+
+
+def load_settings(project) -> NukeSettings:
+    """Load previously saved settings for this project, falling back to defaults."""
+    settings = NukeSettings()
+    try:
+        key = _prefs_key(project)
+        fusion = resolve.Fusion()  # noqa: F821
+
+        val = fusion.GetData(f"{key}.handles")
+        if val is not None:
+            settings.handles = int(val)
+
+        val = fusion.GetData(f"{key}.colorspace")
+        if val is not None:
+            settings.colorspace = str(val)
+
+        val = fusion.GetData(f"{key}.format_name")
+        if val is not None:
+            settings.format_name = str(val)
+
+        val = fusion.GetData(f"{key}.clear_existing_nodes")
+        if val is not None:
+            settings.clear_existing_nodes = bool(val)
+
+        val = fusion.GetData(f"{key}.set_project_settings")
+        if val is not None:
+            settings.set_project_settings = bool(val)
+
+        val = fusion.GetData(f"{key}.output_mode")
+        if val is not None:
+            settings.output_mode = str(val)
+    except Exception as e:
+        print(f"  Could not load saved settings, using defaults: {e}")
+
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -610,8 +679,12 @@ def log_clip_info(clip: ClipData, settings: NukeSettings) -> None:
 # UI Dialog
 # ---------------------------------------------------------------------------
 
-def build_and_show_ui() -> Optional[NukeSettings]:
-    """Build the Fusion UI dialog and return user settings, or None if cancelled."""
+def build_and_show_ui(saved: NukeSettings) -> Optional[NukeSettings]:
+    """Build the Fusion UI dialog and return user settings, or None if cancelled.
+
+    The *saved* argument provides previously stored values to pre-populate
+    the dialog fields, so the user sees their last-used settings.
+    """
     ui = fu.UIManager  # noqa: F821
     disp = bmd.UIDispatcher(ui)  # noqa: F821
     width, height = 450, 380
@@ -631,7 +704,7 @@ def build_and_show_ui() -> Optional[NukeSettings]:
                 ui.Label({"ID": "HandlesLabel", "Text": "Handles (frames)"}),
                 ui.TextEdit({
                     "ID": "Handles",
-                    "Text": str(DEFAULT_HANDLES),
+                    "Text": str(saved.handles),
                     "PlaceholderText": str(DEFAULT_HANDLES),
                 }),
             ]),
@@ -643,7 +716,7 @@ def build_and_show_ui() -> Optional[NukeSettings]:
                 ui.Label({"ID": "ColorspaceCustomLabel", "Text": "Colorspace"}),
                 ui.TextEdit({
                     "ID": "ColorspaceCustom",
-                    "Text": DEFAULT_COLORSPACE,
+                    "Text": saved.colorspace,
                     "PlaceholderText": DEFAULT_COLORSPACE,
                 }),
             ]),
@@ -651,19 +724,19 @@ def build_and_show_ui() -> Optional[NukeSettings]:
                 ui.Label({"ID": "FormatNameLabel", "Text": "Format Name"}),
                 ui.TextEdit({
                     "ID": "FormatName",
-                    "Text": DEFAULT_FORMAT_NAME,
+                    "Text": saved.format_name,
                     "PlaceholderText": DEFAULT_FORMAT_NAME,
                 }),
             ]),
             ui.CheckBox({
                 "ID": "ClearNodes",
                 "Text": "Clear existing nodes (destructive!)",
-                "Checked": False,
+                "Checked": saved.clear_existing_nodes,
             }),
             ui.CheckBox({
                 "ID": "SetProjectSettings",
                 "Text": "Set Nuke project settings (format, FPS, frame range)",
-                "Checked": True,
+                "Checked": saved.set_project_settings,
             }),
             ui.HGroup({"ID": "buttons"}, [
                 ui.Button({"ID": "cancelButton", "Text": "Cancel"}),
@@ -707,9 +780,18 @@ def build_and_show_ui() -> Optional[NukeSettings]:
     # Populate combo boxes
     itm["OutputMode"].AddItem("Python (Script Editor)")
     itm["OutputMode"].AddItem("TCL (Node Graph Paste)")
+    itm["OutputMode"].CurrentIndex = 0 if saved.output_mode == "Python" else 1
 
     for cs in COLORSPACE_PRESETS:
         itm["ColorspacePreset"].AddItem(cs)
+    # Select the preset matching the saved colorspace, if any
+    if saved.colorspace in COLORSPACE_PRESETS:
+        itm["ColorspacePreset"].CurrentIndex = COLORSPACE_PRESETS.index(saved.colorspace)
+
+    # Sync project settings checkbox state with output mode
+    if saved.output_mode != "Python":
+        itm["SetProjectSettings"].Checked = False
+        itm["SetProjectSettings"].Enabled = False
 
     win.Show()
     disp.RunLoop()
@@ -757,11 +839,17 @@ def main():
               "Please select a clip in the timeline.")
         return
 
-    # Show UI dialog
-    settings = build_and_show_ui()
+    # Load previously saved settings for this project
+    saved = load_settings(project)
+
+    # Show UI dialog pre-populated with saved settings
+    settings = build_and_show_ui(saved)
     if settings is None:
         print("Cancelled by user.")
         return
+
+    # Persist settings for next run
+    save_settings(project, settings)
 
     # Extract clip data
     clip = get_selected_clip_data(timeline, selected_item)
