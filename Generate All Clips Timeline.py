@@ -215,8 +215,8 @@ def match_xml_retime_to_clip(
         # Check for overlapping source range
         if entry["source_max"] >= clip_source_start and entry["source_min"] <= clip_source_end:
             return entry
-    # Fallback: return the first entry if no overlap match
-    return entries[0] if entries else None
+    # No overlap found — don't guess; returning a wrong entry would expand ranges incorrectly
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -792,12 +792,15 @@ def run_workflow(
                     if xml_data:
                         xml_min = xml_data["source_min"]
                         xml_max = xml_data["source_max"]
-                        if not is_frame_hold:
-                            norm_start = min(norm_start, xml_min)
-                            norm_end = max(norm_end, xml_max)
                         if xml_data["is_non_linear"]:
                             is_non_linear = True
                             is_retimed = True
+                            # For non-linear retimes (speed ramps) the Resolve API source
+                            # in/out may not reflect the full frame range the ramp accesses.
+                            # Only in this case do we expand using the XML-derived range.
+                            if not is_frame_hold:
+                                norm_start = min(norm_start, xml_min)
+                                norm_end = max(norm_end, xml_max)
 
                 # Create ClipInfo
                 clip_info = ClipInfo(
