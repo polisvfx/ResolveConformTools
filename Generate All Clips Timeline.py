@@ -987,8 +987,8 @@ def build_and_show_ui() -> Optional[dict]:
                 ui.Label({"ID": "DstLabel", "Text": "New Timeline Name"}),
                 ui.TextEdit({
                     "ID": "DstTimelineName",
-                    "Text": "",
-                    "PlaceholderText": "Master Timeline",
+                    "Text": "Sources-Sequence",
+                    "PlaceholderText": "Sources-Sequence",
                 }),
             ]),
             ui.HGroup({}, [
@@ -1077,8 +1077,7 @@ def build_and_show_ui() -> Optional[dict]:
     if not run_export["value"]:
         return None
 
-    timeline_name = itm["DstTimelineName"].PlainText
-    assert timeline_name, "Found empty New Timeline Name! Refusing to run"
+    timeline_name = itm["DstTimelineName"].PlainText.strip() or "Sources-Sequence"
 
     threshold_text = itm["ConnectionThreshold"].PlainText
     try:
