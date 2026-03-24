@@ -1166,6 +1166,10 @@ class BatchRenameDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _update_preview(self):
+        # Block selection signals while rebuilding the tree to avoid
+        # spurious selection changes that would affect the rename button
+        # or cause partial renames.
+        self.preview_tree.blockSignals(True)
         self.preview_tree.clear()
         self.collision_label.setText("")
         self.collision_label.setStyleSheet("")
@@ -1175,6 +1179,7 @@ class BatchRenameDialog(QDialog):
 
         self._filtered_items = self._filter_items(self.cached_items)
         if not self._filtered_items:
+            self.preview_tree.blockSignals(False)
             self._on_preview_selection_changed()
             return
 
@@ -1185,6 +1190,7 @@ class BatchRenameDialog(QDialog):
                     [info["type_label"], info["name"], info["name"]],
                 )
                 tw.setData(0, Qt.UserRole, idx)
+            self.preview_tree.blockSignals(False)
             self._on_preview_selection_changed()
             return
 
@@ -1213,6 +1219,7 @@ class BatchRenameDialog(QDialog):
             if new in collisions:
                 tw.setForeground(2, QColor("#FF6B6B"))
 
+        self.preview_tree.blockSignals(False)
         self._on_preview_selection_changed()
 
     # ------------------------------------------------------------------
@@ -1385,11 +1392,20 @@ class BatchRenameDialog(QDialog):
             print("No operations to apply.")
             return
 
-        # Use preview selection when rows are selected, otherwise all.
-        items = self._get_selected_preview_items()
-        if not items:
-            all_items = self._fetch_items()
-            items = self._filter_items(all_items)
+        # Always fetch fresh items from Resolve so clip objects are current.
+        all_items = self._fetch_items()
+        all_filtered = self._filter_items(all_items)
+
+        # Narrow to preview selection when rows are highlighted.
+        preview_sel = self._get_selected_preview_items()
+        if preview_sel:
+            # Match by media_id (or name) to pick fresh objects.
+            sel_ids = {i.get("media_id") or i["name"] for i in preview_sel}
+            items = [i for i in all_filtered
+                     if (i.get("media_id") or i["name"]) in sel_ids]
+        else:
+            items = all_filtered
+
         if not items:
             print("No items found to rename.")
             return
