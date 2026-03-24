@@ -297,11 +297,18 @@ def _clip_to_item(clip) -> dict:
     }
 
 
-def get_selected_media_pool_items(project) -> list:
-    """Return the active Media Pool selection (clips only, no bins).
+def _is_bin(obj) -> bool:
+    """Return True if *obj* is a Media Pool folder/bin, not a clip."""
+    return callable(getattr(obj, "GetClipList", None))
 
-    Returns an empty list when nothing is selected or only bins are
-    selected, so the caller can fall back to folder-based collection.
+
+def get_selected_media_pool_items(project) -> list:
+    """Return items based on the active Media Pool selection.
+
+    - If clips (non-bin items) are selected, return those clips.
+    - If only bins are selected, return all clips inside those bins.
+    - Returns an empty list when nothing is selected so the caller can
+      fall back to folder-based collection.
     """
     media_pool = project.GetMediaPool()
     if not media_pool:
@@ -312,7 +319,23 @@ def get_selected_media_pool_items(project) -> list:
         return []
     if not selected:
         return []
-    return [_clip_to_item(clip) for clip in selected]
+
+    clips = [s for s in selected if not _is_bin(s)]
+    bins = [s for s in selected if _is_bin(s)]
+
+    if clips:
+        return [_clip_to_item(c) for c in clips]
+
+    # Only bins selected — collect their contents.
+    items: list = []
+    seen: set = set()
+    for folder in bins:
+        for clip in folder.GetClipList() or []:
+            cid = id(clip)
+            if cid not in seen:
+                seen.add(cid)
+                items.append(_clip_to_item(clip))
+    return items
 
 
 def get_media_pool_items(project, recursive: bool = False) -> list:
@@ -716,6 +739,7 @@ class BatchRenameDialog(QDialog):
         self.undo_stack: list[UndoRecord] = []
         self.presets: list[RenamePreset] = load_presets()
         self.cached_items: list = []
+        self._filtered_items: list = []
         self.editing_index: Optional[int] = None
         self.default_preset: str = load_default_preset_name()
 
@@ -960,6 +984,7 @@ class BatchRenameDialog(QDialog):
         self.preview_tree.setHeaderLabels(["Type", "Original Name", "New Name"])
         self.preview_tree.setAlternatingRowColors(True)
         self.preview_tree.setRootIsDecorated(False)
+        self.preview_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.preview_tree.setColumnWidth(0, 90)
         self.preview_tree.setColumnWidth(1, 240)
         self.preview_tree.setColumnWidth(2, 240)
@@ -996,6 +1021,7 @@ class BatchRenameDialog(QDialog):
         self.preset_combo.currentIndexChanged.connect(self._update_default_button)
         self.refresh_btn.clicked.connect(self._on_refresh_preview)
         self.include_subfolders.stateChanged.connect(self._on_refresh_preview)
+        self.preview_tree.itemSelectionChanged.connect(self._on_preview_selection_changed)
         for cb in self.filter_checks.values():
             cb.stateChanged.connect(self._on_filter_changed)
 
@@ -1147,19 +1173,24 @@ class BatchRenameDialog(QDialog):
         if not self.cached_items:
             self.cached_items = self._fetch_items()
 
-        filtered = self._filter_items(self.cached_items)
-        if not filtered:
+        self._filtered_items = self._filter_items(self.cached_items)
+        if not self._filtered_items:
+            self._on_preview_selection_changed()
             return
 
         if not self.operations:
-            for info in filtered:
-                QTreeWidgetItem(self.preview_tree,
-                                [info["type_label"], info["name"], info["name"]])
+            for idx, info in enumerate(self._filtered_items):
+                tw = QTreeWidgetItem(
+                    self.preview_tree,
+                    [info["type_label"], info["name"], info["name"]],
+                )
+                tw.setData(0, Qt.UserRole, idx)
+            self._on_preview_selection_changed()
             return
 
         now = datetime.now()
         new_names = []
-        for info in filtered:
+        for info in self._filtered_items:
             old = info["name"]
             new = apply_pipeline(old, self.operations, now)
             new_names.append((info["type_label"], old, new))
@@ -1175,11 +1206,38 @@ class BatchRenameDialog(QDialog):
             )
             self.collision_label.setStyleSheet("color: #FF6B6B; font-weight: bold;")
 
-        for type_label, old, new in new_names:
+        for idx, (type_label, old, new) in enumerate(new_names):
             display_new = new + "  [COLLISION]" if new in collisions else new
-            item = QTreeWidgetItem(self.preview_tree, [type_label, old, display_new])
+            tw = QTreeWidgetItem(self.preview_tree, [type_label, old, display_new])
+            tw.setData(0, Qt.UserRole, idx)
             if new in collisions:
-                item.setForeground(2, QColor("#FF6B6B"))
+                tw.setForeground(2, QColor("#FF6B6B"))
+
+        self._on_preview_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Events: preview selection
+    # ------------------------------------------------------------------
+
+    def _on_preview_selection_changed(self):
+        """Toggle rename button label based on preview tree selection."""
+        sel = self.preview_tree.selectedItems()
+        if sel:
+            self.rename_btn.setText(f"  Rename Selected ({len(sel)})  ")
+        else:
+            self.rename_btn.setText("  Rename All  ")
+
+    def _get_selected_preview_items(self) -> list:
+        """Return the filtered item dicts for the selected preview rows."""
+        sel = self.preview_tree.selectedItems()
+        if not sel:
+            return []
+        items = []
+        for tw in sel:
+            idx = tw.data(0, Qt.UserRole)
+            if idx is not None and 0 <= idx < len(self._filtered_items):
+                items.append(self._filtered_items[idx])
+        return items
 
     # ------------------------------------------------------------------
     # Events: operation type changed
@@ -1326,8 +1384,12 @@ class BatchRenameDialog(QDialog):
         if not self.operations:
             print("No operations to apply.")
             return
-        all_items = self._fetch_items()
-        items = self._filter_items(all_items)
+
+        # Use preview selection when rows are selected, otherwise all.
+        items = self._get_selected_preview_items()
+        if not items:
+            all_items = self._fetch_items()
+            items = self._filter_items(all_items)
         if not items:
             print("No items found to rename.")
             return
