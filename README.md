@@ -58,5 +58,18 @@ Settings are remembered per-project across runs and even Resolve restarts.
 A companion script that skips the settings dialog entirely when settings have already been configured for the current project. On first use (no saved settings) it opens the full UI; after that it immediately copies to clipboard using the last-used settings. Use the main "Copy Clip to Nuke" script whenever you want to change settings.
 
 
+## Batch Rename (Python, PySide6)
+A comprehensive batch renaming utility for media pool items in DaVinci Resolve. Provides Advanced Renamer-style composable operations with a live preview.
+
+- **Operation Pipeline**: Chain multiple rename operations that execute sequentially — search & replace (plain text or regex), add prefix/suffix, remove N characters from start/end/position
+- **Drag-and-Drop Reordering**: Operations can be reordered by dragging, with per-row delete (x) and enable/disable toggles
+- **Type Filters**: Rename only specific item types — Timeline, Video, Audio, Still/Image, Compound Clip, Fusion Comp, Generator, or Other
+- **Live Preview**: See the result of all operations before committing, with automatic collision detection for duplicate names
+- **Undo History**: Up to 20 levels of undo, reverting renamed items back to their original names
+- **Presets**: Save and load operation pipelines with filter states. Set a default preset that auto-loads on script startup
+- **Date/Time Tokens**: Use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`, `{minute}`, `{second}` in prefix, suffix, and replace fields
+- **Include Subfolders**: Optionally recurse into subfolders of the current media pool bin
+- Uses PySide6 (bundled with Resolve) for a native Qt UI with dark theme
+
 ## Future Features
 The nuke integration is in its infancy and I am contemplating making it a bit more robust and useful, maybe creating a script that will generate a project config file that handles all variables like, project resolution, handles and so on. You could theoretically also reference nukescript templates and generate nuke scripts out of Resolve.
