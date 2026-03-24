@@ -33,8 +33,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QListWidget, QListWidgetItem, QWidget, QGroupBox,
     QSplitter, QSizePolicy, QAbstractItemView, QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QMimeData, QSize
-from PySide6.QtGui import QColor, QFont, QDrag
+from PySide6.QtCore import Qt, Signal, QMimeData, QSize, QTimer
+from PySide6.QtGui import QColor, QFont, QDrag, QIcon, QPainter, QPixmap, QPen
 
 
 # ---------------------------------------------------------------------------
@@ -654,11 +654,40 @@ class DragDropOpsList(QListWidget):
         self.order_changed.emit()
 
 
+def _make_app_icon() -> QIcon:
+    """Create a programmatic 32x32 icon for the Batch Rename tool."""
+    size = 32
+    pix = QPixmap(size, size)
+    pix.fill(QColor("#1e1e1e"))
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # Draw an accent-colored "rename" arrow: ─➤
+    pen = QPen(QColor("#5599ff"))
+    pen.setWidth(2)
+    p.setPen(pen)
+    p.drawLine(6, 16, 22, 16)
+    p.drawLine(19, 11, 25, 16)
+    p.drawLine(19, 21, 25, 16)
+
+    # "BR" text
+    font = QFont("Segoe UI", 7, QFont.Bold)
+    p.setFont(font)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(4, 10, "BR")
+
+    p.end()
+    return QIcon(pix)
+
+
 class BatchRenameDialog(QDialog):
     """Main Batch Rename dialog using PySide6."""
 
     def __init__(self, project, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(
+            self.windowFlags() | Qt.WindowStaysOnTopHint
+        )
         self.project = project
         self.operations: list[RenameOp] = []
         self.undo_stack: list[UndoRecord] = []
@@ -668,12 +697,32 @@ class BatchRenameDialog(QDialog):
         self.default_preset: str = load_default_preset_name()
 
         self.setWindowTitle("Batch Rename")
+        self.setWindowIcon(_make_app_icon())
         self.resize(1400, 700)
         self.setMinimumSize(800, 500)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
         self._connect_signals()
         self._initial_state()
+
+        # Close the dialog if DaVinci Resolve exits.
+        self._resolve_timer = QTimer(self)
+        self._resolve_timer.timeout.connect(self._check_resolve_alive)
+        self._resolve_timer.start(2000)
+
+    # ------------------------------------------------------------------
+    # Resolve lifecycle
+    # ------------------------------------------------------------------
+
+    def _check_resolve_alive(self):
+        """Close the dialog if DaVinci Resolve is no longer reachable."""
+        try:
+            alive = resolve.GetProjectManager() is not None  # noqa: F821
+        except Exception:
+            alive = False
+        if not alive:
+            self._resolve_timer.stop()
+            self.close()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -1359,11 +1408,41 @@ class BatchRenameDialog(QDialog):
 # Main
 # ---------------------------------------------------------------------------
 
+_instance_server = None  # keep reference alive for single-instance lock
+
+
 def main():
+    global _instance_server
+
     project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
     if not project:
         print("Error: No project is open.")
         return
+
+    # --- Single-instance guard via named local socket -------------------
+    try:
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        _has_network = True
+    except ImportError:
+        _has_network = False
+
+    _SOCKET_NAME = "ResolveConformTools.BatchRename"
+
+    if _has_network:
+        # Try connecting to an existing instance.
+        sock = QLocalSocket()
+        sock.connectToServer(_SOCKET_NAME)
+        if sock.waitForConnected(200):
+            print("Batch Rename is already running.")
+            sock.disconnectFromServer()
+            return
+        sock.abort()
+
+        # No other instance — claim the name.
+        _instance_server = QLocalServer()
+        # Remove stale socket from a previous crash.
+        QLocalServer.removeServer(_SOCKET_NAME)
+        _instance_server.listen(_SOCKET_NAME)
 
     print("=== Batch Rename loaded ===")
 
@@ -1380,6 +1459,11 @@ def main():
     else:
         # Resolve already has a Qt event loop — run as modal dialog
         dlg.exec()
+
+    # Clean up the single-instance lock.
+    if _instance_server is not None:
+        _instance_server.close()
+        _instance_server = None
 
     print("=== Batch Rename closed ===")
 
