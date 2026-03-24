@@ -33,8 +33,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QListWidget, QListWidgetItem, QWidget, QGroupBox,
     QSplitter, QSizePolicy, QAbstractItemView, QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QMimeData, QSize
-from PySide6.QtGui import QColor, QFont, QDrag
+from PySide6.QtCore import Qt, Signal, QMimeData, QSize, QTimer
+from PySide6.QtGui import QColor, QFont, QDrag, QIcon, QPainter, QPixmap, QPen
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +279,65 @@ def _classify_type(type_str: str) -> str:
     return "Other"
 
 
+def _clip_to_item(clip) -> dict:
+    """Build an item dict from a Resolve media pool clip object."""
+    clip_name = clip.GetName() or ""
+    media_id = ""
+    try:
+        media_id = clip.GetMediaId()
+    except Exception:
+        pass
+    clip_type = _get_clip_type(clip)
+    return {
+        "item": clip,
+        "name": clip_name,
+        "media_id": media_id,
+        "type": clip_type,
+        "type_label": _classify_type(clip_type),
+    }
+
+
+def _is_bin(obj) -> bool:
+    """Return True if *obj* is a Media Pool folder/bin, not a clip."""
+    return callable(getattr(obj, "GetClipList", None))
+
+
+def get_selected_media_pool_items(project) -> list:
+    """Return items based on the active Media Pool selection.
+
+    - If clips (non-bin items) are selected, return those clips.
+    - If only bins are selected, return all clips inside those bins.
+    - Returns an empty list when nothing is selected so the caller can
+      fall back to folder-based collection.
+    """
+    media_pool = project.GetMediaPool()
+    if not media_pool:
+        return []
+    try:
+        selected = media_pool.GetSelectedClips()
+    except Exception:
+        return []
+    if not selected:
+        return []
+
+    clips = [s for s in selected if not _is_bin(s)]
+    bins = [s for s in selected if _is_bin(s)]
+
+    if clips:
+        return [_clip_to_item(c) for c in clips]
+
+    # Only bins selected — collect their contents.
+    items: list = []
+    seen: set = set()
+    for folder in bins:
+        for clip in folder.GetClipList() or []:
+            cid = id(clip)
+            if cid not in seen:
+                seen.add(cid)
+                items.append(_clip_to_item(clip))
+    return items
+
+
 def get_media_pool_items(project, recursive: bool = False) -> list:
     """Get all items from the current media pool folder with type info."""
     media_pool = project.GetMediaPool()
@@ -293,20 +352,7 @@ def get_media_pool_items(project, recursive: bool = False) -> list:
         clips = folder.GetClipList()
         if clips:
             for clip in clips:
-                clip_name = clip.GetName() or ""
-                media_id = ""
-                try:
-                    media_id = clip.GetMediaId()
-                except Exception:
-                    pass
-                clip_type = _get_clip_type(clip)
-                items.append({
-                    "item": clip,
-                    "name": clip_name,
-                    "media_id": media_id,
-                    "type": clip_type,
-                    "type_label": _classify_type(clip_type),
-                })
+                items.append(_clip_to_item(clip))
         if recursive:
             subfolders = folder.GetSubFolderList()
             if subfolders:
@@ -654,26 +700,76 @@ class DragDropOpsList(QListWidget):
         self.order_changed.emit()
 
 
+def _make_app_icon() -> QIcon:
+    """Create a programmatic 32x32 icon for the Batch Rename tool."""
+    size = 32
+    pix = QPixmap(size, size)
+    pix.fill(QColor("#1e1e1e"))
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # Draw an accent-colored "rename" arrow: ─➤
+    pen = QPen(QColor("#5599ff"))
+    pen.setWidth(2)
+    p.setPen(pen)
+    p.drawLine(6, 16, 22, 16)
+    p.drawLine(19, 11, 25, 16)
+    p.drawLine(19, 21, 25, 16)
+
+    # "BR" text
+    font = QFont("Segoe UI", 7, QFont.Bold)
+    p.setFont(font)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(4, 10, "BR")
+
+    p.end()
+    return QIcon(pix)
+
+
 class BatchRenameDialog(QDialog):
     """Main Batch Rename dialog using PySide6."""
 
     def __init__(self, project, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(
+            self.windowFlags() | Qt.WindowStaysOnTopHint
+        )
         self.project = project
         self.operations: list[RenameOp] = []
         self.undo_stack: list[UndoRecord] = []
         self.presets: list[RenamePreset] = load_presets()
         self.cached_items: list = []
+        self._filtered_items: list = []
         self.editing_index: Optional[int] = None
         self.default_preset: str = load_default_preset_name()
 
         self.setWindowTitle("Batch Rename")
+        self.setWindowIcon(_make_app_icon())
         self.resize(1400, 700)
         self.setMinimumSize(800, 500)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
         self._connect_signals()
         self._initial_state()
+
+        # Close the dialog if DaVinci Resolve exits.
+        self._resolve_timer = QTimer(self)
+        self._resolve_timer.timeout.connect(self._check_resolve_alive)
+        self._resolve_timer.start(2000)
+
+    # ------------------------------------------------------------------
+    # Resolve lifecycle
+    # ------------------------------------------------------------------
+
+    def _check_resolve_alive(self):
+        """Close the dialog if DaVinci Resolve is no longer reachable."""
+        try:
+            alive = resolve.GetProjectManager() is not None  # noqa: F821
+        except Exception:
+            alive = False
+        if not alive:
+            self._resolve_timer.stop()
+            self.close()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -888,6 +984,7 @@ class BatchRenameDialog(QDialog):
         self.preview_tree.setHeaderLabels(["Type", "Original Name", "New Name"])
         self.preview_tree.setAlternatingRowColors(True)
         self.preview_tree.setRootIsDecorated(False)
+        self.preview_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.preview_tree.setColumnWidth(0, 90)
         self.preview_tree.setColumnWidth(1, 240)
         self.preview_tree.setColumnWidth(2, 240)
@@ -924,6 +1021,7 @@ class BatchRenameDialog(QDialog):
         self.preset_combo.currentIndexChanged.connect(self._update_default_button)
         self.refresh_btn.clicked.connect(self._on_refresh_preview)
         self.include_subfolders.stateChanged.connect(self._on_refresh_preview)
+        self.preview_tree.itemSelectionChanged.connect(self._on_preview_selection_changed)
         for cb in self.filter_checks.values():
             cb.stateChanged.connect(self._on_filter_changed)
 
@@ -986,6 +1084,9 @@ class BatchRenameDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _fetch_items(self) -> list:
+        selected = get_selected_media_pool_items(self.project)
+        if selected:
+            return selected
         return get_media_pool_items(self.project, self.include_subfolders.isChecked())
 
     # ------------------------------------------------------------------
@@ -1065,6 +1166,10 @@ class BatchRenameDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _update_preview(self):
+        # Block selection signals while rebuilding the tree to avoid
+        # spurious selection changes that would affect the rename button
+        # or cause partial renames.
+        self.preview_tree.blockSignals(True)
         self.preview_tree.clear()
         self.collision_label.setText("")
         self.collision_label.setStyleSheet("")
@@ -1072,19 +1177,26 @@ class BatchRenameDialog(QDialog):
         if not self.cached_items:
             self.cached_items = self._fetch_items()
 
-        filtered = self._filter_items(self.cached_items)
-        if not filtered:
+        self._filtered_items = self._filter_items(self.cached_items)
+        if not self._filtered_items:
+            self.preview_tree.blockSignals(False)
+            self._on_preview_selection_changed()
             return
 
         if not self.operations:
-            for info in filtered:
-                QTreeWidgetItem(self.preview_tree,
-                                [info["type_label"], info["name"], info["name"]])
+            for idx, info in enumerate(self._filtered_items):
+                tw = QTreeWidgetItem(
+                    self.preview_tree,
+                    [info["type_label"], info["name"], info["name"]],
+                )
+                tw.setData(0, Qt.UserRole, idx)
+            self.preview_tree.blockSignals(False)
+            self._on_preview_selection_changed()
             return
 
         now = datetime.now()
         new_names = []
-        for info in filtered:
+        for info in self._filtered_items:
             old = info["name"]
             new = apply_pipeline(old, self.operations, now)
             new_names.append((info["type_label"], old, new))
@@ -1100,11 +1212,39 @@ class BatchRenameDialog(QDialog):
             )
             self.collision_label.setStyleSheet("color: #FF6B6B; font-weight: bold;")
 
-        for type_label, old, new in new_names:
+        for idx, (type_label, old, new) in enumerate(new_names):
             display_new = new + "  [COLLISION]" if new in collisions else new
-            item = QTreeWidgetItem(self.preview_tree, [type_label, old, display_new])
+            tw = QTreeWidgetItem(self.preview_tree, [type_label, old, display_new])
+            tw.setData(0, Qt.UserRole, idx)
             if new in collisions:
-                item.setForeground(2, QColor("#FF6B6B"))
+                tw.setForeground(2, QColor("#FF6B6B"))
+
+        self.preview_tree.blockSignals(False)
+        self._on_preview_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Events: preview selection
+    # ------------------------------------------------------------------
+
+    def _on_preview_selection_changed(self):
+        """Toggle rename button label based on preview tree selection."""
+        sel = self.preview_tree.selectedItems()
+        if sel:
+            self.rename_btn.setText(f"  Rename Selected ({len(sel)})  ")
+        else:
+            self.rename_btn.setText("  Rename All  ")
+
+    def _get_selected_preview_items(self) -> list:
+        """Return the filtered item dicts for the selected preview rows."""
+        sel = self.preview_tree.selectedItems()
+        if not sel:
+            return []
+        items = []
+        for tw in sel:
+            idx = tw.data(0, Qt.UserRole)
+            if idx is not None and 0 <= idx < len(self._filtered_items):
+                items.append(self._filtered_items[idx])
+        return items
 
     # ------------------------------------------------------------------
     # Events: operation type changed
@@ -1251,8 +1391,21 @@ class BatchRenameDialog(QDialog):
         if not self.operations:
             print("No operations to apply.")
             return
+
+        # Always fetch fresh items from Resolve so clip objects are current.
         all_items = self._fetch_items()
-        items = self._filter_items(all_items)
+        all_filtered = self._filter_items(all_items)
+
+        # Narrow to preview selection when rows are highlighted.
+        preview_sel = self._get_selected_preview_items()
+        if preview_sel:
+            # Match by media_id (or name) to pick fresh objects.
+            sel_ids = {i.get("media_id") or i["name"] for i in preview_sel}
+            items = [i for i in all_filtered
+                     if (i.get("media_id") or i["name"]) in sel_ids]
+        else:
+            items = all_filtered
+
         if not items:
             print("No items found to rename.")
             return
@@ -1359,11 +1512,41 @@ class BatchRenameDialog(QDialog):
 # Main
 # ---------------------------------------------------------------------------
 
+_instance_server = None  # keep reference alive for single-instance lock
+
+
 def main():
+    global _instance_server
+
     project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
     if not project:
         print("Error: No project is open.")
         return
+
+    # --- Single-instance guard via named local socket -------------------
+    try:
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        _has_network = True
+    except ImportError:
+        _has_network = False
+
+    _SOCKET_NAME = "ResolveConformTools.BatchRename"
+
+    if _has_network:
+        # Try connecting to an existing instance.
+        sock = QLocalSocket()
+        sock.connectToServer(_SOCKET_NAME)
+        if sock.waitForConnected(200):
+            print("Batch Rename is already running.")
+            sock.disconnectFromServer()
+            return
+        sock.abort()
+
+        # No other instance — claim the name.
+        _instance_server = QLocalServer()
+        # Remove stale socket from a previous crash.
+        QLocalServer.removeServer(_SOCKET_NAME)
+        _instance_server.listen(_SOCKET_NAME)
 
     print("=== Batch Rename loaded ===")
 
@@ -1380,6 +1563,11 @@ def main():
     else:
         # Resolve already has a Qt event loop — run as modal dialog
         dlg.exec()
+
+    # Clean up the single-instance lock.
+    if _instance_server is not None:
+        _instance_server.close()
+        _instance_server = None
 
     print("=== Batch Rename closed ===")
 
