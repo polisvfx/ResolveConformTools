@@ -279,6 +279,42 @@ def _classify_type(type_str: str) -> str:
     return "Other"
 
 
+def _clip_to_item(clip) -> dict:
+    """Build an item dict from a Resolve media pool clip object."""
+    clip_name = clip.GetName() or ""
+    media_id = ""
+    try:
+        media_id = clip.GetMediaId()
+    except Exception:
+        pass
+    clip_type = _get_clip_type(clip)
+    return {
+        "item": clip,
+        "name": clip_name,
+        "media_id": media_id,
+        "type": clip_type,
+        "type_label": _classify_type(clip_type),
+    }
+
+
+def get_selected_media_pool_items(project) -> list:
+    """Return the active Media Pool selection (clips only, no bins).
+
+    Returns an empty list when nothing is selected or only bins are
+    selected, so the caller can fall back to folder-based collection.
+    """
+    media_pool = project.GetMediaPool()
+    if not media_pool:
+        return []
+    try:
+        selected = media_pool.GetSelectedClips()
+    except Exception:
+        return []
+    if not selected:
+        return []
+    return [_clip_to_item(clip) for clip in selected]
+
+
 def get_media_pool_items(project, recursive: bool = False) -> list:
     """Get all items from the current media pool folder with type info."""
     media_pool = project.GetMediaPool()
@@ -293,20 +329,7 @@ def get_media_pool_items(project, recursive: bool = False) -> list:
         clips = folder.GetClipList()
         if clips:
             for clip in clips:
-                clip_name = clip.GetName() or ""
-                media_id = ""
-                try:
-                    media_id = clip.GetMediaId()
-                except Exception:
-                    pass
-                clip_type = _get_clip_type(clip)
-                items.append({
-                    "item": clip,
-                    "name": clip_name,
-                    "media_id": media_id,
-                    "type": clip_type,
-                    "type_label": _classify_type(clip_type),
-                })
+                items.append(_clip_to_item(clip))
         if recursive:
             subfolders = folder.GetSubFolderList()
             if subfolders:
@@ -1035,6 +1058,9 @@ class BatchRenameDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _fetch_items(self) -> list:
+        selected = get_selected_media_pool_items(self.project)
+        if selected:
+            return selected
         return get_media_pool_items(self.project, self.include_subfolders.isChecked())
 
     # ------------------------------------------------------------------
