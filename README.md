@@ -58,6 +58,17 @@ Settings are remembered per-project across runs and even Resolve restarts.
 A companion script that skips the settings dialog entirely when settings have already been configured for the current project. On first use (no saved settings) it opens the full UI; after that it immediately copies to clipboard using the last-used settings. Use the main "Copy Clip to Nuke" script whenever you want to change settings.
 
 
+## DCTL Report (Python, PySide6)
+Scans the currently-open project for every LUT and DCTL reference, resolves each against Resolve's standard LUT directories **and** any custom directories configured in **Preferences > General > LUT Locations**, and reports what is present and what is missing.
+
+- **DRP-based scanning**: Exports the project to a .drp file and decodes zstd-compressed body blobs to recover DCTL/LUT filenames — the only reliable way to extract OFX/ResolveFX parameters
+- **Scope modes**: Scan selected timelines only or all timelines in the project
+- **Show Missing List**: Full expected paths of every missing file, selectable and copyable
+- **Show Complete List**: Every referenced LUT/DCTL with the resolved path it is being read from; missing entries are marked `(missing)`
+- **Copy Existing Files**: Copies every resolved LUT/DCTL into a destination folder, preserving parent directory structure
+- **Export Full Report**: Writes a categorised .txt report of all references with status and source
+- Requires `zstandard` installed into Resolve's Python interpreter
+
 ## Batch Rename (Python, PySide6)
 A comprehensive batch renaming utility for media pool items in DaVinci Resolve. Provides Advanced Renamer-style composable operations with a live preview.
 
