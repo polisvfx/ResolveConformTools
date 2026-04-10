@@ -67,7 +67,7 @@ Scans the currently-open project for every LUT and DCTL reference, resolves each
 - **Show Complete List**: Every referenced LUT/DCTL with the resolved path it is being read from; missing entries are marked `(missing)`
 - **Copy Existing Files**: Copies every resolved LUT/DCTL into a destination folder, preserving parent directory structure
 - **Export Full Report**: Writes a categorised .txt report of all references with status and source
-- Requires `zstandard` installed into Resolve's Python interpreter
+- Requires `zstandard` installed into Resolve's Python interpreter (usually just a `pip install zstandard`)
 
 ## Batch Rename (Python, PySide6)
 A comprehensive batch renaming utility for media pool items in DaVinci Resolve. Provides Advanced Renamer-style composable operations with a live preview.
