@@ -10,13 +10,63 @@ Use "Copy Clip to Nuke" (the non-Quick version) to change settings.
 from __future__ import annotations
 
 import os
+import sys
 
 # ---------------------------------------------------------------------------
 # Load shared functions from the main script
 # ---------------------------------------------------------------------------
 
-_dir = os.path.dirname(os.path.realpath(__file__))
-_main_path = os.path.join(_dir, "Copy Clip to Nuke.py")
+_MAIN_FILENAME = "Copy Clip to Nuke.py"
+
+
+def _find_main_script() -> str:
+    """Locate the companion 'Copy Clip to Nuke.py' script.
+
+    DaVinci Resolve's embedded Python doesn't always define __file__ when
+    running scripts from the Workspace > Scripts menu, so fall back to the
+    standard Resolve script directories.
+    """
+    # 1. Try __file__ (works when run directly outside Resolve)
+    try:
+        here = os.path.dirname(os.path.realpath(__file__))
+        candidate = os.path.join(here, _MAIN_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+    except NameError:
+        pass
+
+    # 2. Search standard Resolve script directories
+    rel = os.path.join("Fusion", "Scripts", "Utility",
+                       "ResolveConformTools", _MAIN_FILENAME)
+    search_roots: list[str] = []
+
+    if sys.platform == "win32":
+        for env in ("PROGRAMDATA", "APPDATA"):
+            base = os.environ.get(env)
+            if base:
+                search_roots.append(os.path.join(
+                    base, "Blackmagic Design", "DaVinci Resolve"))
+    elif sys.platform == "darwin":
+        search_roots.append("/Library/Application Support/"
+                            "Blackmagic Design/DaVinci Resolve")
+        search_roots.append(os.path.expanduser(
+            "~/Library/Application Support/"
+            "Blackmagic Design/DaVinci Resolve"))
+    else:
+        search_roots.append("/opt/resolve")
+        search_roots.append(os.path.expanduser("~/.local/share/DaVinciResolve"))
+
+    for root in search_roots:
+        candidate = os.path.join(root, rel)
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not locate '{_MAIN_FILENAME}' next to this script or in "
+        f"any standard DaVinci Resolve scripts directory.")
+
+
+_main_path = _find_main_script()
 
 _ns: dict = {"_NUKE_EXPORT_IMPORTED": True}
 # Inject DaVinci Resolve globals into the namespace
