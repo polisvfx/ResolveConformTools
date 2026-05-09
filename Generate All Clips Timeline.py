@@ -18,13 +18,20 @@ import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # Constants
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
+INTER_TIMELINE_GAP = 25  # frames between source-timeline blocks in preserve-layout mode
+
+TIMELINE_BLOCK_MARKER_COLORS = [
+    "Blue", "Cyan", "Green", "Yellow", "Red",
+    "Pink", "Purple", "Fuchsia", "Rose", "Lavender",
+    "Sky", "Mint", "Lemon", "Sand", "Cocoa",
+]
 
 DUPLICATE_MARKER_COLORS = [
     "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink",
@@ -47,6 +54,9 @@ class ClipInfo:
     start_frame: int
     end_frame: int
     timeline_inpoint: int = 0
+    timeline_endpoint: int = 0
+    source_track_index: int = 1
+    source_timeline_name: str = ""
     is_reversed: bool = False
     is_retimed: bool = False
     is_frame_hold: bool = False
@@ -54,6 +64,9 @@ class ClipInfo:
     retime_percentage: Optional[float] = None
     xml_source_min: Optional[int] = None
     xml_source_max: Optional[int] = None
+    source_name: Optional[str] = None
+    version_names: list = field(default_factory=list)
+    current_version_name: Optional[str] = None
 
 
 @dataclass
@@ -286,11 +299,22 @@ def merge_two(a: ClipInfo, b: ClipInfo) -> ClipInfo:
     else:
         xml_max = a.xml_source_max if a.xml_source_max is not None else b.xml_source_max
 
+    # Union version names from both clips, preserving order; active version taken from a
+    merged_versions: list = []
+    seen_versions: set = set()
+    for vname in (a.version_names or []) + (b.version_names or []):
+        if vname not in seen_versions:
+            merged_versions.append(vname)
+            seen_versions.add(vname)
+
     return ClipInfo(
         media_pool_item=a.media_pool_item,
         start_frame=merged_min,
         end_frame=merged_max,
         timeline_inpoint=min(a.timeline_inpoint, b.timeline_inpoint),
+        timeline_endpoint=max(a.timeline_endpoint, b.timeline_endpoint),
+        source_track_index=a.source_track_index,
+        source_timeline_name=a.source_timeline_name,
         is_reversed=a.is_reversed or b.is_reversed,
         is_retimed=a.is_retimed or b.is_retimed,
         is_frame_hold=a.is_frame_hold and b.is_frame_hold,
@@ -298,6 +322,9 @@ def merge_two(a: ClipInfo, b: ClipInfo) -> ClipInfo:
         retime_percentage=a.retime_percentage if a.retime_percentage is not None else b.retime_percentage,
         xml_source_min=xml_min,
         xml_source_max=xml_max,
+        source_name=a.source_name if a.source_name is not None else b.source_name,
+        version_names=merged_versions,
+        current_version_name=a.current_version_name if a.current_version_name is not None else b.current_version_name,
     )
 
 
@@ -601,6 +628,8 @@ def run_workflow(
     mark_duplicates: bool,
     mark_retimed_clips: bool,
     use_xml_retime: bool,
+    import_clip_names: bool,
+    preserve_track_layout: bool,
 ) -> None:
     """Execute the complete timeline generation workflow."""
 
@@ -802,12 +831,45 @@ def run_workflow(
                                 norm_start = min(norm_start, xml_min)
                                 norm_end = max(norm_end, xml_max)
 
+                # Capture source clip name + color version names if option is on
+                source_clip_name: Optional[str] = None
+                version_names_list: list = []
+                current_version_name: Optional[str] = None
+                if import_clip_names:
+                    try:
+                        source_clip_name = track_item.GetName()
+                    except Exception:
+                        pass
+                    try:
+                        vlist = track_item.GetVersionNameList(0)
+                        if vlist:
+                            version_names_list = list(vlist)
+                    except Exception:
+                        pass
+                    try:
+                        cur_ver = track_item.GetCurrentVersion(0)
+                        if isinstance(cur_ver, dict):
+                            current_version_name = cur_ver.get("versionName")
+                        elif isinstance(cur_ver, str):
+                            current_version_name = cur_ver
+                    except Exception:
+                        pass
+
+                # Get timeline endpoint for layout post-processing
+                try:
+                    track_item_endpoint = track_item.GetEnd()
+                except Exception:
+                    track_item_endpoint = track_item.GetStart() + 1
+
                 # Create ClipInfo
                 clip_info = ClipInfo(
                     media_pool_item=media_item,
                     start_frame=norm_start,
                     end_frame=norm_end,
                     timeline_inpoint=track_item.GetStart(),
+                    timeline_endpoint=track_item_endpoint,
+                    source_track_index=track_idx,
+                    source_timeline_name=timeline_name,
                     is_reversed=is_reversed,
                     is_retimed=is_retimed,
                     is_frame_hold=is_frame_hold,
@@ -815,10 +877,18 @@ def run_workflow(
                     retime_percentage=retime_pct,
                     xml_source_min=xml_min,
                     xml_source_max=xml_max,
+                    source_name=source_clip_name,
+                    version_names=version_names_list,
+                    current_version_name=current_version_name,
                 )
-                clips.setdefault(media_id, []).append(clip_info)
+                # When preserving track layout, key by (media_id, track_idx) to prevent
+                # cross-track merging — the same source clip used on different tracks
+                # would otherwise be collapsed into one long range. This also fixes a
+                # latent "really long clips" bug for users who enable the option.
+                clips_key = f"{media_id}_T{track_idx}" if preserve_track_layout else media_id
+                clips.setdefault(clips_key, []).append(clip_info)
                 print(f"  Added clip to processing list: {item_name} "
-                      f"(Start: {norm_start}, End: {norm_end})")
+                      f"(Start: {norm_start}, End: {norm_end}, Track: {track_idx})")
 
         # Clean up XML temp file
         if xml_temp_path:
@@ -843,7 +913,94 @@ def run_workflow(
     for clip_infos in clips.values():
         all_clip_infos.extend(clip_infos)
 
+    # Track-layout post-processing: lay each source timeline as a contiguous block
+    timeline_markers: list[dict] = []
+    if preserve_track_layout:
+        # Preserve order in which source timelines were first encountered
+        timeline_order: list[str] = []
+        seen_tl: set = set()
+        for ci in all_clip_infos:
+            tname = ci.source_timeline_name or "__unknown__"
+            if tname not in seen_tl:
+                timeline_order.append(tname)
+                seen_tl.add(tname)
+
+        # Group clips by source timeline
+        by_timeline: dict[str, list[ClipInfo]] = {tname: [] for tname in timeline_order}
+        for ci in all_clip_infos:
+            tname = ci.source_timeline_name or "__unknown__"
+            by_timeline[tname].append(ci)
+
+        rebuilt: list[ClipInfo] = []
+        used_media_ids: set = set()
+        output_cursor = 0
+
+        for tl_idx, tname in enumerate(timeline_order):
+            group = by_timeline[tname]
+            if not group:
+                continue
+
+            # a) subtract this timeline's own minimum inpoint
+            min_ip = min(ci.timeline_inpoint for ci in group)
+            for ci in group:
+                ci.timeline_inpoint -= min_ip
+                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) - min_ip
+
+            # b) re-merge by (media_id, track) within this group
+            regroup: dict[str, list[ClipInfo]] = {}
+            for ci in group:
+                key = f"{ci.media_pool_item.GetMediaId()}_T{ci.source_track_index}"
+                regroup.setdefault(key, []).append(ci)
+            merged_group: list[ClipInfo] = []
+            for subgroup in regroup.values():
+                merged_group.extend(merge_all_overlapping(subgroup, connection_threshold))
+
+            # c) filter out media already placed by an earlier timeline
+            unique_group: list[ClipInfo] = []
+            for ci in merged_group:
+                mid = ci.media_pool_item.GetMediaId()
+                if mid not in used_media_ids:
+                    unique_group.append(ci)
+                else:
+                    print(f"  Skipping '{ci.media_pool_item.GetName()}' "
+                          f"(already covered by earlier timeline)")
+            for ci in merged_group:
+                used_media_ids.add(ci.media_pool_item.GetMediaId())
+
+            # Record block marker regardless of unique-clip count
+            color = TIMELINE_BLOCK_MARKER_COLORS[tl_idx % len(TIMELINE_BLOCK_MARKER_COLORS)]
+            timeline_markers.append({
+                "frame": output_cursor,
+                "name": tname,
+                "color": color,
+            })
+
+            if not unique_group:
+                print(f"Timeline '{tname}': no unique clips — marker only at frame {output_cursor}")
+                output_cursor += 1
+                continue
+
+            block_end = max(
+                (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) for ci in unique_group
+            )
+
+            for ci in unique_group:
+                ci.timeline_inpoint += output_cursor
+                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) + output_cursor
+                rebuilt.append(ci)
+
+            output_cursor += block_end + INTER_TIMELINE_GAP
+            print(f"Timeline '{tname}': {len(unique_group)} unique clips, "
+                  f"block_end={block_end}, next_cursor={output_cursor}")
+
+        all_clip_infos = rebuilt
+        print(f"After per-timeline processing: {len(all_clip_infos)} unique clip entries")
+
     # Apply sorting
+    if preserve_track_layout and sorting_method != "None":
+        print(f"Preserve Source Track Layout is on — overriding sort '{sorting_method}' to 'None'")
+        sorting_method = "None"
+
     print(f"Sorting using method: {sorting_method}")
     sort_fn = SORT_METHODS.get(sorting_method)
     if sort_fn:
@@ -852,11 +1009,32 @@ def run_workflow(
         print(f"Unknown sorting method '{sorting_method}', using default (Source Name)")
         sort_by_source_name(all_clip_infos)
 
-    # Create new timeline
+    # Create new timeline — dedupe name against existing project timelines.
+    # If "All_Sources" exists, try "All_Sources_01", "All_Sources_02", …
+    if dst_timeline_name in project_timelines:
+        counter = 1
+        while True:
+            candidate = f"{dst_timeline_name}_{counter:02d}"
+            if candidate not in project_timelines:
+                print(f"Timeline name '{dst_timeline_name}' already exists, "
+                      f"using '{candidate}' instead")
+                dst_timeline_name = candidate
+                break
+            counter += 1
+
     print("Adding all clips to new timeline...")
     new_timeline = media_pool.CreateEmptyTimeline(dst_timeline_name)
     assert project.SetCurrentTimeline(new_timeline), \
         "Couldn't set current timeline to the new timeline"
+
+    # Pre-create video tracks to cover the highest source_track_index
+    if preserve_track_layout and all_clip_infos:
+        max_track = max(ci.source_track_index for ci in all_clip_infos)
+        cur = new_timeline.GetTrackCount("video")
+        while cur < max_track:
+            new_timeline.AddTrack("video")
+            cur += 1
+            print(f"Pre-created video track {cur}")
 
     # Add clips — single code path for all clip types
     append_success_count = 0
@@ -882,9 +1060,17 @@ def run_workflow(
             print("  (Adding normalized forward-playing version)")
 
         api_dict = sanitize_for_api(clip_info)
+        if preserve_track_layout:
+            api_dict["recordFrame"] = clip_info.timeline_inpoint
+            api_dict["trackIndex"] = clip_info.source_track_index
+            api_dict["importVideo"] = True
+            api_dict["importAudio"] = not video_only
         try:
             media_pool.AppendToTimeline([api_dict])
             append_success_count += 1
+            if preserve_track_layout:
+                print(f"  Placed on track {clip_info.source_track_index} "
+                      f"at frame {clip_info.timeline_inpoint}")
         except Exception:
             print(f"  ERROR: Failed to add clip: {clip_info.media_pool_item.GetName()}")
             print(f"  Frame range attempted: {api_dict['startFrame']} to {api_dict['endFrame']}")
@@ -898,6 +1084,22 @@ def run_workflow(
     if video_only:
         print("Video Only option selected — removing all audio tracks...")
         remove_all_audio_tracks(new_timeline)
+
+    # Post-processing: source-timeline ruler markers (preserve-layout mode)
+    if preserve_track_layout and timeline_markers:
+        print("Adding timeline block markers...")
+        for m in timeline_markers:
+            try:
+                ok = new_timeline.AddMarker(
+                    m["frame"], m["color"], m["name"],
+                    f"Source timeline: {m['name']}", 1, "",
+                )
+            except Exception:
+                ok = False
+            if ok:
+                print(f"  Marker '{m['name']}' at frame {m['frame']} ({m['color']})")
+            else:
+                print(f"  WARNING: failed to add marker '{m['name']}' at frame {m['frame']}")
 
     # Post-processing: mark duplicates
     if mark_duplicates:
@@ -962,6 +1164,62 @@ def run_workflow(
         print(f"Successfully added {success_count} retime markers out of "
               f"{marker_count} attempts.")
 
+    # Post-processing: apply source clip names + color version names
+    if import_clip_names:
+        print("Applying source clip names and color version names to new timeline...")
+        clip_list = get_all_timeline_clips(new_timeline)
+        name_apply_count = 0
+        version_apply_count = 0
+
+        for timeline_clip in clip_list:
+            for clip_info in all_clip_infos:
+                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
+                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame
+                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + 1):
+
+                    # Set clip name from source
+                    if clip_info.source_name:
+                        ok = False
+                        try:
+                            ok = timeline_clip.clip.SetName(clip_info.source_name)
+                        except Exception:
+                            pass
+                        if ok:
+                            print(f"  Renamed clip to: {clip_info.source_name}")
+                            name_apply_count += 1
+                        else:
+                            print(f"  WARNING: SetName failed for: {timeline_clip.name}")
+
+                    # Recreate color versions
+                    vnames = clip_info.version_names or []
+                    if vnames:
+                        for vname in vnames:
+                            try:
+                                timeline_clip.clip.AddVersion(vname, 0)
+                            except Exception:
+                                pass
+                        if clip_info.current_version_name:
+                            set_ok = False
+                            try:
+                                set_ok = timeline_clip.clip.SetCurrentVersion(
+                                    clip_info.current_version_name, 0,
+                                )
+                            except Exception:
+                                pass
+                            if set_ok:
+                                print(f"  Set active version "
+                                      f"'{clip_info.current_version_name}' on: "
+                                      f"{timeline_clip.name}")
+                            else:
+                                print(f"  WARNING: SetCurrentVersion failed for: "
+                                      f"{timeline_clip.name}")
+                        version_apply_count += 1
+
+                    break
+
+        print(f"Clip names applied to {name_apply_count} clips.")
+        print(f"Color version names applied to {version_apply_count} clips.")
+
     print("Done!")
 
 
@@ -974,7 +1232,7 @@ def build_and_show_ui() -> Optional[dict]:
     # fu and bmd are pre-injected globals in Resolve's scripting environment
     ui = fu.UIManager  # noqa: F821
     disp = bmd.UIDispatcher(ui)  # noqa: F821
-    width, height = 500, 420
+    width, height = 500, 480
 
     win = disp.AddWindow({
         "ID": "MyWin",
@@ -987,8 +1245,8 @@ def build_and_show_ui() -> Optional[dict]:
                 ui.Label({"ID": "DstLabel", "Text": "New Timeline Name"}),
                 ui.TextEdit({
                     "ID": "DstTimelineName",
-                    "Text": "Sources-Sequence",
-                    "PlaceholderText": "Sources-Sequence",
+                    "Text": "All_Sources",
+                    "PlaceholderText": "All_Sources",
                 }),
             ]),
             ui.HGroup({}, [
@@ -1030,6 +1288,16 @@ def build_and_show_ui() -> Optional[dict]:
                 "ID": "useXmlRetime",
                 "Text": "Use XML for Precise Retime Detection",
                 "Checked": True,
+            }),
+            ui.CheckBox({
+                "ID": "importClipNames",
+                "Text": "Import Clip Names from Source Timelines",
+                "Checked": False,
+            }),
+            ui.CheckBox({
+                "ID": "preserveTrackLayout",
+                "Text": "Preserve Source Track Layout",
+                "Checked": False,
             }),
             ui.HGroup({"ID": "buttons"}, [
                 ui.Button({"ID": "cancelButton", "Text": "Cancel"}),
@@ -1077,7 +1345,7 @@ def build_and_show_ui() -> Optional[dict]:
     if not run_export["value"]:
         return None
 
-    timeline_name = itm["DstTimelineName"].PlainText.strip() or "Sources-Sequence"
+    timeline_name = itm["DstTimelineName"].PlainText.strip() or "All_Sources"
 
     threshold_text = itm["ConnectionThreshold"].PlainText
     try:
@@ -1095,6 +1363,8 @@ def build_and_show_ui() -> Optional[dict]:
         "mark_duplicates": itm["markDuplicates"].Checked,
         "mark_retimed_clips": itm["markRetimedClips"].Checked,
         "use_xml_retime": itm["useXmlRetime"].Checked,
+        "import_clip_names": itm["importClipNames"].Checked,
+        "preserve_track_layout": itm["preserveTrackLayout"].Checked,
     }
 
 
