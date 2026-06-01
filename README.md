@@ -13,7 +13,7 @@ This script builds upon work done by [Thatcher Freeman](https://github.com/thatc
 
 ![grafik](https://github.com/user-attachments/assets/1388dbcd-ec09-4f14-9353-a3994669dbf1)
 
-### Python Version (Generate All Clips Timeline.py)
+### Python Version (Generate All Clips Timeline PRO.py)
 A full Python rewrite of the Lua script with improved retime handling and XML-based source range analysis.
 - **Retime handling**: Correctly detects and handles retimed clips, reversed clips, and frame holds (freeze frames). All clips are normalized to forward-playing source ranges on the master timeline.
 - **XML retime analysis**: Optionally exports the source timeline to FCP 7 XML and parses Time Remap keyframes to compute precise source frame ranges — particularly useful for speed ramps and non-linear retimes where the API-reported range may be inaccurate.
