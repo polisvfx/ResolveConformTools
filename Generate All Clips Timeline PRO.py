@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Generate All Clips Timeline
+Generate All Clips Timeline PRO
 Creates a master timeline from selected timelines, collecting all unique source clips,
 merging overlapping source ranges, and placing them on a new timeline.
 
@@ -26,6 +26,15 @@ MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
 INTER_TIMELINE_GAP = 25  # frames between source-timeline blocks in preserve-layout mode
+
+# Diagnostics
+# If XML retime expansion would grow a clip's source range by more than this
+# factor, skip the expansion and keep the API range. Catches the "full length
+# inclusion" case caused by Time Remap keyframes referencing the entire source.
+XML_EXPANSION_MAX_GROWTH = 5.0
+# In the end-of-run Range Audit, flag any clip whose final source range on the
+# new timeline is >= this many times the original API-reported range.
+RANGE_AUDIT_GROWTH_THRESHOLD = 2.0
 
 TIMELINE_BLOCK_MARKER_COLORS = [
     "Blue", "Cyan", "Green", "Yellow", "Red",
@@ -67,6 +76,14 @@ class ClipInfo:
     source_name: Optional[str] = None
     version_names: list = field(default_factory=list)
     current_version_name: Optional[str] = None
+    # Populated by find_duplicate_groups after merging. None = not a duplicate.
+    duplicate_set_index: Optional[int] = None
+    duplicate_position: Optional[int] = None
+    duplicate_set_size: Optional[int] = None
+    # Raw API-reported source range, captured BEFORE XML expansion and merging.
+    # Used by the end-of-run Range Audit to detect ranges that grew unexpectedly.
+    api_source_start: Optional[int] = None
+    api_source_end: Optional[int] = None
 
 
 @dataclass
@@ -299,6 +316,21 @@ def merge_two(a: ClipInfo, b: ClipInfo) -> ClipInfo:
     else:
         xml_max = a.xml_source_max if a.xml_source_max is not None else b.xml_source_max
 
+    # Carry the API-reported source range through the merge as the span of
+    # constituent API ranges. Range Audit compares final start/end_frame to
+    # this span — any growth past 1.0x means XML expansion was applied to
+    # at least one constituent.
+    api_min: Optional[int] = None
+    api_max: Optional[int] = None
+    if a.api_source_start is not None and b.api_source_start is not None:
+        api_min = min(a.api_source_start, b.api_source_start)
+    else:
+        api_min = a.api_source_start if a.api_source_start is not None else b.api_source_start
+    if a.api_source_end is not None and b.api_source_end is not None:
+        api_max = max(a.api_source_end, b.api_source_end)
+    else:
+        api_max = a.api_source_end if a.api_source_end is not None else b.api_source_end
+
     # Union version names from both clips, preserving order; active version taken from a
     merged_versions: list = []
     seen_versions: set = set()
@@ -325,6 +357,8 @@ def merge_two(a: ClipInfo, b: ClipInfo) -> ClipInfo:
         source_name=a.source_name if a.source_name is not None else b.source_name,
         version_names=merged_versions,
         current_version_name=a.current_version_name if a.current_version_name is not None else b.current_version_name,
+        api_source_start=api_min,
+        api_source_end=api_max,
     )
 
 
@@ -349,55 +383,37 @@ def merge_all_overlapping(clip_infos: list[ClipInfo], threshold: int) -> list[Cl
 
 
 # ---------------------------------------------------------------------------
-# Audio Removal
-# ---------------------------------------------------------------------------
-
-def remove_all_audio_tracks(timeline) -> None:
-    """Remove all audio content from the timeline."""
-    if timeline is None:
-        print("Error: No timeline provided.")
-        return
-
-    print("Removing audio tracks from timeline...")
-    try:
-        track_count = timeline.GetTrackCount("audio")
-        print(f"Found {track_count} audio tracks")
-
-        for i in range(1, track_count + 1):
-            items = timeline.GetItemListInTrack("audio", i)
-            if items:
-                print(f"Deleting items from track {i}")
-                timeline.DeleteClips(items)
-
-        for i in range(track_count, 1, -1):
-            timeline.DeleteTrack("audio", i)
-            print(f"Deleted track {i}")
-
-        print("Successfully cleared all audio tracks.")
-    except Exception as e:
-        print(f"Error: An unexpected error occurred: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Duplicate Detection & Marking
 # ---------------------------------------------------------------------------
 
-def are_clips_duplicates(clip1: TimelineClipData, clip2: TimelineClipData) -> bool:
-    """Check if two clips reference the same media at different timeline positions."""
-    try:
-        path1 = clip1.media_pool_item.GetClipProperty("File Path")
-        path2 = clip2.media_pool_item.GetClipProperty("File Path")
-    except Exception:
-        return False
+def find_duplicate_groups(all_clip_infos: list[ClipInfo]) -> int:
+    """Identify duplicate ClipInfo groups (same media pool item, 2+ entries
+    after merging) and stamp duplicate_set_index / duplicate_position /
+    duplicate_set_size onto each member. Returns the number of duplicate sets.
+    """
+    by_mid: dict[str, list[ClipInfo]] = {}
+    for ci in all_clip_infos:
+        try:
+            mid = ci.media_pool_item.GetMediaId()
+        except Exception:
+            mid = None
+        if not mid:
+            continue
+        by_mid.setdefault(mid, []).append(ci)
 
-    if path1 and path2 and path1 == path2:
-        name1 = clip1.media_pool_item.GetName()
-        name2 = clip2.media_pool_item.GetName()
-        if name1 == name2:
-            if clip1.start_frame != clip2.start_frame or clip1.track_index != clip2.track_index:
-                return True
-        return False
-    return False
+    set_index = 0
+    for group in by_mid.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda c: (c.timeline_inpoint, c.source_track_index))
+        size = len(group)
+        for position, ci in enumerate(group):
+            ci.duplicate_set_index = set_index
+            ci.duplicate_position = position
+            ci.duplicate_set_size = size
+        set_index += 1
+
+    return set_index
 
 
 def get_all_timeline_clips(timeline) -> list[TimelineClipData]:
@@ -439,87 +455,6 @@ def get_all_timeline_clips(timeline) -> list[TimelineClipData]:
 
     print(f"Total clips found: {len(clip_list)}")
     return clip_list
-
-
-def find_and_mark_duplicates(timeline) -> None:
-    """Find duplicate clips and mark them with colored markers."""
-    if not timeline:
-        print("No timeline is open. Please open a timeline.")
-        return
-
-    clips = get_all_timeline_clips(timeline)
-    if not clips:
-        print("No clips found in the timeline.")
-        return
-
-    print(f"Scanning for duplicates among {len(clips)} clips...")
-
-    # Find duplicate sets
-    duplicate_sets = []
-    processed = set()
-
-    for i in range(len(clips)):
-        if i in processed:
-            continue
-        current_set = [clips[i]]
-        processed.add(i)
-
-        for j in range(i + 1, len(clips)):
-            if j in processed:
-                continue
-            print(f"Comparing clip {i + 1} ({clips[i].name}) with clip {j + 1} ({clips[j].name})")
-            if are_clips_duplicates(clips[i], clips[j]):
-                print("  MATCH FOUND!")
-                current_set.append(clips[j])
-                processed.add(j)
-
-        if len(current_set) > 1:
-            duplicate_sets.append(current_set)
-            print(f"Found duplicate set with {len(current_set)} clips")
-
-    # Mark duplicates with colored markers
-    marker_count = 0
-    success_count = 0
-
-    for set_index, dup_set in enumerate(duplicate_sets):
-        color_index = set_index % len(DUPLICATE_MARKER_COLORS)
-        color = DUPLICATE_MARKER_COLORS[color_index]
-
-        print(f"Marking duplicate set {set_index + 1} with {len(dup_set)} clips (Color: {color})")
-
-        for i, clip_data in enumerate(dup_set):
-            marker_text = f"Dup Set #{set_index + 1} ({i + 1}/{len(dup_set)})"
-            source_start = clip_data.clip.GetSourceStartFrame()
-            clip_duration = clip_data.clip.GetDuration()
-            offset_frame = math.floor(clip_duration * 0.25)
-            marker_position = source_start + offset_frame
-
-            try:
-                success = clip_data.clip.AddMarker(
-                    marker_position, color, marker_text,
-                    "Duplicate clip detected", 1, "",
-                )
-            except Exception:
-                success = False
-
-            marker_count += 1
-            if success:
-                success_count += 1
-                print(f"  Added marker to clip: {clip_data.name}")
-            else:
-                print(f"  Failed to add marker to clip: {clip_data.name}")
-
-    # Summary
-    if duplicate_sets:
-        print(f"Found {len(duplicate_sets)} sets of duplicates with {marker_count} total clips.")
-        print(f"Successfully added {success_count} markers out of {marker_count} attempts.")
-        if success_count == 0:
-            print("WARNING: Unable to add markers. This could be due to timeline permissions.")
-            for i, s in enumerate(duplicate_sets):
-                names = [c.name for c in s]
-                print(f"Set #{i + 1}: {', '.join(names)}")
-    else:
-        print("No duplicate clips were found.")
 
 
 # ---------------------------------------------------------------------------
@@ -630,8 +565,14 @@ def run_workflow(
     use_xml_retime: bool,
     import_clip_names: bool,
     preserve_track_layout: bool,
+    merge_by_source_file: bool = True,
+    progress: Optional["ProgressUI"] = None,
 ) -> None:
     """Execute the complete timeline generation workflow."""
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress is not None:
+            progress.set(stage, current, total)
 
     # Get project context — resolve is a pre-injected global in Resolve's scripting environment
     project_manager = resolve.GetProjectManager()  # noqa: F821
@@ -669,8 +610,10 @@ def run_workflow(
 
     # Collect clips from all selected timelines
     clips: dict[str, list[ClipInfo]] = {}
+    total_selected = len(selected_clips)
+    _p("Reading clips...", 0, total_selected)
 
-    for media_pool_item in selected_clips:
+    for sel_idx, media_pool_item in enumerate(selected_clips, start=1):
         if media_pool_item is None:
             continue
 
@@ -683,10 +626,14 @@ def run_workflow(
 
         if clip_type != "Timeline":
             print(f"Skipping non-timeline item: {media_pool_item.GetName()}")
+            _p(f"Skipping non-timeline item ({sel_idx}/{total_selected})",
+               sel_idx, total_selected)
             continue
 
         timeline_name = media_pool_item.GetName()
         print(f"Processing timeline: {timeline_name}")
+        _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
+           sel_idx, total_selected)
 
         curr_timeline = project_timelines.get(timeline_name)
         if not curr_timeline:
@@ -786,6 +733,11 @@ def run_workflow(
                 if not is_frame_hold:
                     norm_end -= 1
 
+                # Capture the raw API-reported range BEFORE any XML expansion
+                # or merging — used by the Range Audit at the end of the run.
+                api_source_start = norm_start
+                api_source_end = norm_end
+
                 # Retime detection
                 is_retimed = False
                 is_non_linear = False
@@ -821,15 +773,37 @@ def run_workflow(
                     if xml_data:
                         xml_min = xml_data["source_min"]
                         xml_max = xml_data["source_max"]
-                        if xml_data["is_non_linear"]:
+                        is_non_lin = xml_data["is_non_linear"]
+                        print(f"  XML matched: keyframe range {xml_min}-{xml_max}, "
+                              f"non_linear={is_non_lin}")
+                        if is_non_lin:
                             is_non_linear = True
                             is_retimed = True
                             # For non-linear retimes (speed ramps) the Resolve API source
                             # in/out may not reflect the full frame range the ramp accesses.
                             # Only in this case do we expand using the XML-derived range.
                             if not is_frame_hold:
-                                norm_start = min(norm_start, xml_min)
-                                norm_end = max(norm_end, xml_max)
+                                proposed_start = min(norm_start, xml_min)
+                                proposed_end = max(norm_end, xml_max)
+                                old_duration = max(1, norm_end - norm_start + 1)
+                                new_duration = max(1, proposed_end - proposed_start + 1)
+                                growth = new_duration / old_duration
+                                if (proposed_start, proposed_end) == (norm_start, norm_end):
+                                    pass  # XML didn't actually expand
+                                elif growth > XML_EXPANSION_MAX_GROWTH:
+                                    print(f"  XML EXPANSION SKIPPED: would grow "
+                                          f"{old_duration}f -> {new_duration}f "
+                                          f"({growth:.1f}x, cap is "
+                                          f"{XML_EXPANSION_MAX_GROWTH:.0f}x). "
+                                          f"Keeping API range {norm_start}-{norm_end}.")
+                                else:
+                                    added = new_duration - old_duration
+                                    print(f"  XML EXPANDED range: "
+                                          f"{norm_start}-{norm_end} ({old_duration}f) -> "
+                                          f"{proposed_start}-{proposed_end} "
+                                          f"({new_duration}f, +{added}f, {growth:.2f}x)")
+                                    norm_start = proposed_start
+                                    norm_end = proposed_end
 
                 # Capture source clip name + color version names if option is on
                 source_clip_name: Optional[str] = None
@@ -880,12 +854,26 @@ def run_workflow(
                     source_name=source_clip_name,
                     version_names=version_names_list,
                     current_version_name=current_version_name,
+                    api_source_start=api_source_start,
+                    api_source_end=api_source_end,
                 )
-                # When preserving track layout, key by (media_id, track_idx) to prevent
-                # cross-track merging — the same source clip used on different tracks
-                # would otherwise be collapsed into one long range. This also fixes a
-                # latent "really long clips" bug for users who enable the option.
-                clips_key = f"{media_id}_T{track_idx}" if preserve_track_layout else media_id
+                # Bucket key strategy:
+                # - merge_by_source_file=True: key by File Path so two MediaPoolItems
+                #   pointing at the same source file (dual-import scenario from
+                #   round-tripped conform timelines) land in the same bucket and get
+                #   merged. Falls back to media_id when File Path is empty.
+                # - merge_by_source_file=False: key by media_id (legacy behavior).
+                # When preserving track layout, we also include the track index in the
+                # key to prevent cross-track merging.
+                identity_key = media_id
+                if merge_by_source_file:
+                    try:
+                        fp = media_item.GetClipProperty("File Path") or ""
+                    except Exception:
+                        fp = ""
+                    if fp:
+                        identity_key = f"FP:{fp}"
+                clips_key = f"{identity_key}_T{track_idx}" if preserve_track_layout else identity_key
                 clips.setdefault(clips_key, []).append(clip_info)
                 print(f"  Added clip to processing list: {item_name} "
                       f"(Start: {norm_start}, End: {norm_end}, Track: {track_idx})")
@@ -902,7 +890,96 @@ def run_workflow(
         print("No valid clips found to process.")
         return
 
+    # Cross-bucket scan: files appearing under multiple bucket keys. With
+    # merge-by-file-path ON this should be empty (or only flag clips with
+    # missing File Path); with it OFF this is the classic "two MediaPoolItems,
+    # one source file" warning that explains unmerged subset/superset clips.
+    path_to_buckets: dict[str, list[tuple[str, ClipInfo]]] = {}
+    for bucket_key, bucket_clips in clips.items():
+        for ci in bucket_clips:
+            try:
+                fp = ci.media_pool_item.GetClipProperty("File Path") or ""
+            except Exception:
+                fp = ""
+            if not fp:
+                continue
+            path_to_buckets.setdefault(fp, []).append((bucket_key, ci))
+
+    cross_bucket = []
+    for fp, entries in path_to_buckets.items():
+        distinct_keys = {bk for bk, _ in entries}
+        if len(distinct_keys) > 1:
+            cross_bucket.append((fp, entries, distinct_keys))
+
+    if cross_bucket and not merge_by_source_file:
+        print("")
+        print(f"=== Pre-Merge Warning: {len(cross_bucket)} source file(s) "
+              f"appear under multiple MediaPoolItems ===")
+        print("(These won't merge across buckets — different MediaIds, often "
+              "sub-clip vs full clip or the same file imported twice. Enable "
+              "'Merge clips by source file path' to merge them.)")
+        for fp, entries, distinct_keys in cross_bucket:
+            print(f"  File: {fp}")
+            print(f"  -> {len(distinct_keys)} distinct bucket(s):")
+            for bk, ci in entries:
+                try:
+                    mid = ci.media_pool_item.GetMediaId() or "?"
+                except Exception:
+                    mid = "?"
+                print(f"       bucket='{bk}'  MediaPoolItem='{ci.media_pool_item.GetName()}'  "
+                      f"MediaId={mid}  range={ci.start_frame}-{ci.end_frame}  "
+                      f"(from '{ci.source_timeline_name}')")
+        print("")
+    elif cross_bucket and merge_by_source_file:
+        # Should be rare — only files with missing File Path can land here.
+        print(f"NOTE: {len(cross_bucket)} file(s) still in multiple buckets despite "
+              f"merge-by-file-path being on (likely missing File Path).")
+
+    # Canonicalize MediaPoolItem per bucket: when merge-by-file-path is on, a
+    # single bucket may contain clips from multiple MediaPoolItems pointing at
+    # the same file. Pick the one with the widest source range (most Frames)
+    # as the canonical item for the merged ClipInfo so AppendToTimeline can
+    # place the merged range without hitting sub-clip range restrictions.
+    if merge_by_source_file:
+        def _item_frames(item) -> int:
+            try:
+                val = item.GetClipProperty("Frames")
+                return int(val) if val else 0
+            except (ValueError, TypeError, Exception):
+                return 0
+
+        canonicalized_buckets = 0
+        for bucket_key, bucket_clips in clips.items():
+            distinct_items: dict = {}
+            for ci in bucket_clips:
+                try:
+                    mid = ci.media_pool_item.GetMediaId() or ""
+                except Exception:
+                    mid = ""
+                if mid and mid not in distinct_items:
+                    distinct_items[mid] = ci.media_pool_item
+            if len(distinct_items) <= 1:
+                continue
+            canonical = max(distinct_items.values(), key=_item_frames)
+            canonical_name = canonical.GetName()
+            canonical_frames = _item_frames(canonical)
+            try:
+                canonical_path = canonical.GetClipProperty("File Path") or ""
+            except Exception:
+                canonical_path = ""
+            print(f"INFO: Merging {len(distinct_items)} MediaPoolItems for "
+                  f"'{canonical_path or canonical_name}'. Canonical: "
+                  f"{canonical_name} ({canonical_frames}f)")
+            for ci in bucket_clips:
+                ci.media_pool_item = canonical
+            canonicalized_buckets += 1
+        if canonicalized_buckets:
+            print(f"=== File-Path Merge: canonicalized {canonicalized_buckets} "
+                  f"bucket(s) across multiple MediaPoolItems ===")
+            print("")
+
     # Merge overlapping clips for each media ID
+    _p("Merging overlapping ranges...", 0, 0)
     for media_id in clips:
         clips[media_id] = merge_all_overlapping(clips[media_id], connection_threshold)
 
@@ -996,6 +1073,14 @@ def run_workflow(
         all_clip_infos = rebuilt
         print(f"After per-timeline processing: {len(all_clip_infos)} unique clip entries")
 
+    # Detect duplicate sets on the merged ClipInfo list (before timeline creation)
+    if mark_duplicates:
+        _p("Detecting duplicates...", 0, 0)
+        dup_set_count = find_duplicate_groups(all_clip_infos)
+        print(f"Detected {dup_set_count} duplicate set(s) across {len(all_clip_infos)} clips")
+    else:
+        dup_set_count = 0
+
     # Apply sorting
     if preserve_track_layout and sorting_method != "None":
         print(f"Preserve Source Track Layout is on — overriding sort '{sorting_method}' to 'None'")
@@ -1039,10 +1124,13 @@ def run_workflow(
     # Add clips — single code path for all clip types
     append_success_count = 0
     append_error_count = 0
+    total_to_append = len(all_clip_infos)
 
     for i, clip_info in enumerate(all_clip_infos):
+        clip_name = clip_info.media_pool_item.GetName()
+        _p(f"Appending clip: {clip_name}", i + 1, total_to_append)
         print(f"Adding clip #{i + 1} to timeline:")
-        print(f"  Clip name: {clip_info.media_pool_item.GetName()}")
+        print(f"  Clip name: {clip_name}")
         print(f"  Frame range: {clip_info.start_frame} to {clip_info.end_frame}")
 
         # Log original clip status
@@ -1060,11 +1148,16 @@ def run_workflow(
             print("  (Adding normalized forward-playing version)")
 
         api_dict = sanitize_for_api(clip_info)
+        # Audio filtering: mediaType=1 is the documented way to import video
+        # only and works across all Resolve versions. importVideo/importAudio
+        # are kept as a belt-and-suspenders hint for newer API builds.
+        if video_only:
+            api_dict["mediaType"] = 1  # 1 = video, 2 = audio
+        api_dict["importVideo"] = True
+        api_dict["importAudio"] = not video_only
         if preserve_track_layout:
             api_dict["recordFrame"] = clip_info.timeline_inpoint
             api_dict["trackIndex"] = clip_info.source_track_index
-            api_dict["importVideo"] = True
-            api_dict["importAudio"] = not video_only
         try:
             media_pool.AppendToTimeline([api_dict])
             append_success_count += 1
@@ -1079,11 +1172,6 @@ def run_workflow(
     print(f"Clip addition summary: {append_success_count} succeeded, "
           f"{append_error_count} failed")
     print(f"New timeline created: {dst_timeline_name}")
-
-    # Post-processing: remove audio
-    if video_only:
-        print("Video Only option selected — removing all audio tracks...")
-        remove_all_audio_tracks(new_timeline)
 
     # Post-processing: source-timeline ruler markers (preserve-layout mode)
     if preserve_track_layout and timeline_markers:
@@ -1101,19 +1189,64 @@ def run_workflow(
             else:
                 print(f"  WARNING: failed to add marker '{m['name']}' at frame {m['frame']}")
 
-    # Post-processing: mark duplicates
-    if mark_duplicates:
-        print("Marking duplicates in the new timeline...")
-        find_and_mark_duplicates(new_timeline)
+    # Post-processing: mark duplicates (uses pre-computed metadata on ClipInfo)
+    if mark_duplicates and dup_set_count > 0:
+        print(f"Marking {dup_set_count} duplicate set(s) in the new timeline...")
+        _p("Marking duplicates...", 0, 0)
+        clip_list = get_all_timeline_clips(new_timeline)
+        marker_count = 0
+        success_count = 0
+        total_clips = len(clip_list)
+
+        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
+            _p(f"Marking duplicates: {timeline_clip.name}", ci_idx, total_clips)
+            for clip_info in all_clip_infos:
+                if clip_info.duplicate_set_index is None:
+                    continue
+                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
+                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame
+                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + 1):
+
+                    set_idx = clip_info.duplicate_set_index
+                    color = DUPLICATE_MARKER_COLORS[set_idx % len(DUPLICATE_MARKER_COLORS)]
+                    marker_text = (f"Dup Set #{set_idx + 1} "
+                                   f"({clip_info.duplicate_position + 1}/{clip_info.duplicate_set_size})")
+                    source_start = timeline_clip.clip.GetSourceStartFrame()
+                    clip_duration = timeline_clip.clip.GetDuration()
+                    marker_position = source_start + math.floor(clip_duration * 0.25)
+
+                    try:
+                        success = timeline_clip.clip.AddMarker(
+                            marker_position, color, marker_text,
+                            "Duplicate clip detected", 1, "",
+                        )
+                    except Exception:
+                        success = False
+
+                    marker_count += 1
+                    if success:
+                        success_count += 1
+                        print(f"  Added duplicate marker to: {timeline_clip.name}")
+                    else:
+                        print(f"  Failed to add duplicate marker to: {timeline_clip.name}")
+                    break
+
+        print(f"Successfully added {success_count} duplicate markers out of "
+              f"{marker_count} attempts.")
+    elif mark_duplicates:
+        print("No duplicate clips were found.")
 
     # Post-processing: mark retimed clips
     if mark_retimed_clips:
         print("Marking retimed clips in the new timeline...")
+        _p("Marking retimed clips...", 0, 0)
         clip_list = get_all_timeline_clips(new_timeline)
         marker_count = 0
         success_count = 0
+        total_clips = len(clip_list)
 
-        for timeline_clip in clip_list:
+        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
+            _p(f"Marking retimes: {timeline_clip.name}", ci_idx, total_clips)
             for clip_info in all_clip_infos:
                 # Match by name and source frame range
                 if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
@@ -1167,11 +1300,14 @@ def run_workflow(
     # Post-processing: apply source clip names + color version names
     if import_clip_names:
         print("Applying source clip names and color version names to new timeline...")
+        _p("Applying clip names...", 0, 0)
         clip_list = get_all_timeline_clips(new_timeline)
         name_apply_count = 0
         version_apply_count = 0
+        total_clips = len(clip_list)
 
-        for timeline_clip in clip_list:
+        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
+            _p(f"Applying names: {timeline_clip.name}", ci_idx, total_clips)
             for clip_info in all_clip_infos:
                 if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
                         and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame
@@ -1220,7 +1356,126 @@ def run_workflow(
         print(f"Clip names applied to {name_apply_count} clips.")
         print(f"Color version names applied to {version_apply_count} clips.")
 
+    # Range Audit: flag any clip whose final source range on the new timeline
+    # grew significantly versus the raw API-reported range. The only thing in
+    # the pipeline that can cause growth past 1.0x is XML retime expansion of
+    # a constituent — so this is the primary diagnostic when clips end up
+    # longer than expected.
+    audit_rows = []
+    for ci in all_clip_infos:
+        if ci.api_source_start is None or ci.api_source_end is None:
+            continue
+        api_dur = max(1, ci.api_source_end - ci.api_source_start + 1)
+        final_dur = max(1, ci.end_frame - ci.start_frame + 1)
+        if final_dur >= api_dur * RANGE_AUDIT_GROWTH_THRESHOLD:
+            audit_rows.append((
+                final_dur / api_dur,
+                ci.media_pool_item.GetName(),
+                ci.source_timeline_name,
+                ci.api_source_start, ci.api_source_end, api_dur,
+                ci.start_frame, ci.end_frame, final_dur,
+                ci.is_non_linear_retime,
+            ))
+
+    if audit_rows:
+        audit_rows.sort(reverse=True)
+        print("")
+        print(f"=== Range Audit: {len(audit_rows)} clip(s) grew "
+              f">={RANGE_AUDIT_GROWTH_THRESHOLD:.1f}x vs raw API range ===")
+        print("(Cause: XML retime expansion. Disable 'Use XML for Precise "
+              "Retime Detection' to keep raw API ranges.)")
+        for (growth, name, tl, api_s, api_e, api_d,
+             fin_s, fin_e, fin_d, non_lin) in audit_rows:
+            tag = " [non-linear]" if non_lin else ""
+            print(f"  [{growth:5.1f}x]{tag} {name}  (from '{tl}')")
+            print(f"           API: {api_s}-{api_e} ({api_d}f)  "
+                  f"->  Final: {fin_s}-{fin_e} ({fin_d}f)")
+        print("")
+    elif use_xml_retime:
+        print("Range Audit: no clips grew significantly beyond API range.")
+
+    _p("Done!", 1, 1)
     print("Done!")
+
+
+# ---------------------------------------------------------------------------
+# Progress UI
+# ---------------------------------------------------------------------------
+
+class ProgressUI:
+    """Modeless progress window built with Resolve's UIManager.
+
+    Fusion's UI doesn't tick during blocking Python — we call Fusion:Wait(0)
+    after each update to flush pending events so the window stays responsive.
+    If Wait isn't available, the label/slider values still update; refresh
+    happens on the next natural event-loop tick.
+    """
+
+    def __init__(self) -> None:
+        try:
+            self.ui = fu.UIManager  # noqa: F821
+            self.disp = bmd.UIDispatcher(self.ui)  # noqa: F821
+            self.win = self.disp.AddWindow({
+                "ID": "GenAllClipsProgress",
+                "WindowTitle": "Generate All Clips Timeline PRO — Progress",
+                "Geometry": [150, 150, 520, 120],
+                "Spacing": 8,
+            }, [
+                self.ui.VGroup({"ID": "root"}, [
+                    self.ui.Label({"ID": "StageLabel", "Text": "Starting..."}),
+                    self.ui.Slider({
+                        "ID": "ProgressBar",
+                        "Integer": True,
+                        "Minimum": 0,
+                        "Maximum": 100,
+                        "Value": 0,
+                    }),
+                    self.ui.Label({"ID": "CounterLabel", "Text": ""}),
+                ]),
+            ])
+            self.itm = self.win.GetItems()
+            self.win.Show()
+            self._tick()
+            self._ok = True
+        except Exception as e:
+            print(f"Progress UI unavailable: {e}")
+            self._ok = False
+
+    def set(self, stage: str, current: int = 0, total: int = 0) -> None:
+        if not self._ok:
+            return
+        try:
+            self.itm["StageLabel"].Text = stage
+            if total > 0:
+                pct = int(100 * current / total) if total else 0
+                if pct < 0:
+                    pct = 0
+                elif pct > 100:
+                    pct = 100
+                self.itm["ProgressBar"].Value = pct
+                self.itm["CounterLabel"].Text = f"{current} / {total}  ({pct}%)"
+            else:
+                self.itm["ProgressBar"].Value = 0
+                self.itm["CounterLabel"].Text = ""
+        except Exception:
+            pass
+        self._tick()
+
+    def _tick(self) -> None:
+        try:
+            fusion = bmd.scriptapp("Fusion")  # noqa: F821
+            if fusion is not None:
+                fusion.Wait(0)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if not self._ok:
+            return
+        try:
+            self.win.Hide()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1232,11 +1487,11 @@ def build_and_show_ui() -> Optional[dict]:
     # fu and bmd are pre-injected globals in Resolve's scripting environment
     ui = fu.UIManager  # noqa: F821
     disp = bmd.UIDispatcher(ui)  # noqa: F821
-    width, height = 500, 480
+    width, height = 540, 510
 
     win = disp.AddWindow({
         "ID": "MyWin",
-        "WindowTitle": "Generate All Clips Timeline",
+        "WindowTitle": "Generate All Clips Timeline PRO",
         "Geometry": [100, 100, width, height],
         "Spacing": 10,
     }, [
@@ -1298,6 +1553,27 @@ def build_and_show_ui() -> Optional[dict]:
                 "ID": "preserveTrackLayout",
                 "Text": "Preserve Source Track Layout",
                 "Checked": False,
+            }),
+            ui.CheckBox({
+                "ID": "mergeBySourceFile",
+                "Text": "Merge Clips by Source File Path (across MediaPool entries)",
+                "Checked": True,
+                "ToolTip": (
+                    "When ON (default): clips that reference the same source "
+                    "file on disk are merged into one max-length entry, even "
+                    "if Resolve sees them as separate Media Pool items "
+                    "(different MediaIds). This is the common case when each "
+                    "source timeline was prepped or round-tripped separately "
+                    "and the same file ended up imported into the bin under "
+                    "two entries. The Media Pool item with the widest source "
+                    "range is used for the merged clip so AppendToTimeline "
+                    "can place the full range.\n\n"
+                    "When OFF: clips are bucketed strictly by MediaId. Two "
+                    "imports of the same file stay separate on the output "
+                    "timeline. Use this only if you intentionally want "
+                    "duplicate Media Pool entries kept distinct (e.g. you "
+                    "rely on sub-clips being treated as their own sources)."
+                ),
             }),
             ui.HGroup({"ID": "buttons"}, [
                 ui.Button({"ID": "cancelButton", "Text": "Cancel"}),
@@ -1365,6 +1641,7 @@ def build_and_show_ui() -> Optional[dict]:
         "use_xml_retime": itm["useXmlRetime"].Checked,
         "import_clip_names": itm["importClipNames"].Checked,
         "preserve_track_layout": itm["preserveTrackLayout"].Checked,
+        "merge_by_source_file": itm["mergeBySourceFile"].Checked,
     }
 
 
@@ -1377,7 +1654,11 @@ def main():
     params = build_and_show_ui()
     if params is None:
         return
-    run_workflow(**params)
+    progress = ProgressUI()
+    try:
+        run_workflow(progress=progress, **params)
+    finally:
+        progress.close()
 
 
 main()
