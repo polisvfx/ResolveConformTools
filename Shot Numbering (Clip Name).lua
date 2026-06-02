@@ -221,6 +221,16 @@ function Main()
                 originalName = mediaPoolItem:GetName() or ""
             end
             if originalName ~= "" then
+                -- Strip file extension from the suffix (e.g. ".mov", ".mxf", ".R3D")
+                local stem = originalName:match("^(.+)%.[^.]+$")
+                if stem and stem ~= "" then
+                    originalName = stem
+                end
+                -- Strip Resolve's file-sequence range suffix (e.g. " [0001-0100]", "_[0001-0100]")
+                local trimmed = originalName:match("^(.-)[%s%._%-]*%[%d+%-%d+%]$")
+                if trimmed and trimmed ~= "" then
+                    originalName = trimmed
+                end
                 newName = newName .. separator .. originalName
             end
         end
