@@ -202,10 +202,10 @@ def show_popup(project, clip_name, source_label, results):
         win,
         text=f"Used in {len(results)} timeline(s)  —  double-click to open:",
         font=("Helvetica", 10, "bold"),
-        padx=18, pady=(10, 4),
+        padx=18,
         anchor="w"
     )
-    count_label.pack(fill="x")
+    count_label.pack(fill="x", pady=(10, 4))
 
     # Scrollable frame for long lists
     frame = tk.Frame(win, padx=18, pady=2)
