@@ -1,6 +1,7 @@
 --[[
     Script to remove all audio tracks from the active timeline in DaVinci Resolve.
     Requires DaVinci Resolve Studio.
+    Version: 1.0
 --]]
 
 function main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env lua
 
 -- Script to set Shot metadata field for clips in the timeline
--- Version: 1.4 (Strict Sequential Numbering, Duplicates Marked)
+-- Version: 1.4
 -- Assigns sequential shot numbers based strictly on timeline order.
 -- 'Shot' metadata is set ONLY on the first instance of each source clip encountered.
 -- Duplicate instances have their 'Shot' metadata UNCHANGED, but receive a marker

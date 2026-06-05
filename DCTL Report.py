@@ -2,6 +2,7 @@
 """
 DCTL Report  (DRP-only variant)
 ================================
+Version: 1.0
 
 Scans the currently-open DaVinci Resolve project for every LUT and DCTL
 reference it uses, resolves each reference against the standard Resolve

@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """
 Copy Clip to Nuke
+Version: 1.0
+
 Copies the selected DaVinci Resolve timeline clip's file path, editorial data,
 and metadata into a Nuke-ready format on the clipboard.
 

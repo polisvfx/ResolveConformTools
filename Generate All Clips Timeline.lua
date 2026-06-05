@@ -1,5 +1,6 @@
 --[[
 Timeline Generator with Duplicate Marker
+Version: 1.0
 This script creates a master timeline from selected timelines and optionally marks duplicate clips.
 ]]--
 

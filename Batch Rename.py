@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """
 Batch Rename
+Version: 1.0
+
 A comprehensive batch renaming utility for DaVinci Resolve.
 
 Features:
