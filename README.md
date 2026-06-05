@@ -82,5 +82,15 @@ A comprehensive batch renaming utility for media pool items in DaVinci Resolve. 
 - **Include Subfolders**: Optionally recurse into subfolders of the current media pool bin
 - Uses PySide6 (bundled with Resolve) for a native Qt UI with dark theme
 
+## Find Clip in Timelines
+Searches every timeline in the current project for the selected clip and lists the timelines that use it. Run with a clip selected in either the active timeline (video item) or the Media Pool.
+
+- **Clickable results**: Double-click a timeline in the list to switch to it; the playhead jumps (best-effort) to the in-point of the clip's first occurrence on that timeline
+- **Multi-hit indicator**: Timelines containing more than one instance show a `(N×)` badge — the jump targets the first occurrence
+- **Drop-frame aware**: Playhead positioning handles 29.97 / 59.94 drop-frame timecode
+- **Stay-open popup**: The results window remains open after opening a timeline, so you can jump between multiple matches without re-running the script
+- Dark, Resolve-style UI built with tkinter — no extra dependencies
+
+
 ## Future Features
 The nuke integration is in its infancy and I am contemplating making it a bit more robust and useful, maybe creating a script that will generate a project config file that handles all variables like, project resolution, handles and so on. You could theoretically also reference nukescript templates and generate nuke scripts out of Resolve.
