@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """
 Copy Clip to Nuke (Quick)
+Version: 1.0
+
 Skips the settings dialog when settings have already been configured
 for the current project. Shows the full UI only on first use.
 

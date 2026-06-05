@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
+Version: 1.0
+
 Creates a master timeline from selected timelines, collecting all unique source clips,
 merging overlapping source ranges, and placing them on a new timeline.
 

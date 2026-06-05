@@ -1,6 +1,8 @@
 """
 Find Clip in Timelines.py
 ─────────────────────────
+Version: 1.0
+
 Searches all timelines in the current project for the selected clip and
 shows a popup listing the timelines that contain it.
 

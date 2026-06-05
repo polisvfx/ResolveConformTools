@@ -1,6 +1,6 @@
 --[[
 Timeline Duplicate Clip Marker - DaVinci Resolve Script
-Version: 1.2 (Corrected Marker Placement)
+Version: 1.2
 
 This script scans the current timeline for duplicate clips (including image sequences)
 and marks them with colored markers to easily identify them.

@@ -1,3 +1,8 @@
+--[[
+Copy Timeline Settings
+Version: 1.0
+]]
+
 function print_table(t, indentation)
     if indentation == nil then
         indentation = 0
