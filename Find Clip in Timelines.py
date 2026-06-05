@@ -153,22 +153,26 @@ def frames_to_timecode(frame, fps, drop_frame=False):
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
+# Resolve-style dark palette
+BG_MAIN  = "#2b2b2b"   # window background
+BG_PANEL = "#3a3a3a"   # listbox / button background
+BG_ALT   = "#323232"   # alternating row tint
+FG_TEXT  = "#d8d8d8"   # primary text
+FG_MUTED = "#8a8a8a"   # subtitle / secondary text
+FG_ERR   = "#ff8080"   # status errors
+SEL_BG   = "#5a5a5a"   # selected row background
+SEL_FG   = "#ffffff"   # selected row text
+BORDER   = "#1a1a1a"   # subtle dividers
+
+
 def show_popup(project, clip_name, source_label, results):
     root = tk.Tk()
     root.withdraw()                        # hide the blank root window
+    root.configure(bg=BG_MAIN)
 
-    if not results:
-        messagebox.showinfo(
-            "Clip Usage",
-            f'"{clip_name}"\n\nNot found in any timeline.',
-            parent=root
-        )
-        root.destroy()
-        return
-
-    # Custom window so we can make it always-on-top and scrollable
     win = tk.Toplevel(root)
     win.title("Clip Usage — Find in Timelines")
+    win.configure(bg=BG_MAIN)
     win.resizable(False, False)
     win.attributes("-topmost", True)       # float above Resolve
 
@@ -177,6 +181,7 @@ def show_popup(project, clip_name, source_label, results):
         win,
         text=f'"{clip_name}"',
         font=("Helvetica", 13, "bold"),
+        bg=BG_MAIN, fg=FG_TEXT,
         padx=18, pady=10,
         anchor="w",
         justify="left"
@@ -187,105 +192,135 @@ def show_popup(project, clip_name, source_label, results):
         win,
         text=f"Source: {source_label}",
         font=("Helvetica", 10),
-        fg="#666666",
+        bg=BG_MAIN, fg=FG_MUTED,
         padx=18,
         anchor="w",
         justify="left"
     )
     sub.pack(fill="x")
 
-    separator = tk.Frame(win, height=1, bg="#cccccc")
-    separator.pack(fill="x", padx=12, pady=(4, 0))
+    separator = tk.Frame(win, height=1, bg=BORDER)
+    separator.pack(fill="x", padx=12, pady=(6, 0))
 
-    # ── Timeline list ──
-    count_label = tk.Label(
-        win,
-        text=f"Used in {len(results)} timeline(s)  —  double-click to open:",
-        font=("Helvetica", 10, "bold"),
-        padx=18,
-        anchor="w"
-    )
-    count_label.pack(fill="x", pady=(10, 4))
+    if not results:
+        empty = tk.Label(
+            win,
+            text="Not found in any timeline.",
+            font=("Helvetica", 11),
+            bg=BG_MAIN, fg=FG_TEXT,
+            padx=18, pady=20,
+            anchor="w",
+            justify="left"
+        )
+        empty.pack(fill="x")
+    else:
+        # ── Timeline list ──
+        count_label = tk.Label(
+            win,
+            text=f"Used in {len(results)} timeline(s)  —  double-click to open:",
+            font=("Helvetica", 10, "bold"),
+            bg=BG_MAIN, fg=FG_TEXT,
+            padx=18,
+            anchor="w"
+        )
+        count_label.pack(fill="x", pady=(10, 4))
 
-    # Scrollable frame for long lists
-    frame = tk.Frame(win, padx=18, pady=2)
-    frame.pack(fill="both", expand=True)
+        # Scrollable frame for long lists
+        frame = tk.Frame(win, bg=BG_MAIN, padx=18, pady=2)
+        frame.pack(fill="both", expand=True)
 
-    scrollbar = tk.Scrollbar(frame, orient="vertical")
-    listbox = tk.Listbox(
-        frame,
-        yscrollcommand=scrollbar.set,
-        font=("Helvetica", 11),
-        selectmode="browse",
-        activestyle="none",
-        relief="flat",
-        bd=0,
-        highlightthickness=0,
-        width=48,
-        height=min(len(results), 16)       # cap at 16 rows, then scroll
-    )
-    scrollbar.config(command=listbox.yview)
+        scrollbar = tk.Scrollbar(
+            frame,
+            orient="vertical",
+            bg=BG_PANEL,
+            troughcolor=BG_MAIN,
+            activebackground=SEL_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        listbox = tk.Listbox(
+            frame,
+            yscrollcommand=scrollbar.set,
+            font=("Helvetica", 11),
+            bg=BG_PANEL, fg=FG_TEXT,
+            selectbackground=SEL_BG,
+            selectforeground=SEL_FG,
+            selectmode="browse",
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            width=48,
+            height=min(len(results), 16)       # cap at 16 rows, then scroll
+        )
+        scrollbar.config(command=listbox.yview)
 
-    for r in results:
-        hit_summary = f"  ({len(r['hits'])}×)" if len(r['hits']) > 1 else ""
-        listbox.insert("end", f"  {r['name']}{hit_summary}")
+        for r in results:
+            hit_summary = f"  ({len(r['hits'])}×)" if len(r['hits']) > 1 else ""
+            listbox.insert("end", f"  {r['name']}{hit_summary}")
 
-    # Alternate row colours for readability
-    for i in range(0, listbox.size(), 2):
-        listbox.itemconfig(i, bg="#f5f5f5")
+        # Alternate row tint for readability
+        for i in range(0, listbox.size(), 2):
+            listbox.itemconfig(i, bg=BG_ALT)
 
-    listbox.pack(side="left", fill="both", expand=True)
-    if len(results) > 16:
-        scrollbar.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+        if len(results) > 16:
+            scrollbar.pack(side="right", fill="y")
 
-    # ── Status line (used for open-attempt errors) ──
-    status_var = tk.StringVar(value="")
-    status_label = tk.Label(
-        win,
-        textvariable=status_var,
-        font=("Helvetica", 9),
-        fg="#a33333",
-        padx=18,
-        anchor="w",
-        justify="left"
-    )
-    status_label.pack(fill="x")
+        # ── Status line (used for open-attempt errors) ──
+        status_var = tk.StringVar(value="")
+        status_label = tk.Label(
+            win,
+            textvariable=status_var,
+            font=("Helvetica", 9),
+            bg=BG_MAIN, fg=FG_ERR,
+            padx=18,
+            anchor="w",
+            justify="left"
+        )
+        status_label.pack(fill="x")
 
-    # ── Open handler ──
-    def open_selected(event=None):
-        selection = listbox.curselection()
-        if not selection:
-            return
-        r  = results[selection[0]]
-        tl = r["timeline"]
+        # ── Open handler ──
+        def open_selected(event=None):
+            selection = listbox.curselection()
+            if not selection:
+                return
+            r  = results[selection[0]]
+            tl = r["timeline"]
 
-        if not project.SetCurrentTimeline(tl):
-            status_var.set(f'Could not switch to "{r["name"]}".')
-            return
-        status_var.set("")
+            if not project.SetCurrentTimeline(tl):
+                status_var.set(f'Could not switch to "{r["name"]}".')
+                return
+            status_var.set("")
 
-        # Best-effort playhead jump to the first occurrence
-        try:
-            fps   = tl.GetSetting("timelineFrameRate")
-            df_in = str(tl.GetSetting("timelineDropFrameTimecode"))
-            df    = df_in in ("1", "True", "true")
-            tc    = frames_to_timecode(r["hits"][0]["start_frame"], fps, df)
-            if tc:
-                tl.SetCurrentTimecode(tc)
-        except Exception:
-            pass  # non-critical — timeline switch already succeeded
+            # Best-effort playhead jump to the first occurrence
+            try:
+                fps   = tl.GetSetting("timelineFrameRate")
+                df_in = str(tl.GetSetting("timelineDropFrameTimecode"))
+                df    = df_in in ("1", "True", "true")
+                tc    = frames_to_timecode(r["hits"][0]["start_frame"], fps, df)
+                if tc:
+                    tl.SetCurrentTimecode(tc)
+            except Exception:
+                pass  # non-critical — timeline switch already succeeded
 
-    listbox.bind("<Double-Button-1>", open_selected)
-    listbox.bind("<Return>",          open_selected)
+        listbox.bind("<Double-Button-1>", open_selected)
+        listbox.bind("<Return>",          open_selected)
 
     # ── Close button ──
-    btn_frame = tk.Frame(win, pady=10)
+    btn_frame = tk.Frame(win, bg=BG_MAIN, pady=10)
     btn_frame.pack()
     tk.Button(
         btn_frame,
-        text="  Close  ",
+        text="   Close   ",
         command=win.destroy,
-        relief="groove",
+        bg=BG_PANEL, fg=FG_TEXT,
+        activebackground=SEL_BG,
+        activeforeground=SEL_FG,
+        relief="flat",
+        bd=0,
+        padx=12, pady=4,
+        highlightthickness=0,
         font=("Helvetica", 10)
     ).pack()
 
