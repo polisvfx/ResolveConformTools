@@ -1,8 +1,18 @@
 --[[
 Timeline Generator with Duplicate Marker
-Version: 1.0
+Version: 1.1
 This script creates a master timeline from selected timelines and optionally marks duplicate clips.
 ]]--
+
+-- AppendToTimeline can place clips with a small source-frame slip relative to
+-- what we requested (observed: -1/0 on start, 0/-1 on end depending on whether
+-- the request hits a media-end clamp or an auto pre-roll handle). The post-
+-- processing matchers use this tolerance when correlating placed timeline
+-- items back to their clip_info.
+SLIP_TOLERANCE = 2
+-- Max attempts to compensate for AppendToTimeline source-frame slip before
+-- accepting whatever Resolve produced and falling back to widening the request.
+SLIP_RETRY_LIMIT = 2
 
 function print_table(t, indentation)
     if indentation == nil then
@@ -702,10 +712,14 @@ function main()
                             end
                             
                             -- Get source frame range
+                            -- GetSourceEndFrame() is inclusive in the Resolve API, and
+                            -- AppendToTimeline.endFrame is inclusive too — pass end_frame
+                            -- through unchanged. (The old `- 1` chopped the last source
+                            -- frame off every placed clip.)
                             local start_frame, end_frame
                             local frame_success = pcall(function()
                                 start_frame = track_item:GetSourceStartFrame()
-                                end_frame = track_item:GetSourceEndFrame() - 1
+                                end_frame = track_item:GetSourceEndFrame()
                             end)
                             
                             if not frame_success or not start_frame or not end_frame then
@@ -878,10 +892,23 @@ function main()
         local new_timeline = media_pool:CreateEmptyTimeline(dst_timeline_name)
         assert(project:SetCurrentTimeline(new_timeline), "couldn't set current timeline to the new timeline")
 
+        -- Capture timeline FPS so per-clip code can warn on FPS mismatches.
+        local timeline_fps_str = ""
+        pcall(function() timeline_fps_str = new_timeline:GetSetting("timelineFrameRate") or "" end)
+        if timeline_fps_str == "" then
+            pcall(function() timeline_fps_str = project:GetSetting("timelineFrameRate") or "" end)
+        end
+        local timeline_fps = tonumber(timeline_fps_str)
+        print("Timeline FPS: " .. (timeline_fps_str ~= "" and timeline_fps_str or "<unknown>"))
+
         -- Add clips in the sorted order
         local append_success_count = 0
         local append_error_count = 0
-        
+        -- Slip-compensation telemetry (summarised at the end of the append phase).
+        local slip_corrected_count = 0  -- clips that landed on target after retry
+        local slip_widened_count = 0    -- clips that needed the +/-1 widening fallback
+        local slip_unfixed_count = 0    -- clips where even widening did not cover target
+
         for i, clip_info in ipairs(all_clip_infos) do
             print("Adding clip #" .. i .. " to timeline:")
             print("  Clip name: " .. clip_info.mediaPoolItem:GetName())
@@ -902,7 +929,24 @@ function main()
             if status_info ~= "" then
                 print("  Special clip status: " .. status_info)
             end
-            
+
+            -- Quiet FPS-mismatch check (loud warning only when triggered).
+            -- Used by the widening fallback to bound the request to media End.
+            local mpi = clip_info.mediaPoolItem
+            local clip_fps_val = nil
+            pcall(function()
+                local raw = mpi:GetClipProperty("FPS")
+                if raw ~= nil and raw ~= "" then
+                    clip_fps_val = tonumber(raw)
+                end
+            end)
+            if timeline_fps ~= nil and clip_fps_val ~= nil
+                    and math.abs(timeline_fps - clip_fps_val) > 0.01 then
+                print("  WARN: FPS mismatch on '" .. mpi:GetName() ..
+                      "' (clip=" .. tostring(clip_fps_val) ..
+                      ", timeline=" .. tostring(timeline_fps) .. ")")
+            end
+
             -- For reversed clips, create a normalized version
             if clip_info.isReversed then
                 print("  Using special handling for reversed clip")
@@ -969,20 +1013,150 @@ function main()
                     append_error_count = append_error_count + 1
                 end
             else
-                -- For normal clips, use standard approach
-                local success = pcall(function() media_pool:AppendToTimeline({clip_info}) end)
-                
-                if success then
-                    append_success_count = append_success_count + 1
-                else
+                -- For normal clips, use standard approach with slip compensation.
+                -- AppendToTimeline sometimes places clips with their source in/out
+                -- shifted by +/-1 frame (codec/internal anchor quirks). After the
+                -- append we re-query the placed clip's source range; if it differs
+                -- from the target we delete it and retry with startFrame/endFrame
+                -- adjusted by the inverse of the observed slip. Capped at
+                -- SLIP_RETRY_LIMIT retries; if still off we fall back to widening
+                -- the request by +/-1 so the target range is fully contained in
+                -- the placed range (extra handle frames acceptable; missing not).
+                local api_dict = {
+                    mediaPoolItem = clip_info.mediaPoolItem,
+                    startFrame = clip_info.startFrame,
+                    endFrame = clip_info.endFrame
+                }
+                local target_start = api_dict.startFrame
+                local target_end = api_dict.endFrame
+                local placed_items = nil
+                local success = pcall(function()
+                    placed_items = media_pool:AppendToTimeline({api_dict})
+                end)
+
+                if not success then
                     print("  Failed to add normal clip: " .. clip_info.mediaPoolItem:GetName())
                     append_error_count = append_error_count + 1
+                else
+                    append_success_count = append_success_count + 1
+
+                    local retry_count = 0
+                    while placed_items ~= nil
+                            and type(placed_items) == "table"
+                            and #placed_items == 1
+                            and retry_count <= SLIP_RETRY_LIMIT do
+                        local placed = placed_items[1]
+                        local actual_start, actual_end
+                        local q_ok = pcall(function()
+                            actual_start = placed:GetSourceStartFrame()
+                            actual_end = placed:GetSourceEndFrame()
+                        end)
+                        if not q_ok or actual_start == nil or actual_end == nil then
+                            break
+                        end
+                        local start_delta = actual_start - target_start
+                        local end_delta = actual_end - target_end
+                        if start_delta == 0 and end_delta == 0 then
+                            if retry_count > 0 then
+                                slip_corrected_count = slip_corrected_count + 1
+                            end
+                            break
+                        end
+
+                        if retry_count >= SLIP_RETRY_LIMIT then
+                            -- Widening fallback -- extra handle frames are acceptable.
+                            local del_ok = pcall(function()
+                                new_timeline:DeleteClips({placed}, false)
+                            end)
+                            if not del_ok then
+                                print("  ERROR: '" .. mpi:GetName() ..
+                                      "' slip unfixable and DeleteClips failed before " ..
+                                      "widening; clip left at " .. actual_start .. "-" ..
+                                      actual_end .. " (target " .. target_start .. "-" ..
+                                      target_end .. ")")
+                                slip_unfixed_count = slip_unfixed_count + 1
+                                break
+                            end
+                            local wide_start = math.max(0, target_start - 1)
+                            local wide_end = target_end + 1
+                            local media_end = nil
+                            pcall(function()
+                                local v = mpi:GetClipProperty("End")
+                                if v ~= nil and v ~= "" then
+                                    media_end = tonumber(v)
+                                end
+                            end)
+                            if media_end ~= nil then
+                                wide_end = math.min(wide_end, media_end)
+                            end
+                            api_dict.startFrame = wide_start
+                            api_dict.endFrame = wide_end
+                            local wide_items = nil
+                            pcall(function()
+                                wide_items = media_pool:AppendToTimeline({api_dict})
+                            end)
+                            local covers = false
+                            local w_start, w_end
+                            if wide_items ~= nil and type(wide_items) == "table"
+                                    and #wide_items == 1 then
+                                pcall(function()
+                                    w_start = wide_items[1]:GetSourceStartFrame()
+                                    w_end = wide_items[1]:GetSourceEndFrame()
+                                end)
+                                if w_start ~= nil and w_end ~= nil then
+                                    covers = (w_start <= target_start)
+                                             and (w_end >= target_end)
+                                end
+                            end
+                            if covers then
+                                print("  WARN: '" .. mpi:GetName() ..
+                                      "' slip unfixable (target " .. target_start .. "-" ..
+                                      target_end .. "); widened to " .. tostring(w_start) ..
+                                      "-" .. tostring(w_end) ..
+                                      " -- target frames preserved with handles")
+                                slip_widened_count = slip_widened_count + 1
+                            else
+                                print("  ERROR: '" .. mpi:GetName() ..
+                                      "' slip unfixable; widened to " .. tostring(w_start) ..
+                                      "-" .. tostring(w_end) .. " but target " ..
+                                      target_start .. "-" .. target_end ..
+                                      " NOT covered (frames missing)")
+                                slip_unfixed_count = slip_unfixed_count + 1
+                            end
+                            break
+                        end
+
+                        -- Silent retry with inverse-of-observed-slip compensation.
+                        local del_ok = pcall(function()
+                            new_timeline:DeleteClips({placed}, false)
+                        end)
+                        if not del_ok then
+                            print("  ERROR: '" .. mpi:GetName() ..
+                                  "' DeleteClips failed during retry; leaving slipped " ..
+                                  "clip at " .. actual_start .. "-" .. actual_end ..
+                                  " (target " .. target_start .. "-" .. target_end .. ")")
+                            slip_unfixed_count = slip_unfixed_count + 1
+                            break
+                        end
+                        api_dict.startFrame = target_start - start_delta
+                        api_dict.endFrame = target_end - end_delta
+                        placed_items = nil
+                        pcall(function()
+                            placed_items = media_pool:AppendToTimeline({api_dict})
+                        end)
+                        retry_count = retry_count + 1
+                    end
                 end
             end
         end
-        
-        print("Clip addition summary: " .. append_success_count .. " succeeded, " .. 
+
+        print("Clip addition summary: " .. append_success_count .. " succeeded, " ..
               append_error_count .. " failed")
+        if slip_corrected_count > 0 or slip_widened_count > 0 or slip_unfixed_count > 0 then
+            print("Slip compensation: " .. slip_corrected_count ..
+                  " corrected via retry, " .. slip_widened_count ..
+                  " widened with handles, " .. slip_unfixed_count .. " unfixable")
+        end
 
         print("New timeline created: " .. dst_timeline_name)
         
@@ -1010,9 +1184,12 @@ function main()
                 -- Find the matching original clip_info to determine if it was retimed
                 local isMatched = false
                 for _, clip_info in ipairs(all_clip_infos) do
+                    -- Bounds widened by SLIP_TOLERANCE so clips placed via the
+                    -- AppendToTimeline widening fallback (which adds +/-1 handle
+                    -- frames) still match their original clip_info here.
                     if timeline_clip.mediaPoolItem:GetName() == clip_info.mediaPoolItem:GetName() and
-                       timeline_clip.clip:GetSourceStartFrame() >= math.min(clip_info.startFrame, clip_info.endFrame) and
-                       timeline_clip.clip:GetSourceEndFrame() <= math.max(clip_info.startFrame, clip_info.endFrame) + 1 then
+                       timeline_clip.clip:GetSourceStartFrame() >= math.min(clip_info.startFrame, clip_info.endFrame) - SLIP_TOLERANCE and
+                       timeline_clip.clip:GetSourceEndFrame() <= math.max(clip_info.startFrame, clip_info.endFrame) + SLIP_TOLERANCE then
                         
                         -- If the original clip was marked retimed, mark this clip too
                         if clip_info.isRetimed then
