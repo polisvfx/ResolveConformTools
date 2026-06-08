@@ -1,7 +1,7 @@
 """
 Find Clip in Timelines.py
 ─────────────────────────
-Version: 1.0
+Version: 1.1
 
 Searches all timelines in the current project for the selected clip and
 shows a popup listing the timelines that contain it.
@@ -11,9 +11,10 @@ jump (best-effort) to the in-point of the clip's first occurrence on
 that timeline.
 
 Source detection priority:
-  1. Selected item in the active Timeline (video tracks only — Resolve's
-     GetCurrentVideoItem())
-  2. Selected clip in the Media Pool
+  1. Selected clip in the Media Pool (explicit selection wins).
+  2. Item under the playhead on the active Timeline — Resolve's
+     scripting API has no concept of "selected timeline item", so this
+     is a best-effort fallback when nothing is selected in the bin.
 
 Run from:  Workspace ▸ Scripts  – or –  Workspace ▸ Console (exec/run)
 """
@@ -48,26 +49,30 @@ def get_target_clip(project):
     Returns (media_pool_item, source_label) or (None, reason_string).
 
     Priority:
-      1. Current video item selected on the active timeline
-      2. Selected clip(s) in the Media Pool
+      1. Media Pool selection (explicit — only fires if the user actually
+         clicked a clip in the bin).
+      2. Item under the playhead on the active Timeline. Resolve's API
+         does not expose timeline-item selection, so GetCurrentVideoItem
+         returns whatever sits under the playhead regardless of whether
+         the user picked it. Used only when nothing is selected in the
+         Media Pool.
     """
-    tl = project.GetCurrentTimeline()
+    # 1 – Explicit Media Pool selection wins.
+    mp = project.GetMediaPool()
+    selected = mp.GetSelectedMediaPoolItems() if mp else None
+    if selected:
+        return selected[0], "Media Pool selection"
 
-    # 1 – Try timeline selection first
+    # 2 – Fall back to whatever sits under the playhead on the timeline.
+    tl = project.GetCurrentTimeline()
     if tl:
         current_item = tl.GetCurrentVideoItem()
         if current_item:
             mpi = current_item.GetMediaPoolItem()
             if mpi:
-                return mpi, f"Timeline selection  [{tl.GetName()}]"
+                return mpi, f"Timeline — under playhead  [{tl.GetName()}]"
 
-    # 2 – Fall back to Media Pool selection
-    mp = project.GetMediaPool()
-    selected = mp.GetSelectedMediaPoolItems()
-    if selected:
-        return selected[0], "Media Pool selection"
-
-    return None, "No clip selected in Timeline or Media Pool"
+    return None, "No clip selected in Media Pool, and no clip under the timeline playhead."
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────
