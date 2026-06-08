@@ -58,8 +58,12 @@ def get_target_clip(project):
          Media Pool.
     """
     # 1 – Explicit Media Pool selection wins.
-    mp = project.GetMediaPool()
-    selected = mp.GetSelectedMediaPoolItems() if mp else None
+    #     MediaPool.GetSelectedClips() is the documented method; older drafts
+    #     used GetSelectedMediaPoolItems(), which Resolve's scripting bridge
+    #     silently resolves to None on the versions that don't expose it.
+    mp = project.GetMediaPool() if project else None
+    get_selected = getattr(mp, "GetSelectedClips", None) if mp else None
+    selected = get_selected() if callable(get_selected) else None
     if selected:
         return selected[0], "Media Pool selection"
 
