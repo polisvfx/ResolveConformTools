@@ -29,6 +29,29 @@ and edits to non-script files do **not** require a version bump.
 Applies to every `*.lua` and `*.py` script at the repo root. If a new script
 is added, give it `Version: 1.0` in its header.
 
+Files under `tests/` are **not** covered — they carry no version header and
+changing them needs no bump.
+
+## Tests
+
+`tests/` holds a suite that runs outside Resolve's UI. See
+[tests/README.md](tests/README.md) for prerequisites and how to run it.
+
+Run the relevant tests before committing a change to any script:
+
+```bash
+fuscript.exe -l lua tests/luacheck.lua          # parse-check all Lua scripts
+fuscript.exe -l lua tests/test_shot_numbering.lua
+python tests/test_part_a.py                      # and the other test_part_*.py
+```
+
+Most tests need no running Resolve — the Lua ones drive the real scripts against
+stubbed API objects. `test_part_d.py` and `final_live_check.py` do need Resolve
+open with a project, and exit `2` to signal "skipped" when it is unavailable;
+treat a skip as untested, not as a pass.
+
+If you change a script's behaviour, extend the matching test in the same commit.
+
 ## Working in branches
 
 Non-trivial changes should be made on a new branch off `main`, not directly
