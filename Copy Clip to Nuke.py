@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Copy Clip to Nuke
-Version: 1.1
+Version: 1.2
 
 Copies the selected DaVinci Resolve timeline clip's file path, editorial data,
 and metadata into a Nuke-ready format on the clipboard.
@@ -372,7 +372,8 @@ def get_selected_clip_data(timeline, timeline_item) -> Optional[ClipData]:
         reel_name = m.group(1) if m else base_name
 
     # -- Resolution ---------------------------------------------------------
-    width, height = 1920, 1080
+    width: Optional[int] = None
+    height: Optional[int] = None
     res_x = media_pool_item.GetClipProperty("Resolution X")
     res_y = media_pool_item.GetClipProperty("Resolution Y")
     if res_x and res_y and str(res_x).strip() and str(res_y).strip():
@@ -380,31 +381,46 @@ def get_selected_clip_data(timeline, timeline_item) -> Optional[ClipData]:
             width = int(res_x)
             height = int(res_y)
         except (ValueError, TypeError):
-            pass
-    else:
+            width, height = None, None
+
+    if width is None:
+        # Resolve 21.0.4 returns None for "Resolution X" / "Resolution Y" and
+        # only exposes the size as a combined "3840x2160" string, so this is
+        # the normal path there, not a failure.
         resolution = media_pool_item.GetClipProperty("Resolution")
         if resolution:
             m = re.match(r"(\d+)\s*x\s*(\d+)", str(resolution))
             if m:
                 width, height = int(m.group(1)), int(m.group(2))
-        print(f"  Using default resolution: {width}x{height}")
+                print(f"  Resolution: {width}x{height} "
+                      "(from the combined Resolution property)")
+
+    if width is None:
+        width, height = 1920, 1080
+        print("  Warning: Could not read resolution. "
+              f"Using default {width}x{height}.")
 
     # -- FPS ----------------------------------------------------------------
-    clip_fps = 24.0
+    clip_fps: Optional[float] = None
     fps_val = media_pool_item.GetClipProperty("FPS")
     if fps_val and str(fps_val).strip():
         try:
             clip_fps = float(fps_val)
         except (ValueError, TypeError):
-            pass
-    else:
+            clip_fps = None
+
+    if clip_fps is None:
         timeline_fps = timeline.GetSetting("timelineFrameRate")
         if timeline_fps and str(timeline_fps).strip():
             try:
                 clip_fps = float(timeline_fps)
+                print(f"  FPS: {clip_fps} (from the timeline frame rate)")
             except (ValueError, TypeError):
-                pass
-        print(f"  Using FPS: {clip_fps}")
+                clip_fps = None
+
+    if clip_fps is None:
+        clip_fps = 24.0
+        print(f"  Warning: Could not read FPS. Using default {clip_fps}.")
 
     # -- Frame range --------------------------------------------------------
     first_frame = 1
