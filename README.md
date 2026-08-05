@@ -35,12 +35,24 @@ If you are only using trims, duplicates shouldnt be of concern.
 An alternative approach that uses the `TimelineItem:SetName()` API introduced in DaVinci Resolve 20.2 to apply sequential shot numbers directly to the clip name on the timeline. Unlike the metadata-based version, each timeline instance is renamed independently — duplicate source clips are not an issue.
 - Configurable prefix (default: `SH_`), padding, and increment
 - Option to append the original clip name as a suffix
-- Restore button to revert all timeline clips back to their original Media Pool names
+- Restore button to revert timeline clips back to their original Media Pool names
 - Does not modify the source Media Pool item
+
+### Numbering only part of a timeline (Resolve 21.0.4+)
+Both Shot Numbering scripts can limit their scope to the clips you have selected on the timeline, via **Apply To > Selected clips only**. This needs `Timeline:GetSelectedClips()`, added in DaVinci Resolve 21.0.4; on older builds the control is disabled and behaviour is unchanged.
+
+When scoped, a **Numbering** control decides how the numbers are assigned:
+
+- **Keep full-timeline numbers** (default) — the whole timeline is numbered as usual, but only the selected clips are written to. A selected clip gets the same number a full run would have given it, so a partial pass stays consistent with the rest of the timeline.
+- **Renumber selection from the first number** — the selection is numbered from the start as though it were the entire timeline. Useful for an isolated section, but it can collide with numbers already in use elsewhere.
+
+Select your clips before pressing Run — the selection is read when the dialog closes, so you can also select them while the dialog is open. The Clear Markers and Restore Names buttons honour the same scope, so they never reach outside your selection.
 
 
 ## Copy Clip to Nuke (Python)
 A unified Python rewrite that replaces both the old "Copy to Nuke Simple" and "Copy Clip and Settings to Nuke Python" Lua scripts. Copies the selected clip's file path, editorial data, and metadata to the clipboard in a Nuke-ready format.
+
+Which clip it uses: the clip **selected on the timeline** (needs `Timeline:GetSelectedClips()`, DaVinci Resolve 21.0.4+), falling back to the clip under the playhead on older builds or when nothing is selected. If several video clips are selected, the one on the topmost track wins — the same clip the Viewer is showing. The console always prints which clip was chosen.
 
 Features a UI dialog with configurable settings:
 - **Output Mode**: Python (Script Editor) or TCL (Node Graph Paste)
@@ -83,8 +95,9 @@ A comprehensive batch renaming utility for media pool items in DaVinci Resolve. 
 - Uses PySide6 (bundled with Resolve) for a native Qt UI with dark theme
 
 ## Find Clip in Timelines
-Searches every timeline in the current project for the selected clip and lists the timelines that use it. Run with a clip selected in either the active timeline (video item) or the Media Pool.
+Searches every timeline in the current project for the selected clip and lists the timelines that use it. Run it with a clip selected in the Media Pool or on the active timeline.
 
+- **Source detection**, in priority order: the Media Pool selection, then the timeline selection (needs `Timeline:GetSelectedClips()`, DaVinci Resolve 21.0.4+), then the clip under the playhead. The Media Pool wins because a bin selection stays visible from every page, whereas a timeline selection only exists on Cut/Edit and can sit stale while you work in the bin — ctrl/cmd-click to deselect in the bin if you want the timeline to win. Audio clips are valid search targets. The popup and console both state which source was used
 - **Clickable results**: Double-click a timeline in the list to switch to it; the playhead jumps (best-effort) to the in-point of the clip's first occurrence on that timeline
 - **Multi-hit indicator**: Timelines containing more than one instance show a `(N×)` badge — the jump targets the first occurrence
 - **Drop-frame aware**: Playhead positioning handles 29.97 / 59.94 drop-frame timecode

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 1.2
+Version: 1.3
 
 Creates a master timeline from selected timelines, collecting all unique source clips,
 merging overlapping source ranges, and placing them on a new timeline.
@@ -561,6 +561,39 @@ def sanitize_for_api(clip_info: ClipInfo) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Timeline Resolution
+# ---------------------------------------------------------------------------
+
+def get_timeline_for_media_pool_item(media_pool_item):
+    """Return the Timeline a timeline-type MediaPoolItem points at, or None.
+
+    MediaPoolItem.GetTimeline() arrived in DaVinci Resolve 21.0.4 and resolves the
+    item exactly, with no dependence on timeline names being unique. Older builds
+    resolve the unknown attribute to None instead of raising AttributeError, so
+    probe with getattr + callable() and let the caller fall back to a name lookup.
+
+    The 21.0.4 docs label the return type "TimelineItem" while the prose says
+    "timeline object". Verified on 21.0.4.5: it is a real Timeline — GetTrackCount
+    and GetItemListInTrack work, GetLeftOffset and GetSourceStartFrame are absent.
+    The duck-type check keeps that verification honest: anything that does not
+    behave like a Timeline falls through to the name lookup, so a future API
+    surprise degrades to the old behaviour instead of crashing.
+    """
+    getter = getattr(media_pool_item, "GetTimeline", None)
+    if not callable(getter):
+        return None
+    try:
+        timeline = getter()
+    except Exception:
+        return None
+    if timeline is None:
+        return None
+    if not callable(getattr(timeline, "GetTrackCount", None)):
+        return None
+    return timeline
+
+
+# ---------------------------------------------------------------------------
 # Main Workflow
 # ---------------------------------------------------------------------------
 
@@ -592,11 +625,16 @@ def run_workflow(
     num_timelines = project.GetTimelineCount()
     selected_bin = media_pool.GetCurrentFolder()
 
-    # Build timeline name lookup
+    # Build timeline name lookup. Kept eager because it has a second consumer —
+    # destination-timeline name deduplication further down — which runs on every
+    # invocation. As a way of resolving a source timeline it is superseded by
+    # get_timeline_for_media_pool_item() below and only used as the pre-21.0.4
+    # fallback. (The Lua variant builds this lazily; it has no second consumer.)
     project_timelines = {}
     for timeline_idx in range(1, num_timelines + 1):
         tl = project.GetTimelineByIndex(timeline_idx)
-        project_timelines[tl.GetName()] = tl
+        if tl is not None:
+            project_timelines[tl.GetName()] = tl
 
     # Get selected clips
     selected_clips = []
@@ -646,7 +684,12 @@ def run_workflow(
         _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
            sel_idx, total_selected)
 
-        curr_timeline = project_timelines.get(timeline_name)
+        # Ask the item for its own timeline (Resolve 21.0.4+). The name lookup
+        # silently picks the wrong timeline when two timelines in the project share
+        # a name, which Resolve permits across different bins.
+        curr_timeline = get_timeline_for_media_pool_item(media_pool_item)
+        if curr_timeline is None:
+            curr_timeline = project_timelines.get(timeline_name)
         if not curr_timeline:
             print(f"Timeline not found in project: {timeline_name}")
             continue

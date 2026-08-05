@@ -1,6 +1,6 @@
 --[[
 Timeline Generator with Duplicate Marker
-Version: 1.1
+Version: 1.2
 This script creates a master timeline from selected timelines and optionally marks duplicate clips.
 ]]--
 
@@ -454,6 +454,50 @@ function isClipRetimed(clip)
     return checkRetimeProperties(clip)
 end
 
+-- TIMELINE RESOLUTION
+-- Returns the Timeline object a timeline-type MediaPoolItem points at, or nil.
+--
+-- MediaPoolItem:GetTimeline() arrived in DaVinci Resolve 21.0.4; older builds have
+-- no such method, so the call is wrapped in pcall. The 21.0.4 documentation labels
+-- the return type "TimelineItem" while its prose says "timeline object" — verified
+-- on 21.0.4.5 to be a real Timeline (GetTrackCount/GetItemListInTrack work,
+-- GetLeftOffset/GetSourceStartFrame are absent). The duck-type check below means a
+-- future API surprise falls through to the name lookup instead of crashing.
+function GetTimelineForMediaPoolItem(media_pool_item)
+    local tl = nil
+    pcall(function() tl = media_pool_item:GetTimeline() end)
+    if tl == nil then return nil end
+
+    local looks_like_timeline = false
+    pcall(function() looks_like_timeline = (tl:GetTrackCount("video") ~= nil) end)
+    if not looks_like_timeline then return nil end
+    return tl
+end
+
+-- Timeline name -> Timeline, built on first use only.
+--
+-- This is purely the pre-21.0.4 fallback for GetTimelineForMediaPoolItem(), so on
+-- 21.0.4 the GetTimelineByIndex() loop over every timeline in the project never
+-- runs at all. Resolve permits duplicate timeline names in different bins, and a
+-- name-keyed table silently collapses them onto one object — which is the bug
+-- GetTimeline() removes. Reset per run so a second press does not reuse a stale map.
+--
+-- Note: the Python PRO variant deliberately keeps building this map eagerly,
+-- because there it has a second consumer (destination-name deduplication). Do not
+-- "harmonise" the two.
+timeline_name_cache = nil
+
+function GetTimelineByNameCached(project, name)
+    if timeline_name_cache == nil then
+        timeline_name_cache = {}
+        for idx = 1, project:GetTimelineCount() do
+            local tl = project:GetTimelineByIndex(idx)
+            if tl then timeline_name_cache[tl:GetName()] = tl end
+        end
+    end
+    return timeline_name_cache[name]
+end
+
 -- MAIN SCRIPT EXECUTION
 function main()
     -- Draw window to get user parameters.
@@ -598,18 +642,15 @@ function main()
         projectManager = resolve:GetProjectManager()
         project = projectManager:GetCurrentProject()
         media_pool = project:GetMediaPool()
-        num_timelines = project:GetTimelineCount()
         selected_bin = media_pool:GetCurrentFolder()
 
         -- Initialize table to store clips
         local clips = {}
 
-        -- Mapping of timeline name to timeline object
-        project_timelines = {}
-        for timeline_idx = 1, num_timelines do
-            runner_timeline = project:GetTimelineByIndex(timeline_idx)
-            project_timelines[runner_timeline:GetName()] = runner_timeline
-        end
+        -- Timelines are resolved per item below. The name-keyed fallback map is
+        -- built lazily by GetTimelineByNameCached() and only on pre-21.0.4 builds;
+        -- clear it so this run cannot reuse a map from a previous press.
+        timeline_name_cache = nil
 
         -- Safely get selected clips
         local selected_clips = {}
@@ -659,8 +700,13 @@ function main()
             if clip_type == "Timeline" then
                 local timeline_name = media_pool_item:GetName()
                 print("Processing timeline: " .. timeline_name)
-                
-                local curr_timeline = project_timelines[timeline_name]
+
+                -- Ask the item for its own timeline (21.0.4+); fall back to matching
+                -- by name, which picks the wrong timeline when two share a name.
+                local curr_timeline = GetTimelineForMediaPoolItem(media_pool_item)
+                if not curr_timeline then
+                    curr_timeline = GetTimelineByNameCached(project, timeline_name)
+                end
                 if not curr_timeline then
                     print("Timeline not found in project: " .. timeline_name)
                     goto continue

@@ -1,13 +1,25 @@
 #!/usr/bin/env lua
 
 -- Script to set sequential shot numbers as Clip Names on timeline items
--- Version: 1.0
+-- Version: 1.1
 -- Requires: DaVinci Resolve 20.2+ (uses TimelineItem:SetName API)
 --
 -- Uses TimelineItem:SetName() to rename each clip instance on the timeline.
 -- Each timeline item gets its own unique sequential name, regardless of
 -- whether the same source clip appears multiple times.
 -- Original clip names can be preserved as a suffix.
+--
+-- Scope can be limited to the clips selected on the timeline, which needs
+-- Timeline:GetSelectedClips() (DaVinci Resolve 21.0.4+). Two numbering modes are
+-- offered when scoped:
+--   Keep full-timeline numbers - number the whole timeline as usual but only
+--     rename the selected clips, so they match an unscoped run.
+--   Renumber from the first number - treat the selection as if it were the
+--     entire timeline.
+-- On builds without the API the scope control is disabled and behaviour is
+-- unchanged.
+
+local SCRIPT_VERSION = "1.1"
 
 -- Get Resolve API and Fusion object
 local resolve = bmd.scriptapp("Resolve")
@@ -23,14 +35,147 @@ if timeline == nil then
     return
 end
 
+-- Re-fetch the timeline the user is actually looking at.
+-- The module-level `timeline` handle is captured at load time, i.e. before the
+-- config dialog runs. The dialog is not application-modal - the user can (and for
+-- the scope option must be able to) click clips and even switch timelines while
+-- it is open - so anything that runs after the dialog closes should ask again.
+function GetActiveTimeline()
+    local tl = nil
+    pcall(function() tl = project:GetCurrentTimeline() end)
+    return tl or timeline
+end
+
+
+-- Does this build expose Timeline:GetSelectedClips()? (DaVinci Resolve 21.0.4+)
+function HasTimelineSelectionAPI(tl)
+    local present = false
+    pcall(function() present = (tl.GetSelectedClips ~= nil) end)
+    return present
+end
+
+
+-- Returns an array of selected TimelineItems, or nil when the API is missing.
+-- nil (unsupported) and {} (supported, nothing selected) are deliberately
+-- distinct: they produce different messages and different fallbacks.
+function GetTimelineSelection(tl)
+    if not HasTimelineSelectionAPI(tl) then return nil end
+    local items = {}
+    local ok = pcall(function()
+        local sel = tl:GetSelectedClips()
+        if type(sel) == "table" then
+            for _, item in pairs(sel) do
+                if item then table.insert(items, item) end
+            end
+        end
+    end)
+    if not ok then return nil end
+    return items
+end
+
+
+-- Stable key for a TimelineItem across separate API calls.
+-- Resolve hands back a fresh wrapper object per call, so neither `==` nor identity
+-- works between the selection list and the per-track walk (verified on 21.0.4.5:
+-- both are false for the same item fetched twice). GetUniqueId() is stable across
+-- calls and distinct per instance of a source clip, so it is the real key; the
+-- geometric fallback only matters on a build that lacks it.
+function TimelineItemKey(item)
+    if item == nil then return nil end
+
+    local uid = nil
+    pcall(function() uid = item:GetUniqueId() end)
+    if uid ~= nil and uid ~= "" then
+        return "uid:" .. tostring(uid)
+    end
+
+    local mpiId, startFrame, endFrame, leftOffset = "", -1, -1, -1
+    pcall(function()
+        local mpi = item:GetMediaPoolItem()
+        if mpi then mpiId = mpi:GetUniqueId() or "" end
+        startFrame = item:GetStart()
+        endFrame = item:GetEnd()
+        leftOffset = item:GetLeftOffset() or -1
+    end)
+    return string.format("geo:%s:%d:%d:%d",
+        tostring(mpiId), startFrame, endFrame, leftOffset)
+end
+
+
+-- Flags the entries of `orderedItems` that are in the timeline selection.
+-- Returns orderedItems, selectedOnly, scopeLabel where selectedOnly == nil means
+-- the scope collapsed back to the whole timeline (for any reason, each of which
+-- prints its own explanation).
+--
+-- Audio and subtitle items need no explicit filter here: orderedItems only ever
+-- contains video-track items, so a selected audio item simply never matches.
+function ApplySelectionScope(orderedItems, wantSelectionOnly, tl)
+    for _, itemData in ipairs(orderedItems) do
+        itemData.selected = false
+    end
+
+    if not wantSelectionOnly then
+        return orderedItems, nil, "Whole timeline"
+    end
+
+    local selection = GetTimelineSelection(tl)
+    if selection == nil then
+        print("NOTE: This DaVinci Resolve build has no Timeline:GetSelectedClips()")
+        print("      (added in 21.0.4). Falling back to the whole timeline.")
+        return orderedItems, nil, "Whole timeline (selection API unavailable)"
+    end
+    if #selection == 0 then
+        print("NOTE: 'Selected clips only' was chosen, but nothing is selected on")
+        print("      the timeline. Falling back to the whole timeline.")
+        return orderedItems, nil, "Whole timeline (nothing was selected)"
+    end
+
+    local selectedKeys = {}
+    for _, item in ipairs(selection) do
+        local key = TimelineItemKey(item)
+        if key then selectedKeys[key] = true end
+    end
+
+    local selectedOnly = {}
+    local seenKeys = {}
+    for _, itemData in ipairs(orderedItems) do
+        local key = TimelineItemKey(itemData.item)
+        if key and selectedKeys[key] then
+            if seenKeys[key] then
+                print(string.format("  WARNING: two items share identity key %s", key))
+                print("           - both are treated as selected.")
+            end
+            seenKeys[key] = true
+            itemData.selected = true
+            table.insert(selectedOnly, itemData)
+        end
+    end
+
+    if #selectedOnly == 0 then
+        print(string.format("NOTE: %d item(s) selected, but none are video clips on", #selection))
+        print("      this timeline. Falling back to the whole timeline.")
+        return orderedItems, nil, "Whole timeline (no video clips selected)"
+    end
+
+    local ignored = #selection - #selectedOnly
+    if ignored > 0 then
+        print(string.format("  Ignoring %d selected item(s) that are not video clips on this timeline.", ignored))
+    end
+    return orderedItems, selectedOnly,
+        string.format("Selected clips only (%d of %d timeline items)",
+            #selectedOnly, #orderedItems)
+end
+
+
 -- Function to get all timeline items ordered by their position
-function GetOrderedTimelineItems()
+function GetOrderedTimelineItems(tl)
+    tl = tl or GetActiveTimeline()
     local trackTypes = {"video"}
     local allItems = {}
     for _, trackType in ipairs(trackTypes) do
-        local trackCount = timeline:GetTrackCount(trackType)
+        local trackCount = tl:GetTrackCount(trackType)
         for trackIndex = trackCount, 1, -1 do
-            local trackItems = timeline:GetItemListInTrack(trackType, trackIndex)
+            local trackItems = tl:GetItemListInTrack(trackType, trackIndex)
             if trackItems then
                 for _, item in ipairs(trackItems) do
                     table.insert(allItems, {
@@ -53,9 +198,12 @@ function GetOrderedTimelineItems()
 end
 
 
--- Function to restore clip names from their Media Pool source
-function RestoreOriginalClipNames()
-    local items = GetOrderedTimelineItems()
+-- Function to restore clip names from their Media Pool source.
+-- `itemList` restricts the sweep; defaults to the whole timeline. Callers pass the
+-- scoped list: an unscoped restore is destructive and asymmetric, since a user who
+-- had just renamed five selected clips would otherwise rename the whole timeline.
+function RestoreOriginalClipNames(itemList)
+    local items = itemList or GetOrderedTimelineItems()
     local restoredCount = 0
     print("Restoring original clip names from Media Pool items...")
     for _, itemData in ipairs(items) do
@@ -81,19 +229,22 @@ end
 function ShowConfigDialog()
     local ui = fusion.UIManager
     local disp = bmd.UIDispatcher(ui)
+    -- Defaults reproduce the pre-1.1 behaviour exactly.
     local config = {
         prefix = "SH_",
         padding = 4,
         increment = 10,
         includeOriginalName = false,
-        separator = "_"
+        separator = "_",
+        selectedOnly = false,
+        numbering = "keep"
     }
     local result = nil
 
     local win = disp:AddWindow({
-        WindowTitle = "Shot Numbering - Clip Name (v1.0)",
+        WindowTitle = "Shot Numbering - Clip Name (v" .. SCRIPT_VERSION .. ")",
         ID = "ConfigWin",
-        Geometry = { 100, 100, 450, 340 },
+        Geometry = { 100, 100, 470, 440 },
         Spacing = 10,
         ui:VGroup{ ID = "root", Weight = 1.0,
             ui:HGroup{
@@ -112,6 +263,15 @@ function ShowConfigDialog()
                 ui:Label{ Text = "Separator:", Weight = 0.3 },
                 ui:LineEdit{ ID = "SeparatorInput", Text = config.separator, PlaceholderText = "e.g. _", Weight = 0.7 }
             },
+            ui:HGroup{
+                ui:Label{ Text = "Apply To:", Weight = 0.3 },
+                ui:ComboBox{ ID = "ScopeCombo", Weight = 0.7 }
+            },
+            ui:HGroup{
+                ui:Label{ Text = "Numbering:", Weight = 0.3 },
+                ui:ComboBox{ ID = "NumberingCombo", Weight = 0.7 }
+            },
+            ui:Label{ ID = "ScopeNote", Text = "", WordWrap = true },
             ui:CheckBox{
                 ID = "IncludeOriginalCheckBox",
                 Text = "Append original clip name as suffix",
@@ -134,6 +294,23 @@ function ShowConfigDialog()
 
     local itm = win:GetItems()
 
+    itm.ScopeCombo:AddItem("Whole timeline")
+    itm.ScopeCombo:AddItem("Selected clips only")
+    itm.NumberingCombo:AddItem("Keep full-timeline numbers")
+    itm.NumberingCombo:AddItem("Renumber selection from the first number")
+    itm.NumberingCombo.Enabled = false
+
+    if not HasTimelineSelectionAPI(GetActiveTimeline()) then
+        itm.ScopeCombo.Enabled = false
+        itm.ScopeNote.Text = "'Selected clips only' needs DaVinci Resolve 21.0.4 or newer."
+    else
+        itm.ScopeNote.Text = "Selection is read when this dialog closes, so you can select clips now."
+    end
+
+    function win.On.ScopeCombo.CurrentIndexChanged(ev)
+        itm.NumberingCombo.Enabled = (itm.ScopeCombo.CurrentIndex == 1)
+    end
+
     function win.On.ConfigWin.Close(ev)
         disp:ExitLoop()
     end
@@ -149,14 +326,23 @@ function ShowConfigDialog()
         config.increment = itm.IncrementInput.Value
         config.separator = itm.SeparatorInput.Text
         config.includeOriginalName = itm.IncludeOriginalCheckBox.Checked
+        config.selectedOnly = (itm.ScopeCombo.CurrentIndex == 1)
+        config.numbering = (itm.NumberingCombo.CurrentIndex == 1) and "renumber" or "keep"
         result = config
         disp:ExitLoop()
     end
 
     function win.On.RestoreButton.Clicked(ev)
         print("\n--- Restoring Original Clip Names ---")
-        local restored = RestoreOriginalClipNames()
-        itm.RestoreButton.Text = string.format("Restored (%d clips)", restored)
+        -- Honour whatever the scope combo says right now, so Restore can never undo
+        -- more than the run it is undoing.
+        local tl = GetActiveTimeline()
+        local ordered = GetOrderedTimelineItems(tl)
+        local _, selectedOnly, scopeLabel =
+            ApplySelectionScope(ordered, itm.ScopeCombo.CurrentIndex == 1, tl)
+        print("Scope: " .. scopeLabel)
+        local restored = RestoreOriginalClipNames(selectedOnly or ordered)
+        itm.RestoreButton.Text = string.format("Restored (%d clips, %s)", restored, scopeLabel)
         print("--- Restore Complete ---")
     end
 
@@ -182,20 +368,63 @@ function Main()
     local includeOriginalName = config.includeOriginalName
     local formatString = "%0" .. tostring(padding) .. "d"
 
-    print("\n--- Starting Shot Numbering - Clip Name (v1.0) ---")
+    print("\n--- Starting Shot Numbering - Clip Name (v" .. SCRIPT_VERSION .. ") ---")
     print("Configuration:")
     print(string.format("  Prefix: '%s', Padding: %d, Increment: %d", prefix, padding, shotStep))
     print(string.format("  Include original name: %s, Separator: '%s'", includeOriginalName and "Yes" or "No", separator))
 
-    local items = GetOrderedTimelineItems()
+    -- Ask for the timeline again: the dialog is not application-modal, so the user
+    -- may have switched timelines (and must have been able to click clips) while it
+    -- was open.
+    local tl = GetActiveTimeline()
+    print(string.format("  Timeline: %s", tl:GetName()))
+
+    local items = GetOrderedTimelineItems(tl)
     if #items == 0 then
         print("\nNo video clips found on the timeline.")
         return false
     end
 
+    local orderedItems, selectedOnly, scopeLabel =
+        ApplySelectionScope(items, config.selectedOnly, tl)
+    local renumberFromScratch = (selectedOnly ~= nil) and (config.numbering == "renumber")
+
+    print(string.format("  Scope: %s", scopeLabel))
+    print(string.format("  Numbering: %s", renumberFromScratch
+        and "renumber selection from the first number"
+        or "keep full-timeline numbers"))
+
+    -- Build the work list. Each entry is { data = itemData, apply = bool }.
+    --
+    -- "keep full-timeline numbers" walks the ENTIRE ordered list so the counter
+    -- advances exactly as an unscoped run would, and only renames selected clips -
+    -- so a selected clip ends up with the same name a full run would have given it.
+    --
+    -- "renumber from scratch" walks only the selection, numbering it from the first
+    -- number as though it were the whole timeline.
+    local workList = {}
+    if renumberFromScratch then
+        for _, itemData in ipairs(selectedOnly) do
+            table.insert(workList, { data = itemData, apply = true })
+        end
+    else
+        for _, itemData in ipairs(orderedItems) do
+            table.insert(workList, {
+                data = itemData,
+                apply = (selectedOnly == nil) or itemData.selected,
+            })
+        end
+    end
+
+    local appliedCount = 0
+    for _, entry in ipairs(workList) do
+        if entry.apply then appliedCount = appliedCount + 1 end
+    end
+
     local currentShotNumberValue = shotStep
     local renamedCount = 0
     local failedCount = 0
+    local skippedOutOfScope = 0
 
     -- Build preview of first clip name
     local previewNumber = string.format(formatString, currentShotNumberValue)
@@ -203,10 +432,14 @@ function Main()
     if includeOriginalName then
         previewName = previewName .. separator .. "(clipname)"
     end
-    print(string.format("\nProcessing %d timeline items...", #items))
+    print(string.format("\nProcessing %d timeline items...", #workList))
+    if appliedCount ~= #workList then
+        print(string.format("  (renaming %d of them; the rest are walked only to keep the numbering aligned)", appliedCount))
+    end
     print(string.format("Name pattern: '%s'", previewName))
 
-    for i, itemData in ipairs(items) do
+    for i, entry in ipairs(workList) do
+        local itemData = entry.data
         local timelineItem = itemData.item
         local shotNumberStr = string.format(formatString, currentShotNumberValue)
 
@@ -238,7 +471,10 @@ function Main()
         local currentName = timelineItem:GetName() or "Unnamed"
         local clipInfoStr = string.format("'%s' (T%d @ %d)", currentName, itemData.trackIndex, itemData.start)
 
-        if timelineItem:SetName(newName) then
+        if not entry.apply then
+            -- Walked only to keep the sequence aligned with a full-timeline run.
+            skippedOutOfScope = skippedOutOfScope + 1
+        elseif timelineItem:SetName(newName) then
             print(string.format("  Renamed %s -> '%s'", clipInfoStr, newName))
             renamedCount = renamedCount + 1
         else
@@ -250,8 +486,12 @@ function Main()
     end
 
     print("\n--- Shot Numbering Summary ---")
-    print(string.format("Clips processed: %d", #items))
+    print(string.format("Scope: %s", scopeLabel))
+    print(string.format("Items walked for numbering: %d", #workList))
     print(string.format("  Successfully renamed: %d", renamedCount))
+    if skippedOutOfScope > 0 then
+        print(string.format("  Walked but left untouched (outside selection): %d", skippedOutOfScope))
+    end
     if failedCount > 0 then
         print(string.format("  Failed: %d", failedCount))
     end

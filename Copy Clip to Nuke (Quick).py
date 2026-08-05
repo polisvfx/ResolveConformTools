@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Copy Clip to Nuke (Quick)
-Version: 1.0
+Version: 1.1
 
 Skips the settings dialog when settings have already been configured
 for the current project. Shows the full UI only on first use.
@@ -84,6 +84,7 @@ has_saved_settings = _ns["has_saved_settings"]
 load_settings = _ns["load_settings"]
 save_settings = _ns["save_settings"]
 build_and_show_ui = _ns["build_and_show_ui"]
+pick_export_item = _ns["pick_export_item"]
 get_selected_clip_data = _ns["get_selected_clip_data"]
 generate_nuke_python = _ns["generate_nuke_python"]
 generate_nuke_tcl = _ns["generate_nuke_tcl"]
@@ -104,10 +105,18 @@ def main():
         print("Error: No timeline is active. Please open a timeline.")
         return
 
-    selected_item = timeline.GetCurrentVideoItem()
-    if not selected_item:
-        print("Error: No clip is currently selected. "
-              "Please select a clip in the timeline.")
+    pick = pick_export_item(timeline)
+    if pick is None:
+        print("Error: No clip selected in the timeline and no clip under the "
+              "playhead. Select a clip in the timeline (or park the playhead "
+              "over one) and run again.")
+        return
+
+    print(f"Source: {pick.label}")
+
+    # Extract clip data before any dialog, so unsupported clips bail out early.
+    clip = get_selected_clip_data(timeline, pick.item)
+    if clip is None:
         return
 
     # Check for saved settings — show UI only on first use
@@ -122,11 +131,6 @@ def main():
             print("Cancelled by user.")
             return
         save_settings(project, settings)
-
-    # Extract clip data
-    clip = get_selected_clip_data(timeline, selected_item)
-    if clip is None:
-        return
 
     # Generate output
     if settings.output_mode == "Python":
