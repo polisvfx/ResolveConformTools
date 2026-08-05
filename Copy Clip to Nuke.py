@@ -1,10 +1,16 @@
 #!/usr/bin/env python
 """
 Copy Clip to Nuke
-Version: 1.0
+Version: 1.1
 
 Copies the selected DaVinci Resolve timeline clip's file path, editorial data,
 and metadata into a Nuke-ready format on the clipboard.
+
+Clip source priority:
+  1. The clip selected in the timeline (Timeline.GetSelectedClips(), added in
+     DaVinci Resolve 21.0.4). Topmost video track wins when several are
+     selected.
+  2. The clip under the playhead, on older builds or when nothing is selected.
 
 Two output modes:
   - Python (Script Editor): Full setup including Nuke project settings
@@ -77,6 +83,14 @@ class NukeSettings:
     clear_existing_nodes: bool = False
     set_project_settings: bool = True
     output_mode: str = "Python"
+
+
+@dataclass
+class ItemPick:
+    """The single timeline item chosen for export, plus how it was chosen."""
+    item: object
+    label: str            # human-readable source, printed before the dialog
+    selected_count: int   # video clips in the selection; 0 = playhead fallback
 
 
 # ---------------------------------------------------------------------------
@@ -209,18 +223,136 @@ def load_settings(project) -> NukeSettings:
 
 
 # ---------------------------------------------------------------------------
+# Timeline Clip Selection
+# ---------------------------------------------------------------------------
+
+def _as_list(value) -> list:
+    """Normalise a Resolve list-returning API result into a Python list."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if v is not None]
+    return [value]
+
+
+def get_selected_timeline_items(timeline) -> list:
+    """Return the user's timeline selection, or [] when unavailable.
+
+    Timeline.GetSelectedClips() was added in DaVinci Resolve 21.0.4. Older
+    builds resolve the unknown attribute to None instead of raising
+    AttributeError, so probe with getattr + callable() before calling.
+    """
+    getter = getattr(timeline, "GetSelectedClips", None) if timeline else None
+    if not callable(getter):
+        return []
+    try:
+        return _as_list(getter())
+    except Exception:
+        return []
+
+
+def _video_track_index(item) -> Optional[int]:
+    """1-based video track index for a timeline item, or None if not video.
+
+    GetSelectedClips() returns timeline items of every kind, so audio and
+    subtitle items have to be filtered out. GetTrackTypeAndIndex() (verified
+    present on 21.0.4.5, returning e.g. ['video', 4]) answers this directly.
+
+    Note that the clip's "Type" property cannot be used for this: an A/V clip's
+    video and audio items share one MediaPoolItem, so "Type" describes the
+    source rather than the track and reads the same for both.
+    """
+    getter = getattr(item, "GetTrackTypeAndIndex", None)
+    if not callable(getter):
+        return None
+    try:
+        track_type, track_index = getter()
+    except Exception:
+        return None
+    if track_type != "video":
+        return None
+    try:
+        return int(track_index)
+    except (TypeError, ValueError):
+        return None
+
+
+def pick_export_item(timeline) -> Optional[ItemPick]:
+    """Choose the one timeline item to export.
+
+    Priority:
+      1. Timeline selection (Resolve 21.0.4+), audio and subtitle items dropped.
+      2. GetCurrentVideoItem(): the topmost video clip under the playhead.
+
+    With several video clips selected the topmost track wins, ties broken by the
+    earliest start. Topmost-first is deliberate: it is the clip the Viewer shows
+    and the one GetCurrentVideoItem() would return, so the selection path and the
+    playhead fallback never disagree. On a conform timeline carrying stacked
+    versions of a shot, it is also the live version rather than a buried one.
+
+    (This is the opposite tie-break from Shot Numbering's ordering, which sorts
+    lower tracks first because it is numbering a whole timeline in edit order.)
+
+    GetSelectedClips() order is arbitrary - verified on 21.0.4.5, where a
+    23-clip selection came back in neither timeline nor track order - so the
+    candidates are sorted explicitly and no message claims "selection order".
+    """
+    selected = get_selected_timeline_items(timeline)
+
+    if selected:
+        candidates = []
+        for item in selected:
+            track_index = _video_track_index(item)
+            if track_index is None:
+                continue                      # audio / subtitle / unknown
+            try:
+                start = int(item.GetStart())
+            except Exception:
+                continue
+            candidates.append((-track_index, start, track_index, item))
+
+        if candidates:
+            candidates.sort(key=lambda c: (c[0], c[1]))
+            _, start, track_index, item = candidates[0]
+            dropped = len(selected) - len(candidates)
+            if len(candidates) > 1:
+                print(f"Note: {len(candidates)} video clips selected in the "
+                      f"timeline - exporting the topmost one (V{track_index}).")
+            if dropped:
+                print(f"Note: ignored {dropped} selected item(s) that are not "
+                      f"on a video track.")
+            return ItemPick(
+                item=item,
+                label=f"timeline selection (V{track_index} @ frame {start})",
+                selected_count=len(candidates),
+            )
+
+        print(f"Note: {len(selected)} timeline item(s) selected, but none are "
+              f"on a video track - falling back to the playhead.")
+
+    current = timeline.GetCurrentVideoItem()
+    if current:
+        if not selected:
+            print("Note: nothing selected in the timeline - using the clip "
+                  "under the playhead.")
+        return ItemPick(item=current, label="clip under the playhead",
+                        selected_count=0)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Resolve Data Extraction
 # ---------------------------------------------------------------------------
 
-def get_selected_clip_data(timeline, selected_item) -> Optional[ClipData]:
-    """Extract all clip data from the selected timeline item.
+def get_selected_clip_data(timeline, timeline_item) -> Optional[ClipData]:
+    """Extract all clip data from the chosen timeline item.
 
     Returns None if the item has no media pool item (e.g. generators,
     compound clips) or if required properties cannot be read.
     """
-    media_pool_item = selected_item.GetMediaPoolItem()
+    media_pool_item = timeline_item.GetMediaPoolItem()
     if media_pool_item is None:
-        print("Error: Selected item has no media pool item "
+        print("Error: The chosen timeline clip has no media pool item "
               "(generators and compound clips are not supported).")
         return None
 
@@ -314,9 +446,9 @@ def get_selected_clip_data(timeline, selected_item) -> Optional[ClipData]:
             print("  Warning: Could not determine clip length. Using default.")
 
     # -- Editorial frames ---------------------------------------------------
-    start_tc = selected_item.GetStart()
-    end_tc = selected_item.GetEnd()
-    start_frame = selected_item.GetLeftOffset()
+    start_tc = timeline_item.GetStart()
+    end_tc = timeline_item.GetEnd()
+    start_frame = timeline_item.GetLeftOffset()
     end_frame = start_frame + (end_tc - start_tc)
 
     return ClipData(
@@ -861,10 +993,20 @@ def main():
         print("Error: No timeline is active. Please open a timeline.")
         return
 
-    selected_item = timeline.GetCurrentVideoItem()
-    if not selected_item:
-        print("Error: No clip is currently selected. "
-              "Please select a clip in the timeline.")
+    pick = pick_export_item(timeline)
+    if pick is None:
+        print("Error: No clip selected in the timeline and no clip under the "
+              "playhead. Select a clip in the timeline (or park the playhead "
+              "over one) and run again.")
+        return
+
+    print(f"Source: {pick.label}")
+
+    # Extract clip data before showing the dialog, so unsupported clips
+    # (generators, compound clips, missing File Path) bail out before the user
+    # has filled the form in.
+    clip = get_selected_clip_data(timeline, pick.item)
+    if clip is None:
         return
 
     # Load previously saved settings for this project
@@ -878,11 +1020,6 @@ def main():
 
     # Persist settings for next run
     save_settings(project, settings)
-
-    # Extract clip data
-    clip = get_selected_clip_data(timeline, selected_item)
-    if clip is None:
-        return
 
     # Generate output
     if settings.output_mode == "Python":
