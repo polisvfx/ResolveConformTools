@@ -1,7 +1,7 @@
 """
 Find Clip in Timelines.py
 ─────────────────────────
-Version: 1.1
+Version: 1.2
 
 Searches all timelines in the current project for the selected clip and
 shows a popup listing the timelines that contain it.
@@ -11,10 +11,12 @@ jump (best-effort) to the in-point of the clip's first occurrence on
 that timeline.
 
 Source detection priority:
-  1. Selected clip in the Media Pool (explicit selection wins).
-  2. Item under the playhead on the active Timeline — Resolve's
-     scripting API has no concept of "selected timeline item", so this
-     is a best-effort fallback when nothing is selected in the bin.
+  1. Selected clip in the Media Pool — explicit, and the only signal
+     that stays visible from every page.
+  2. Selected clip in the active Timeline — Timeline.GetSelectedClips(),
+     added in DaVinci Resolve 21.0.4. Skipped on older builds.
+  3. Item under the playhead on the active Timeline — implicit fallback,
+     used only when nothing is selected anywhere.
 
 Run from:  Workspace ▸ Scripts  – or –  Workspace ▸ Console (exec/run)
 """
@@ -42,6 +44,77 @@ def get_resolve():
                        "Run this script from inside DaVinci Resolve.")
 
 
+# ─── Selection helpers ────────────────────────────────────────────────────────
+
+def _as_list(value):
+    """Normalise a Resolve list-returning API result into a plain list."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if v is not None]
+    return [value]
+
+
+def get_media_pool_selection(project):
+    """MediaPool.GetSelectedClips() — available on every supported build.
+
+    Guarded anyway: Resolve's scripting bridge resolves an unknown attribute
+    name to None rather than raising AttributeError, so a future rename would
+    otherwise surface as "'NoneType' object is not callable".
+    """
+    mp = project.GetMediaPool() if project else None
+    getter = getattr(mp, "GetSelectedClips", None) if mp else None
+    if not callable(getter):
+        return []
+    try:
+        return _as_list(getter())
+    except Exception:
+        return []
+
+
+def get_timeline_selection(timeline):
+    """Timeline.GetSelectedClips() — DaVinci Resolve 21.0.4 and newer.
+
+    Earlier builds have no such method and resolve the attribute to None, so
+    probe with getattr + callable() before calling. Verified on 21.0.4.5:
+    returns a plain list, [] when nothing is selected, and never leaks another
+    timeline's selection.
+    """
+    getter = getattr(timeline, "GetSelectedClips", None) if timeline else None
+    if not callable(getter):
+        return []
+    try:
+        return _as_list(getter())
+    except Exception:
+        return []
+
+
+def _earliest_media_pool_item(items):
+    """MediaPoolItem of the earliest selected item that has one, else None.
+
+    The returned order of GetSelectedClips() is arbitrary — verified on
+    21.0.4.5, where a 23-clip selection came back in neither timeline nor track
+    order — so sort explicitly rather than trusting position.
+
+    Audio items are kept on purpose: find_timelines_for_clip searches audio
+    tracks as well as video tracks, so an audio selection is a valid target.
+    """
+    def _start(item):
+        try:
+            return int(item.GetStart())
+        except Exception:
+            return 0
+
+    for item in sorted(items, key=_start):
+        try:
+            mpi = item.GetMediaPoolItem()
+        except Exception:
+            mpi = None
+        if mpi:
+            return mpi
+    return None
+
+
 # ─── Clip detection ───────────────────────────────────────────────────────────
 
 def get_target_clip(project):
@@ -49,34 +122,49 @@ def get_target_clip(project):
     Returns (media_pool_item, source_label) or (None, reason_string).
 
     Priority:
-      1. Media Pool selection (explicit — only fires if the user actually
-         clicked a clip in the bin).
-      2. Item under the playhead on the active Timeline. Resolve's API
-         does not expose timeline-item selection, so GetCurrentVideoItem
-         returns whatever sits under the playhead regardless of whether
-         the user picked it. Used only when nothing is selected in the
-         Media Pool.
+      1. Media Pool selection — the most explicit signal, and the only one
+         visible from every page.
+      2. Timeline selection — Timeline.GetSelectedClips(), Resolve 21.0.4+.
+         Also explicit, but a timeline selection can sit around stale while
+         the user works in the bin, so it loses to a live bin selection.
+      3. Item under the playhead — implicit. The playhead is always somewhere,
+         so it can never be read as a deliberate choice.
+
+    Tiers 2 and 3 are both best-effort: on builds older than 21.0.4 tier 2 is
+    silently unavailable and tier 3 is the only timeline-side signal.
     """
     # 1 – Explicit Media Pool selection wins.
-    #     MediaPool.GetSelectedClips() is the documented method; older drafts
-    #     used GetSelectedMediaPoolItems(), which Resolve's scripting bridge
-    #     silently resolves to None on the versions that don't expose it.
-    mp = project.GetMediaPool() if project else None
-    get_selected = getattr(mp, "GetSelectedClips", None) if mp else None
-    selected = get_selected() if callable(get_selected) else None
-    if selected:
-        return selected[0], "Media Pool selection"
+    mp_selected = get_media_pool_selection(project)
+    if mp_selected:
+        extra = (f" ({len(mp_selected)} clips selected, using the first)"
+                 if len(mp_selected) > 1 else "")
+        return mp_selected[0], f"Media Pool selection{extra}"
 
-    # 2 – Fall back to whatever sits under the playhead on the timeline.
     tl = project.GetCurrentTimeline()
     if tl:
+        tl_name = tl.GetName()
+
+        # 2 – Explicit timeline selection (Resolve 21.0.4+).
+        tl_selected = get_timeline_selection(tl)
+        if tl_selected:
+            mpi = _earliest_media_pool_item(tl_selected)
+            if mpi:
+                extra = (f" — {len(tl_selected)} clips selected, using the earliest"
+                         if len(tl_selected) > 1 else "")
+                return mpi, f"Timeline selection{extra}  [{tl_name}]"
+            print("[INFO] Timeline selection holds no clip backed by a Media "
+                  "Pool item (generator / adjustment clip?) — falling back "
+                  "to the playhead.")
+
+        # 3 – Whatever sits under the playhead.
         current_item = tl.GetCurrentVideoItem()
         if current_item:
             mpi = current_item.GetMediaPoolItem()
             if mpi:
-                return mpi, f"Timeline — under playhead  [{tl.GetName()}]"
+                return mpi, f"Timeline — under playhead  [{tl_name}]"
 
-    return None, "No clip selected in Media Pool, and no clip under the timeline playhead."
+    return None, ("Nothing selected in the Media Pool or the timeline, and no "
+                  "clip under the timeline playhead.")
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────
