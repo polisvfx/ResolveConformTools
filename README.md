@@ -19,7 +19,84 @@ A full Python rewrite of the Lua script with improved retime handling and XML-ba
 - **XML retime analysis**: Optionally exports the source timeline to FCP 7 XML and parses Time Remap keyframes to compute precise source frame ranges — particularly useful for speed ramps and non-linear retimes where the API-reported range may be inaccurate.
 - **Distinct retime markers**: Red markers distinguish between "Frame Hold", "Non-Linear Retime", and "Retimed Clip" (with speed percentage), with a note when the source was originally reversed.
 - **Clean API calls**: Only API-recognized fields are passed to `AppendToTimeline`, preventing silent failures caused by extra metadata.
+- **Complete source ranges (2.3+)**: `AppendToTimeline`'s `endFrame` is *exclusive* — asking for `endFrame=E` places frames up to `E-1`. Every clip is now requested one frame past its last frame, so the range that lands is the range that was asked for, and freeze frames (a one-frame range, previously refused as zero-length) place correctly.
 - All features from the Lua version (sorting, merging, duplicate marking, audio removal) are fully preserved.
+
+#### Update Timeline mode (2.0+)
+
+Update mode works on All Clips timelines created by **version 2.0 or later**.
+Regenerate anything older before updating it.
+
+Open an All Clips timeline, set **Mode** to *Update Existing Timeline*, and the
+script re-reads the source timelines and reconciles what is already there
+against what they say now:
+
+- shots whose source range grew or shrank are brought to the newest state,
+- genuinely new shots are appended on a **new video track per run**, named for
+  the run (`Update 3 - 2026-08-06`), starting after the existing content,
+- shots that no longer appear in any source are **marked, never removed**,
+- every shot it touches gets a marker with a timestamp and a short changelog,
+  e.g. `2026-08-06 14:22 | run 3 | head +20f, tail +40f | 100-200 -> 80-240`,
+  accumulating up to eight entries before the tail is summarised.
+
+Marker colours: green extended, yellow shortened, sand both ends, mint new,
+purple superseded, rose no longer used, fuchsia needs manual attention. A Sky
+marker on the timeline ruler summarises each run.
+
+**Run a dry run first.** Resolve's undo stack is not scriptable, so an update
+cannot be undone in one step. Dry run prints the whole plan and writes nothing.
+
+##### What it costs, and why
+
+Resolve's API has no trim and no move. Changing a clip's range therefore means
+deleting it and re-appending it, and **a rebuilt clip loses its grade and its
+Fusion comps** — `CopyGrades` needs the source clip still alive and there is no
+way to read a grade back out. Its name, clip colour, flags, enabled state and
+your own markers *are* restored. Clips carrying a Fusion comp or more than one
+colour version are skipped by default and flagged for manual attention; untick
+*skip clips with Fusion comps* to rebuild them anyway.
+
+That constraint is why only clips whose range actually moved are touched, and it
+shapes one behaviour worth expecting: **on a gapless timeline a clip has nowhere
+to grow**, so extensions are placed as a full-range copy on the run's update
+track and the original is marked superseded rather than moved. Growth happens in
+place only where a gap exists — usually one that a shortening opened earlier in
+the same run, which is why range changes are applied smallest-delta first.
+
+Other things to know:
+
+- **Growing and shrinking are not treated alike.** A shot is rebuilt once it
+  needs more than 3 frames it does not have, but only once it is carrying more
+  than 12 surplus frames. Missing frames break a pull; surplus frames are just
+  handle, and rebuilding to remove a few of them would cost that clip its grade
+  for nothing. Both are constants near the top of the script
+  (`UPDATE_CHANGE_TOLERANCE`, `UPDATE_SHRINK_TOLERANCE`) if your handles differ.
+- **The tool owns source ranges.** A clip you trimmed by hand — by more than
+  those thresholds — reads as changed and is put back to the collected range.
+  Every such rebuild is marked.
+- **Video only.** A clip with linked audio is skipped: deleting the video item
+  would orphan the audio. Generate with *Video Only* on, which is the default.
+- **The connection threshold matters between runs.** It decides which source
+  edits merge into one range, so changing it makes nearly everything read as
+  changed. The value used is stored and offered back to you; the script warns
+  if you change it.
+- **Preserve Source Track Layout** is a create-time layout and is not available
+  in update mode; a timeline built with it is reconciled by clip identity only.
+
+##### Where the state lives
+
+The source timelines and settings are stamped onto the timeline in two places —
+third-party metadata on the timeline's Media Pool item, and a `Cream` marker at
+the start of the timeline whose custom data holds the same JSON. The marker
+doubles as a visible "this timeline is managed" badge. Which clips are on the
+timeline is deliberately *not* stored: it is re-scanned every run, so anything
+you rearrange between runs is respected rather than overwritten.
+
+A timeline with no such record can be **adopted**: choose *Current selection*
+(or *Recorded + current selection*) as the update source, and the timelines you
+have selected in the Media Pool become its recorded sources. The script never
+guesses them. *Recorded + current selection* is also how you add a new reel to
+an existing All Clips timeline.
 
 ## Shot Naming
 The script will insert custom numbering into the "Shot" Metadata field. A shortcoming of Resolve is that theres no API access to set any custom timeline based values to a clip/event that can also be read via Tokens (eg. on the Deliver Page) so we are stuck with setting this data on a global/media bin level. This is problematic if you deal with source material that is used multiple times as the unique numbering can only be applied once and not for each instance.

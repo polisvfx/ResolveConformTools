@@ -1,29 +1,49 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 1.3
+Version: 2.3
 
-Creates a master timeline from selected timelines, collecting all unique source clips,
-merging overlapping source ranges, and placing them on a new timeline.
+Two modes.
 
-Supports detection and marking of:
+CREATE: builds a master timeline from the selected timelines, collecting all
+unique source clips, merging overlapping source ranges, and placing them on a
+new timeline. Detects and marks:
 - Duplicate clips (colored markers)
 - Retimed clips (red markers with speed info)
 - Frame holds / freeze frames
 - Non-linear retimes / speed ramps (via XML analysis)
 - Reversed clips (normalized to forward-playing)
+
+UPDATE: re-reads the source timelines and reconciles an existing All Clips
+timeline against them — lengthening and shortening shots to the newest state,
+appending genuinely new shots on a track of their own, and marking every shot it
+touched with a timestamped changelog. The source timelines and the settings used
+are stamped onto the timeline so a later run can find them again.
+
+Update mode only rebuilds clips whose source range actually moved, because
+Resolve has no trim and no move: changing a clip's range means deleting and
+re-appending it. Its name, clip colour, flags, enabled state and markers are
+restored afterwards, but ITS GRADE AND FUSION COMPS CANNOT BE — there is no API
+to read a grade back out. Clips carrying that work are skipped by default, and
+dry run exists because Resolve's undo stack is not scriptable.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 # Constants
+# Keep in step with the "Version:" line in the module docstring above — the repo
+# convention is that the docstring is authoritative, this is what gets recorded
+# into the manifest so an old timeline says which build last touched it.
+TOOL_VERSION = "2.3"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -56,6 +76,83 @@ TIMELINE_BLOCK_MARKER_COLORS = [
 DUPLICATE_MARKER_COLORS = [
     "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink",
     "Fuchsia", "Lavender", "Rose", "Cocoa", "Sand", "Sky", "Mint", "Lemon",
+]
+
+# Update-mode manifest. Stamped onto an All Clips timeline so a later run knows
+# which source timelines it was built from and with which settings — neither is
+# recoverable by looking at the output. Everything else (which clips are on the
+# timeline, where, and over what source range) is deliberately NOT stored: it is
+# re-scanned every run so edits made in between are respected rather than
+# overwritten from a stale cache.
+MANIFEST_SCHEMA = 1
+MANIFEST_KEY = "RCT_AllClipsManifest"
+MANIFEST_MARKER_PREFIX = "RCT_AllClipsManifest_v1:"
+MANIFEST_MARKER_COLOR = "Cream"  # the one colour no other pass in this file uses
+MANIFEST_MARKER_NAME = "All Clips Manifest"
+MANIFEST_MAX_RUNS = 20
+# The customData size limit is undocumented. A 16,000-character payload was
+# verified to round-trip intact on 21.0.4.5, so this cap is conservative on
+# purpose — the oldest run records are dropped first if it is ever reached.
+MANIFEST_MARKER_MAX_CHARS = 8000
+
+# customData prefix on the per-clip update marker. Carries the desired range the
+# clip was last reconciled against, which is what stops a clip whose target is
+# physically unreachable from being rebuilt on every run forever.
+UPDATE_MARKER_PREFIX = "RCT_UPD:"
+# A source range must GROW by more than this many frames before the update
+# rebuilds the clip. Must stay >= SLIP_TOLERANCE so last run's own placement slip
+# never reads as a change; 3 also matches MIN_FRAME_DIFF, the "difference that
+# matters" threshold the retime detector already uses.
+UPDATE_CHANGE_TOLERANCE = 3
+# ...and by more than this many frames before a clip is SHORTENED. The two are
+# deliberately asymmetric: missing frames break a pull, surplus frames do not.
+# Rebuilding to remove a few frames of handle costs that clip its grade and its
+# Fusion comps and leaves a gap, which is a bad trade for frames nobody minds.
+# Observed in practice: an All Clips timeline built by an earlier version of this
+# script carried a reversed clip with 5 frames of extra handle — real, harmless,
+# and not worth a rebuild. 12 frames is about half a second at 24/25 fps, well
+# clear of handle and rounding differences but far below a genuine edit change.
+UPDATE_SHRINK_TOLERANCE = 12
+# Free space after the last clip on a track: there is always more timeline.
+FREE_SPACE_UNBOUNDED = 1 << 30
+# Spare frames to reserve on each side when deciding whether a grown clip may
+# also use the append helper's +/-1 widening fallback. Without it, widening
+# collides with the neighbour and the append fails.
+REBUILD_FIT_SLACK = 1
+
+# Per-clip update markers. Colours are Resolve marker names; the overlap with
+# DUPLICATE_MARKER_COLORS is harmless — different frame, name and customData.
+UPDATE_MARKER_COLORS = {
+    "extended": "Green",
+    "shortened": "Yellow",
+    "both": "Sand",
+    "new": "Mint",
+    "superseded": "Purple",
+    "dropped": "Rose",
+    "manual": "Fuchsia",
+}
+# Fraction of the clip the update marker sits at. The duplicate pass uses 0.25
+# and the retime pass 0.5, so 0.75 keeps all three apart on all but tiny clips —
+# and pick_marker_frame() steps off a collision even then.
+UPDATE_MARKER_FRACTION = 0.75
+RUN_MARKER_PREFIX = "RCT_RUN:"
+RUN_MARKER_COLOR = "Sky"
+# Changelog lines kept in a clip's update marker note before the tail is folded
+# into a "... (N earlier changes)" summary line.
+CHANGELOG_MAX_LINES = 8
+CHANGELOG_TRUNCATION_MARK = "... ("
+# Marker text stays ASCII: it round-trips through the scripting bridge and back
+# out through GetMarkers on every subsequent run.
+CHANGELOG_SEPARATOR = " | "
+
+# UI mode labels, and the update-source options mapped to the internal names
+# run_update_workflow expects.
+MODE_CREATE = "Create New Timeline"
+MODE_UPDATE = "Update Existing Timeline"
+SOURCE_MODES = [
+    ("Recorded in timeline", "Recorded"),
+    ("Current selection", "Selection"),
+    ("Recorded + current selection", "Union"),
 ]
 
 
@@ -114,6 +211,65 @@ class RetimeKeyframe:
     """A single keyframe from the FCP XML Time Remap effect."""
     when: int
     value: int
+
+
+@dataclass
+class PlacedClip:
+    """A clip found on an existing All Clips timeline during an update scan.
+
+    record_end is EXCLUSIVE and is computed as GetStart() + GetDuration() rather
+    than from GetEnd(). Verified on 21.0.4.5 that GetEnd() is itself exclusive
+    (start 90100 + duration 79 = end 90179), so the two agree — but duration is
+    unambiguous by definition, so the arithmetic here does not rest on that.
+    """
+    item: object
+    identity: str
+    source_start: int          # inclusive, normalised so start <= end
+    source_end: int            # inclusive
+    record_start: int          # absolute timeline frame
+    record_end: int            # exclusive
+    track_index: int
+    name: str = ""
+    # Desired range this clip was last reconciled against, read back from its own
+    # update marker. None when the clip has never been through an update.
+    accepted_start: Optional[int] = None
+    accepted_end: Optional[int] = None
+    linked_item_count: int = 0
+
+
+@dataclass
+class ItemState:
+    """Everything about a TimelineItem that survives a delete + re-append.
+
+    Grades and Fusion comps are absent because they cannot be carried across:
+    CopyGrades copies FROM a live source item, and SetCDL has no getter. Their
+    presence is recorded so a clip that would lose them can be reported, and
+    optionally left alone.
+    """
+    name: Optional[str] = None
+    clip_color: Optional[str] = None
+    flags: list = field(default_factory=list)
+    markers: dict = field(default_factory=dict)
+    enabled: Optional[bool] = None
+    fusion_comp_count: int = 0
+    version_names: list = field(default_factory=list)
+    linked_item_count: int = 0
+    track_index: int = 1
+    record_start: int = 0
+    duration: int = 0
+    source_start: int = 0
+    source_end: int = 0
+
+
+@dataclass
+class ClipDiff:
+    """One reconciliation decision: what to do about one shot."""
+    identity: str
+    kind: str                          # unchanged|extended|shortened|both|new|dropped
+    clip_info: Optional[ClipInfo] = None   # None for "dropped"
+    placed: Optional[PlacedClip] = None    # None for "new"
+    head_delta: int = 0                # desired_start - placed_start; <0 grows
+    tail_delta: int = 0                # desired_end - placed_end;    >0 grows
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +550,44 @@ def merge_all_overlapping(clip_infos: list[ClipInfo], threshold: int) -> list[Cl
 
 
 # ---------------------------------------------------------------------------
+# Clip Identity
+# ---------------------------------------------------------------------------
+
+def clip_identity_key(media_pool_item, merge_by_source_file: bool) -> Optional[str]:
+    """Bucket identity for a MediaPoolItem.
+
+    - merge_by_source_file=True: key by File Path so two MediaPoolItems pointing
+      at the same source file (the dual-import scenario from round-tripped
+      conform timelines) land in the same bucket and get merged. Falls back to
+      the MediaId when File Path is empty.
+    - merge_by_source_file=False: key by MediaId (legacy behaviour).
+
+    Returns None when neither is available; the caller skips the clip.
+
+    Both the collection pass and the update pass's timeline scan go through this
+    so a clip already on an All Clips timeline is recognised as the same shot the
+    collector just produced. Any track suffix (preserve-track-layout mode) is the
+    caller's business: an output-timeline track has no relationship to a source
+    track and must never enter the identity.
+    """
+    media_id = None
+    try:
+        media_id = media_pool_item.GetMediaId()
+    except Exception:
+        media_id = None
+
+    if merge_by_source_file:
+        try:
+            file_path = media_pool_item.GetClipProperty("File Path") or ""
+        except Exception:
+            file_path = ""
+        if file_path:
+            return f"FP:{file_path}"
+
+    return media_id or None
+
+
+# ---------------------------------------------------------------------------
 # Duplicate Detection & Marking
 # ---------------------------------------------------------------------------
 
@@ -552,11 +746,29 @@ def is_clip_retimed(clip: TimelineClipData) -> tuple[bool, Optional[float], bool
 # ---------------------------------------------------------------------------
 
 def sanitize_for_api(clip_info: ClipInfo) -> dict:
-    """Create a clean dict with only API-recognized fields for AppendToTimeline."""
+    """Create a clean dict with only API-recognized fields for AppendToTimeline.
+
+    AppendToTimeline's endFrame is EXCLUSIVE: requesting endFrame=E places source
+    frames start..E-1. ClipInfo ranges are inclusive (they come from a source
+    clip's GetSourceStartFrame/GetSourceEndFrame, where the last frame is
+    included), so the request has to be end + 1.
+
+    Measured on 21.0.4.5 against a 158-frame clip:
+
+        bare append, whole clip          duration 158   (ground truth)
+        startFrame=0, endFrame=157       duration 157   one frame short
+        startFrame=0, endFrame=158       duration 158   correct
+        startFrame=10, endFrame=19       duration 9     covers 10..18
+        startFrame=10, endFrame=10       REFUSED        zero-length
+
+    Without the +1 every generated clip lost the last frame of its range, and a
+    frame hold - where start == end - asked for a zero-length clip, which Resolve
+    refuses outright, so freeze frames silently never appeared on the timeline.
+    """
     return {
         "mediaPoolItem": clip_info.media_pool_item,
         "startFrame": clip_info.start_frame,
-        "endFrame": clip_info.end_frame,
+        "endFrame": clip_info.end_frame + 1,
     }
 
 
@@ -594,51 +806,290 @@ def get_timeline_for_media_pool_item(media_pool_item):
 
 
 # ---------------------------------------------------------------------------
-# Main Workflow
+# Update Manifest
 # ---------------------------------------------------------------------------
 
-def run_workflow(
-    dst_timeline_name: str,
-    selection_method: str,
-    sorting_method: str,
-    connection_threshold: int,
-    allow_disabled_clips: bool,
-    video_only: bool,
-    mark_duplicates: bool,
-    mark_retimed_clips: bool,
-    use_xml_retime: bool,
-    import_clip_names: bool,
-    preserve_track_layout: bool,
-    merge_by_source_file: bool = True,
-    progress: Optional["ProgressUI"] = None,
-) -> None:
-    """Execute the complete timeline generation workflow."""
+def utc_now_iso() -> str:
+    """Current UTC time as 2026-08-06T12:22:33Z — the manifest's machine clock."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_manifest(timeline_uid, timeline_name, sources, settings, now_iso,
+                   tool_version) -> dict:
+    """A fresh manifest for an All Clips timeline.
+
+    `sources` is [{"uid": ..., "name": ...}] for the timelines it was built from;
+    the uid is exact and survives renames, the name is the only thing a human can
+    act on once a uid stops resolving. `settings` is the generation settings that
+    shaped the merged ranges — re-running with a different connection threshold
+    reshapes nearly every clip, so the previous value has to be recoverable.
+    """
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "tool": "Generate All Clips Timeline PRO",
+        "tool_version": tool_version,
+        "timeline_uid": timeline_uid or "",
+        "timeline_name": timeline_name or "",
+        "created_utc": now_iso,
+        "last_run_utc": now_iso,
+        "run_counter": 0,
+        "adopted": False,
+        "sources": list(sources or []),
+        "settings": dict(settings or {}),
+        "runs": [],
+    }
+
+
+def manifest_add_run(manifest: dict, run_record: dict,
+                     max_runs: int = MANIFEST_MAX_RUNS) -> dict:
+    """Append a run record, bump the counters, cap the history. Returns a copy."""
+    updated = dict(manifest)
+    runs = list(manifest.get("runs") or [])
+    runs.append(dict(run_record))
+    if max_runs >= 0:
+        runs = runs[-max_runs:] if max_runs else []
+    updated["runs"] = runs
+    updated["run_counter"] = run_record.get("n", manifest.get("run_counter", 0) + 1)
+    if run_record.get("utc"):
+        updated["last_run_utc"] = run_record["utc"]
+    return updated
+
+
+def encode_manifest(manifest: dict) -> str:
+    """Compact, key-sorted JSON so the same manifest always encodes identically."""
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+
+
+def decode_manifest(text) -> Optional[dict]:
+    """Parse a manifest payload, with or without the marker prefix.
+
+    Returns None for anything unusable — absent, junk, not an object, or written
+    by a schema this build does not understand. A newer schema is reported loudly
+    rather than half-read, because acting on a manifest we only partly understand
+    is how an update deletes the wrong clips.
+    """
+    if not text:
+        return None
+    if isinstance(text, dict):
+        # GetThirdPartyMetadata can hand back {key: value} instead of the value.
+        text = text.get(MANIFEST_KEY) or ""
+    if not isinstance(text, str):
+        return None
+    payload = text.strip()
+    if payload.startswith(MANIFEST_MARKER_PREFIX):
+        payload = payload[len(MANIFEST_MARKER_PREFIX):]
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    schema = data.get("schema")
+    if schema != MANIFEST_SCHEMA:
+        if schema is not None:
+            print(f"  NOTE: ignoring manifest with unsupported schema {schema!r} "
+                  f"(this build understands {MANIFEST_SCHEMA}).")
+        return None
+    return data
+
+
+def trim_manifest_for_marker(manifest: dict,
+                             max_chars: int = MANIFEST_MARKER_MAX_CHARS) -> dict:
+    """Drop the oldest run records until the encoded manifest fits `max_chars`.
+
+    Never drops sources or settings — those are the parts that cannot be
+    re-derived. If it still does not fit with no runs left, the manifest is
+    returned as-is and the caller writes what it can.
+    """
+    trimmed = dict(manifest)
+    runs = list(manifest.get("runs") or [])
+    while runs and len(MANIFEST_MARKER_PREFIX) + len(
+            encode_manifest({**trimmed, "runs": runs})) > max_chars:
+        runs = runs[1:]
+    trimmed["runs"] = runs
+    return trimmed
+
+
+def normalised_markers(obj) -> dict:
+    """GetMarkers() as {int frame: info}. Resolve returns float keys (96.0)."""
+    getter = getattr(obj, "GetMarkers", None)
+    if not callable(getter):
+        return {}
+    try:
+        raw = getter()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    markers = {}
+    try:
+        for frame, info in raw.items():
+            try:
+                markers[int(frame)] = info
+            except (TypeError, ValueError):
+                continue
+    except AttributeError:
+        return {}
+    return markers
+
+
+def first_free_frame(existing_frames, preferred: int,
+                     lower: Optional[int] = None,
+                     upper: Optional[int] = None) -> int:
+    """First frame free of `existing_frames` at or after `preferred`.
+
+    Falls back to searching backwards towards `lower` when the forward range is
+    exhausted. Returns -1 when every frame in [lower, upper] is taken. Resolve
+    permits only one marker per frame, so any code adding a marker near a
+    fraction of a clip has to be able to step off a collision.
+    """
+    taken = {int(f) for f in existing_frames}
+    if upper is None:
+        upper = preferred + len(taken) + 1
+    start = preferred if lower is None else max(preferred, lower)
+    for frame in range(start, upper + 1):
+        if frame not in taken:
+            return frame
+    if lower is not None:
+        for frame in range(min(preferred, upper), lower - 1, -1):
+            if frame not in taken:
+                return frame
+    return -1
+
+
+def find_manifest_marker_frame(markers: dict) -> Optional[int]:
+    """Frame of the manifest marker in a normalised markers dict, or None.
+
+    Scans for the customData prefix rather than using GetMarkerByCustomData,
+    which matches the whole string exactly and so cannot find a payload whose
+    tail changes on every run.
+    """
+    for frame in sorted(markers):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if isinstance(custom, str) and custom.startswith(MANIFEST_MARKER_PREFIX):
+            return frame
+    return None
+
+
+def read_manifest(timeline) -> tuple:
+    """Read the manifest off a timeline. Returns (manifest, source).
+
+    source is "metadata", "marker" or "none". Both stores are written on every
+    update; whichever answers first wins. Third-party metadata is the primary
+    because it is invisible. It was verified to round-trip on a timeline's
+    MediaPoolItem on 21.0.4.5 — which was not a given, since third-party metadata
+    is a camera/sidecar concept and a timeline has no media file — but survival
+    across a project save and reload has not been checked, and the visible marker
+    is the badge that tells a human this timeline is managed. Keep both.
+    """
+    getter = getattr(timeline, "GetMediaPoolItem", None)
+    if callable(getter):
+        try:
+            mpi = getter()
+        except Exception:
+            mpi = None
+        if mpi is not None:
+            reader = getattr(mpi, "GetThirdPartyMetadata", None)
+            if callable(reader):
+                try:
+                    raw = reader(MANIFEST_KEY)
+                except Exception:
+                    raw = None
+                manifest = decode_manifest(raw)
+                if manifest is not None:
+                    return manifest, "metadata"
+
+    markers = normalised_markers(timeline)
+    frame = find_manifest_marker_frame(markers)
+    if frame is not None:
+        manifest = decode_manifest((markers[frame] or {}).get("customData"))
+        if manifest is not None:
+            return manifest, "marker"
+
+    return None, "none"
+
+
+def write_manifest(timeline, manifest: dict) -> dict:
+    """Write the manifest to both stores. Returns {"metadata": ok, "marker": ok}."""
+    result = {"metadata": False, "marker": False}
+    encoded = encode_manifest(manifest)
+
+    getter = getattr(timeline, "GetMediaPoolItem", None)
+    if callable(getter):
+        try:
+            mpi = getter()
+        except Exception:
+            mpi = None
+        if mpi is not None:
+            writer = getattr(mpi, "SetThirdPartyMetadata", None)
+            if callable(writer):
+                try:
+                    result["metadata"] = bool(writer(MANIFEST_KEY, encoded))
+                except Exception:
+                    result["metadata"] = False
+
+    markers = normalised_markers(timeline)
+    existing = find_manifest_marker_frame(markers)
+    if existing is not None:
+        try:
+            timeline.DeleteMarkerAtFrame(existing)
+        except Exception:
+            pass
+        markers.pop(existing, None)
+
+    trimmed = trim_manifest_for_marker(manifest)
+    dropped = len(manifest.get("runs") or []) - len(trimmed.get("runs") or [])
+    if dropped > 0:
+        print(f"  NOTE: manifest marker trimmed by {dropped} old run record(s) "
+              f"to stay under {MANIFEST_MARKER_MAX_CHARS} characters.")
+
+    frame = existing if existing is not None else first_free_frame(markers, 0, lower=0)
+    if frame < 0:
+        print("  WARNING: no free frame for the manifest marker.")
+        return result
+
+    note = (f"Managed by Generate All Clips Timeline PRO.\n"
+            f"Run {manifest.get('run_counter', 0)} · "
+            f"{manifest.get('last_run_utc', '')}\n"
+            f"Sources: "
+            + ", ".join(s.get("name", "?") for s in manifest.get("sources") or []))
+    try:
+        result["marker"] = bool(timeline.AddMarker(
+            frame, MANIFEST_MARKER_COLOR, MANIFEST_MARKER_NAME, note, 1,
+            MANIFEST_MARKER_PREFIX + encode_manifest(trimmed),
+        ))
+    except Exception:
+        result["marker"] = False
+
+    if not result["metadata"] and not result["marker"]:
+        print("  WARNING: could not persist the manifest — this timeline will "
+              "not be recognised as an All Clips timeline on the next run.")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Source Timeline Resolution
+# ---------------------------------------------------------------------------
+
+def resolve_source_timelines(media_pool, selection_method: str,
+                             project_timelines: dict, progress_cb=None) -> list:
+    """Resolve the user's Media Pool selection into [(name, Timeline), ...].
+
+    Non-timeline items are reported and skipped. Returns an empty list when
+    nothing usable was selected — the caller decides what to say about that.
+    """
 
     def _p(stage: str, current: int = 0, total: int = 0) -> None:
-        if progress is not None:
-            progress.set(stage, current, total)
-
-    # Get project context — resolve is a pre-injected global in Resolve's scripting environment
-    project_manager = resolve.GetProjectManager()  # noqa: F821
-    project = project_manager.GetCurrentProject()
-    media_pool = project.GetMediaPool()
-    num_timelines = project.GetTimelineCount()
-    selected_bin = media_pool.GetCurrentFolder()
-
-    # Build timeline name lookup. Kept eager because it has a second consumer —
-    # destination-timeline name deduplication further down — which runs on every
-    # invocation. As a way of resolving a source timeline it is superseded by
-    # get_timeline_for_media_pool_item() below and only used as the pre-21.0.4
-    # fallback. (The Lua variant builds this lazily; it has no second consumer.)
-    project_timelines = {}
-    for timeline_idx in range(1, num_timelines + 1):
-        tl = project.GetTimelineByIndex(timeline_idx)
-        if tl is not None:
-            project_timelines[tl.GetName()] = tl
+        if progress_cb is not None:
+            progress_cb(stage, current, total)
 
     # Get selected clips
     selected_clips = []
     if selection_method == "Current Bin":
+        selected_bin = media_pool.GetCurrentFolder()
         if selected_bin:
             bin_clips = selected_bin.GetClipList()
             if bin_clips:
@@ -649,18 +1100,17 @@ def run_workflow(
             selected_clips = sel_clips
     else:
         print("Unknown selection method.")
-        return
+        return []
 
     if not selected_clips:
         print("No clips selected or found in bin. Please select clips or timelines.")
-        return
+        return []
 
     print("Processing selected clips...")
 
-    # Collect clips from all selected timelines
-    clips: dict[str, list[ClipInfo]] = {}
+    resolved = []
     total_selected = len(selected_clips)
-    _p("Reading clips...", 0, total_selected)
+    _p("Resolving timelines...", 0, total_selected)
 
     for sel_idx, media_pool_item in enumerate(selected_clips, start=1):
         if media_pool_item is None:
@@ -680,8 +1130,7 @@ def run_workflow(
             continue
 
         timeline_name = media_pool_item.GetName()
-        print(f"Processing timeline: {timeline_name}")
-        _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
+        _p(f"Resolving: {timeline_name} ({sel_idx}/{total_selected})",
            sel_idx, total_selected)
 
         # Ask the item for its own timeline (Resolve 21.0.4+). The name lookup
@@ -693,6 +1142,54 @@ def run_workflow(
         if not curr_timeline:
             print(f"Timeline not found in project: {timeline_name}")
             continue
+
+        resolved.append((timeline_name, curr_timeline))
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Clip Collection
+# ---------------------------------------------------------------------------
+
+def collect_desired_clips(
+    source_timelines: list,
+    *,
+    connection_threshold: int,
+    allow_disabled_clips: bool,
+    mark_duplicates: bool,
+    mark_retimed_clips: bool,
+    use_xml_retime: bool,
+    import_clip_names: bool,
+    preserve_track_layout: bool,
+    merge_by_source_file: bool,
+    sorting_method: str,
+    progress_cb=None,
+) -> tuple:
+    """Walk the source timelines and produce the desired clip set.
+
+    Returns (all_clip_infos, timeline_block_markers, duplicate_set_count).
+
+    This is the whole "what belongs on the output timeline" computation: track
+    walk, retime and XML analysis, identity bucketing, overlap merging, the
+    optional per-source-timeline layout, duplicate stamping and sorting. The
+    create and update workflows both run it and differ only in what they do with
+    the result.
+    """
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress_cb is not None:
+            progress_cb(stage, current, total)
+
+    # Collect clips from all selected timelines
+    clips: dict[str, list[ClipInfo]] = {}
+    total_selected = len(source_timelines)
+    _p("Reading clips...", 0, total_selected)
+
+    for sel_idx, (timeline_name, curr_timeline) in enumerate(source_timelines, start=1):
+        print(f"Processing timeline: {timeline_name}")
+        _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
+           sel_idx, total_selected)
 
         # XML retime analysis for this timeline
         xml_lookup = {}
@@ -783,9 +1280,12 @@ def run_workflow(
                 norm_start = min(raw_start, raw_end)
                 norm_end = max(raw_start, raw_end)
 
-                # GetSourceEndFrame() is inclusive in the Resolve API, and
-                # AppendToTimeline.endFrame is inclusive too — pass norm_end through
-                # unchanged. (is_frame_hold is still used downstream for marker text.)
+                # GetSourceEndFrame() on a source clip is the inclusive last
+                # frame, so norm_end is inclusive and passes through unchanged.
+                # AppendToTimeline.endFrame is EXCLUSIVE, which is not the same
+                # convention — sanitize_for_api() does that conversion, once, at
+                # the point of the API call. (is_frame_hold is still used
+                # downstream for marker text.)
 
                 # Capture the raw API-reported range BEFORE any XML expansion
                 # or merging — used by the Range Audit at the end of the run.
@@ -911,22 +1411,9 @@ def run_workflow(
                     api_source_start=api_source_start,
                     api_source_end=api_source_end,
                 )
-                # Bucket key strategy:
-                # - merge_by_source_file=True: key by File Path so two MediaPoolItems
-                #   pointing at the same source file (dual-import scenario from
-                #   round-tripped conform timelines) land in the same bucket and get
-                #   merged. Falls back to media_id when File Path is empty.
-                # - merge_by_source_file=False: key by media_id (legacy behavior).
-                # When preserving track layout, we also include the track index in the
-                # key to prevent cross-track merging.
-                identity_key = media_id
-                if merge_by_source_file:
-                    try:
-                        fp = media_item.GetClipProperty("File Path") or ""
-                    except Exception:
-                        fp = ""
-                    if fp:
-                        identity_key = f"FP:{fp}"
+                # Bucket key: see clip_identity_key(). When preserving track layout
+                # we also include the track index to prevent cross-track merging.
+                identity_key = clip_identity_key(media_item, merge_by_source_file) or media_id
                 clips_key = f"{identity_key}_T{track_idx}" if preserve_track_layout else identity_key
                 clips.setdefault(clips_key, []).append(clip_info)
                 print(f"  Added clip to processing list: {item_name} "
@@ -942,7 +1429,7 @@ def run_workflow(
 
     if not clips:
         print("No valid clips found to process.")
-        return
+        return [], [], 0
 
     # Cross-bucket scan: files appearing under multiple bucket keys. With
     # merge-by-file-path ON this should be empty (or only flag clips with
@@ -1148,6 +1635,651 @@ def run_workflow(
         print(f"Unknown sorting method '{sorting_method}', using default (Source Name)")
         sort_by_source_name(all_clip_infos)
 
+    return all_clip_infos, timeline_markers, dup_set_count
+
+
+# ---------------------------------------------------------------------------
+# Append Helper
+# ---------------------------------------------------------------------------
+
+def append_clip_with_slip_compensation(
+    media_pool,
+    timeline,
+    clip_info: ClipInfo,
+    *,
+    video_only: bool,
+    track_index: Optional[int] = None,
+    record_frame: Optional[int] = None,
+    timeline_fps: Optional[float] = None,
+    allow_widening: bool = True,
+) -> tuple:
+    """Append one ClipInfo, compensating for AppendToTimeline source-frame slip.
+
+    `timeline` must already be the project's current timeline — AppendToTimeline
+    always targets the current one.
+
+    Resolve sometimes places clips with their source in/out shifted by ±1 frame
+    (codec/internal anchor quirks). We re-query the placed clip; if it differs
+    from the target, delete it and retry with startFrame/endFrame adjusted by the
+    inverse of the observed slip. Capped at SLIP_RETRY_LIMIT retries; if still
+    off, fall back to widening the request by ±1 so the target range is fully
+    contained in the placed range (extra handle frames are acceptable, missing
+    frames are not). Pass allow_widening=False when the clip is going into a
+    tight gap where that extra frame has nowhere to go.
+
+    Returns (item, status, placed_source_start, placed_source_end). status is one
+    of "exact", "corrected", "widened", "unfixed", "unknown" or "error";
+    "unknown" covers an append that raised nothing but gave back no single
+    usable item to verify.
+    """
+    mpi = clip_info.media_pool_item
+    clip_name = mpi.GetName()
+
+    # Quiet FPS-mismatch check (loud warning only when triggered).
+    try:
+        _clip_fps_raw = mpi.GetClipProperty("FPS")
+        _clip_fps_val = float(_clip_fps_raw) if _clip_fps_raw not in (None, "") else None
+    except (TypeError, ValueError, Exception):
+        _clip_fps_val = None
+    if (timeline_fps is not None and _clip_fps_val is not None
+            and abs(timeline_fps - _clip_fps_val) > 0.01):
+        print(
+            f"  WARN: FPS mismatch on '{clip_name}' "
+            f"(clip={_clip_fps_val}, timeline={timeline_fps})"
+        )
+
+    api_dict = sanitize_for_api(clip_info)
+    # Audio filtering: mediaType=1 is the documented way to import video only and
+    # works across all Resolve versions. importVideo/importAudio are kept as a
+    # belt-and-suspenders hint for newer API builds.
+    if video_only:
+        api_dict["mediaType"] = 1  # 1 = video, 2 = audio
+    api_dict["importVideo"] = True
+    api_dict["importAudio"] = not video_only
+    if track_index is not None:
+        api_dict["trackIndex"] = track_index
+    if record_frame is not None:
+        api_dict["recordFrame"] = record_frame
+
+    target_start = api_dict["startFrame"]
+    target_end = api_dict["endFrame"]
+
+    try:
+        placed_items = media_pool.AppendToTimeline([api_dict])
+    except Exception:
+        print(f"  ERROR: Failed to add clip: {clip_name}")
+        print(f"  Frame range attempted: {api_dict['startFrame']} to {api_dict['endFrame']}")
+        return None, "error", None, None
+
+    if record_frame is not None:
+        print(f"  Placed on track {track_index} at frame {record_frame}")
+
+    last_item = None
+    retry_count = 0
+    while placed_items and retry_count <= SLIP_RETRY_LIMIT:
+        if len(placed_items) != 1:
+            break  # unexpected multi-item return; don't try to fix
+        placed = placed_items[0]
+        last_item = placed
+        try:
+            actual_start = placed.GetSourceStartFrame()
+            actual_end = placed.GetSourceEndFrame()
+        except Exception:
+            actual_start = None
+            actual_end = None
+        if actual_start is None or actual_end is None:
+            break
+        start_delta = actual_start - target_start
+        end_delta = actual_end - target_end
+        if start_delta == 0 and end_delta == 0:
+            return (placed, "corrected" if retry_count > 0 else "exact",
+                    actual_start, actual_end)
+        if retry_count >= SLIP_RETRY_LIMIT:
+            if not allow_widening:
+                print(
+                    f"  WARN: '{clip_name}' slip unfixable (target "
+                    f"{target_start}-{target_end}, placed "
+                    f"{actual_start}-{actual_end}); no room to widen here"
+                )
+                return placed, "unfixed", actual_start, actual_end
+            # Widening fallback — extra frames are acceptable.
+            try:
+                timeline.DeleteClips([placed], False)
+            except Exception:
+                print(
+                    f"  ERROR: '{clip_name}' slip unfixable and DeleteClips "
+                    f"failed before widening; clip left at "
+                    f"{actual_start}-{actual_end} "
+                    f"(target {target_start}-{target_end})"
+                )
+                return placed, "unfixed", actual_start, actual_end
+            wide_start = max(0, target_start - 1)
+            wide_end = target_end + 1
+            try:
+                _media_end_raw = mpi.GetClipProperty("End")
+                _media_end = int(_media_end_raw) if _media_end_raw not in (None, "") else None
+            except (TypeError, ValueError, Exception):
+                _media_end = None
+            if _media_end is not None:
+                # GetClipProperty("End") is the inclusive last frame of the
+                # media; endFrame is exclusive, so the largest legal request is
+                # one past it.
+                wide_end = min(wide_end, _media_end + 1)
+            api_dict["startFrame"] = wide_start
+            api_dict["endFrame"] = wide_end
+            try:
+                wide_items = media_pool.AppendToTimeline([api_dict])
+            except Exception:
+                print(
+                    f"  ERROR: '{clip_name}' widening append raised; clip is "
+                    f"no longer on the timeline (target "
+                    f"{target_start}-{target_end})"
+                )
+                return None, "unfixed", None, None
+            covers = False
+            w_start = w_end = None
+            wide_item = None
+            if wide_items and len(wide_items) == 1:
+                wide_item = wide_items[0]
+                try:
+                    w_start = wide_item.GetSourceStartFrame()
+                    w_end = wide_item.GetSourceEndFrame()
+                except Exception:
+                    pass
+                if w_start is not None and w_end is not None:
+                    covers = (w_start <= target_start and w_end >= target_end)
+            if covers:
+                print(
+                    f"  WARN: '{clip_name}' slip unfixable "
+                    f"(target {target_start}-{target_end}); "
+                    f"widened to {w_start}-{w_end} — "
+                    f"target frames preserved with handles"
+                )
+                return wide_item, "widened", w_start, w_end
+            print(
+                f"  ERROR: '{clip_name}' slip unfixable; "
+                f"widened to {w_start}-{w_end} but target "
+                f"{target_start}-{target_end} NOT covered "
+                f"(frames missing)"
+            )
+            return wide_item, "unfixed", w_start, w_end
+        # Silent retry with inverse-of-observed-slip compensation.
+        try:
+            timeline.DeleteClips([placed], False)
+        except Exception:
+            print(
+                f"  ERROR: '{clip_name}' DeleteClips failed during "
+                f"retry; leaving slipped clip at "
+                f"{actual_start}-{actual_end} "
+                f"(target {target_start}-{target_end})"
+            )
+            return placed, "unfixed", actual_start, actual_end
+        api_dict["startFrame"] = target_start - start_delta
+        api_dict["endFrame"] = target_end - end_delta
+        try:
+            placed_items = media_pool.AppendToTimeline([api_dict])
+        except Exception:
+            print(
+                f"  ERROR: '{clip_name}' retry append raised; clip is no "
+                f"longer on the timeline (target {target_start}-{target_end})"
+            )
+            return None, "unfixed", None, None
+        last_item = None
+        retry_count += 1
+
+    return last_item, "unknown", None, None
+
+
+# ---------------------------------------------------------------------------
+# Marker Text
+# ---------------------------------------------------------------------------
+
+def build_duplicate_marker_text(clip_info: ClipInfo) -> tuple:
+    """(color, name, note) for a duplicate-set marker."""
+    set_idx = clip_info.duplicate_set_index
+    color = DUPLICATE_MARKER_COLORS[set_idx % len(DUPLICATE_MARKER_COLORS)]
+    marker_text = (f"Dup Set #{set_idx + 1} "
+                   f"({clip_info.duplicate_position + 1}/{clip_info.duplicate_set_size})")
+    return color, marker_text, "Duplicate clip detected"
+
+
+def build_retime_marker_text(clip_info: ClipInfo) -> tuple:
+    """(name, note) for a retime marker. The colour is always Red."""
+    if clip_info.is_frame_hold:
+        marker_text = "Frame Hold"
+        marker_note = ("Source clip used a frame hold (freeze frame). "
+                       "Manual check recommended.")
+    elif clip_info.is_non_linear_retime:
+        marker_text = "Non-Linear Retime"
+        marker_note = ("Speed curve/ramp detected. Source range may not "
+                       "cover all frames used. Manual check recommended.")
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    else:
+        speed_value = clip_info.retime_percentage
+        speed_str = f"{speed_value:.1f}" if speed_value is not None else "Unknown"
+        marker_text = "Retimed Clip"
+        marker_note = f"Manual check recommended. Speed: {speed_str}%"
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    return marker_text, marker_note
+
+
+# ---------------------------------------------------------------------------
+# Update Diff
+# ---------------------------------------------------------------------------
+
+def read_accepted_range(markers: dict) -> tuple:
+    """(accepted_start, accepted_end) from a clip's own update marker.
+
+    Returns (None, None) when the clip has never been through an update. If more
+    than one update marker survives, the highest run number wins.
+    """
+    best_run = None
+    best = (None, None)
+    for frame in sorted(markers):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if not isinstance(custom, str) or not custom.startswith(UPDATE_MARKER_PREFIX):
+            continue
+        try:
+            data = json.loads(custom[len(UPDATE_MARKER_PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        start, end = data.get("ds"), data.get("de")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        run = data.get("run")
+        run = run if isinstance(run, int) else -1
+        if best_run is None or run >= best_run:
+            best_run = run
+            best = (start, end)
+    return best
+
+
+def diff_ranges(desired_ranges: list, placed_ranges: list) -> tuple:
+    """Greedy maximum-overlap matching between two lists of inclusive ranges.
+
+    Returns (pairs, unmatched_desired, unmatched_placed) where pairs is
+    [(desired_index, placed_index), ...].
+
+    Merging legitimately leaves several disjoint ranges for one source file, so
+    both sides are lists. Pairing them by index breaks the moment one range is
+    deleted or a new one lands in the middle, hence the overlap match. Ties are
+    broken by total endpoint distance and then by index, so the result is
+    deterministic for a given input.
+    """
+    candidates = []
+    for di, (d_start, d_end) in enumerate(desired_ranges):
+        for pi, (p_start, p_end) in enumerate(placed_ranges):
+            overlap = min(d_end, p_end) - max(d_start, p_start) + 1
+            if overlap <= 0:
+                continue
+            distance = abs(d_start - p_start) + abs(d_end - p_end)
+            candidates.append((-overlap, distance, di, pi))
+    candidates.sort()
+
+    pairs = []
+    used_desired = set()
+    used_placed = set()
+    for _overlap, _distance, di, pi in candidates:
+        if di in used_desired or pi in used_placed:
+            continue
+        used_desired.add(di)
+        used_placed.add(pi)
+        pairs.append((di, pi))
+    pairs.sort()
+
+    unmatched_desired = [i for i in range(len(desired_ranges)) if i not in used_desired]
+    unmatched_placed = [i for i in range(len(placed_ranges)) if i not in used_placed]
+    return pairs, unmatched_desired, unmatched_placed
+
+
+def classify_change(desired: tuple, placed: tuple, accepted=None,
+                    tolerance: int = UPDATE_CHANGE_TOLERANCE,
+                    shrink_tolerance: int = UPDATE_SHRINK_TOLERANCE) -> str:
+    """'unchanged' | 'extended' | 'shortened' | 'both' for one matched pair.
+
+    Each end is tested against a threshold chosen by DIRECTION, not by size:
+    growth beyond `tolerance` counts, shrink only beyond `shrink_tolerance`.
+    Missing frames break a pull; surplus frames are just handle, and rebuilding
+    to remove them costs the clip its grade for nothing.
+
+    That asymmetry also hardens the anti-churn guarantee. The append helper's
+    widening fallback can place a clip WIDER than requested, which reads as a
+    shrink on both ends — now measured against the larger threshold, so a
+    widened clip stays unchanged by an even wider margin.
+
+    `accepted` is the desired range this clip was last reconciled against, and is
+    compared with the tight tolerance because it asks a different question: has
+    the target itself moved? When it has not, the clip is unchanged no matter
+    where it actually landed — the escape hatch for a target that is physically
+    unreachable (media clamp, unfixable slip, sub-clip range limit), which would
+    otherwise be retried forever.
+    """
+    desired_start, desired_end = desired
+    if accepted is not None:
+        accepted_start, accepted_end = accepted
+        if (accepted_start is not None and accepted_end is not None
+                and abs(desired_start - accepted_start) <= tolerance
+                and abs(desired_end - accepted_end) <= tolerance):
+            return "unchanged"
+
+    placed_start, placed_end = placed
+    head_delta = desired_start - placed_start
+    tail_delta = desired_end - placed_end
+
+    # head_delta < 0 reaches further back (growth); > 0 pulls the head in.
+    # tail_delta > 0 reaches further on (growth); < 0 pulls the tail in.
+    head_grows = head_delta < 0 and -head_delta > tolerance
+    head_shrinks = head_delta > 0 and head_delta > shrink_tolerance
+    tail_grows = tail_delta > 0 and tail_delta > tolerance
+    tail_shrinks = tail_delta < 0 and -tail_delta > shrink_tolerance
+
+    grows = head_grows or tail_grows
+    shrinks = head_shrinks or tail_shrinks
+
+    if not grows and not shrinks:
+        return "unchanged"
+    if grows and shrinks:
+        return "both"
+    return "extended" if grows else "shortened"
+
+
+def plan_rebuild_placement(record_start: int, old_src: tuple,
+                           new_src: tuple) -> tuple:
+    """(new_record, new_duration, head_need, tail_need) for a rebuilt clip.
+
+    Anchored on the source frame, not the record frame: every source frame the
+    clip keeps stays at the same timeline position. A head trim therefore opens
+    the gap at the head instead of sliding the whole clip left, so anything the
+    user lined up against it on another track stays lined up.
+    """
+    old_start, old_end = old_src
+    new_start, new_end = new_src
+    old_duration = max(1, old_end - old_start + 1)
+    new_duration = max(1, new_end - new_start + 1)
+    new_record = record_start + (new_start - old_start)
+    head_need = max(0, record_start - new_record)
+    tail_need = max(0, (new_record + new_duration) - (record_start + old_duration))
+    return new_record, new_duration, head_need, tail_need
+
+
+def compute_free_space(bounds: list, index: int, timeline_start: int = 0) -> tuple:
+    """(free_before, free_after) around bounds[index] on a single track.
+
+    `bounds` is [(start, end_exclusive), ...] for one track, sorted by start.
+    The last clip on a track has unbounded room after it.
+    """
+    start, end = bounds[index]
+    if index == 0:
+        free_before = max(0, start - timeline_start)
+    else:
+        free_before = max(0, start - bounds[index - 1][1])
+    if index >= len(bounds) - 1:
+        free_after = FREE_SPACE_UNBOUNDED
+    else:
+        free_after = max(0, bounds[index + 1][0] - end)
+    return free_before, free_after
+
+
+def fits_in_place(free_before: int, free_after: int, head_need: int,
+                  tail_need: int, slack: int = 0) -> bool:
+    """Whether a rebuilt clip's growth fits the gaps around it.
+
+    Head and tail are independent: a clip can grow left into a gap while having
+    no room at all on the right. Call once with slack=0 to ask "does it fit",
+    then again with slack=REBUILD_FIT_SLACK to ask "and may it also widen".
+    Widening pushes out both ends at once, so it needs a spare frame on each
+    side even when only one end grew.
+    """
+    return (head_need + slack <= free_before
+            and tail_need + slack <= free_after)
+
+
+def group_desired_by_identity(clip_infos: list, merge_by_source_file: bool) -> dict:
+    """identity -> [ClipInfo] sorted by source start, for the diff."""
+    grouped: dict = {}
+    for clip_info in clip_infos:
+        identity = clip_identity_key(clip_info.media_pool_item, merge_by_source_file)
+        if not identity:
+            continue
+        grouped.setdefault(identity, []).append(clip_info)
+    for entries in grouped.values():
+        entries.sort(key=lambda ci: ci.start_frame)
+    return grouped
+
+
+def scan_timeline_placements(timeline, merge_by_source_file: bool) -> tuple:
+    """(placed_by_identity, unmanaged_items) for an existing All Clips timeline.
+
+    The timeline is the authority on what is currently placed — nothing is read
+    from the manifest here, so any reordering, retracking or deletion the user
+    did between runs is simply what we see.
+
+    Items with no MediaPoolItem (titles, generators, compound and Fusion clips)
+    cannot be identified as a shot and are returned separately so the caller can
+    report them. They are never touched.
+    """
+    placed_by_identity: dict = {}
+    unmanaged = []
+
+    try:
+        track_count = timeline.GetTrackCount("video")
+    except Exception:
+        track_count = 0
+
+    for track_index in range(1, (track_count or 0) + 1):
+        try:
+            items = timeline.GetItemListInTrack("video", track_index)
+        except Exception:
+            items = None
+        if not items:
+            continue
+
+        for item in items:
+            if item is None:
+                continue
+            try:
+                media_pool_item = item.GetMediaPoolItem()
+            except Exception:
+                media_pool_item = None
+            if not media_pool_item:
+                unmanaged.append(item)
+                continue
+
+            identity = clip_identity_key(media_pool_item, merge_by_source_file)
+            if not identity:
+                unmanaged.append(item)
+                continue
+
+            try:
+                raw_start = item.GetSourceStartFrame()
+                raw_end = item.GetSourceEndFrame()
+                record_start = item.GetStart()
+                duration = item.GetDuration()
+            except Exception:
+                unmanaged.append(item)
+                continue
+            if None in (raw_start, raw_end, record_start, duration):
+                unmanaged.append(item)
+                continue
+
+            # A clip the user reversed by hand would otherwise scan backwards.
+            source_start = min(raw_start, raw_end)
+            source_end = max(raw_start, raw_end)
+
+            # GetSourceEndFrame() does not answer with one convention. On a clip
+            # a human cut it is the inclusive last frame, so end - start + 1 ==
+            # duration. On a clip AppendToTimeline placed from an explicit range
+            # it mirrors back the EXCLUSIVE endFrame that was requested, so
+            # end - start + 1 == duration + 1. Duration is the reliable one, so
+            # use it to spot the exclusive form and bring it back to inclusive —
+            # otherwise every clip this tool placed reads one frame longer than
+            # the conform clip it was pulled from.
+            #
+            # Only an exact one-frame overhang is corrected. A retimed clip has a
+            # timeline duration unrelated to its source span and must not be
+            # touched here.
+            if source_end - source_start + 1 - duration == 1:
+                source_end -= 1
+
+            accepted_start, accepted_end = read_accepted_range(normalised_markers(item))
+
+            linked_count = 0
+            linked_getter = getattr(item, "GetLinkedItems", None)
+            if callable(linked_getter):
+                try:
+                    linked = linked_getter() or []
+                    # An item lists itself among its linked items on some builds.
+                    linked_count = max(0, len(linked) - 1)
+                except Exception:
+                    linked_count = 0
+
+            name = ""
+            try:
+                name = item.GetName() or ""
+            except Exception:
+                name = ""
+
+            placed_by_identity.setdefault(identity, []).append(PlacedClip(
+                item=item,
+                identity=identity,
+                source_start=source_start,
+                source_end=source_end,
+                record_start=record_start,
+                record_end=record_start + duration,
+                track_index=track_index,
+                name=name,
+                accepted_start=accepted_start,
+                accepted_end=accepted_end,
+                linked_item_count=linked_count,
+            ))
+
+    for entries in placed_by_identity.values():
+        entries.sort(key=lambda pc: pc.source_start)
+
+    return placed_by_identity, unmanaged
+
+
+def diff_desired_vs_placed(desired_by_identity: dict, placed_by_identity: dict,
+                           tolerance: int = UPDATE_CHANGE_TOLERANCE,
+                           shrink_tolerance: int = UPDATE_SHRINK_TOLERANCE) -> list:
+    """Reconcile desired against placed. Returns [ClipDiff] in identity order."""
+    diffs = []
+    identities = sorted(set(desired_by_identity) | set(placed_by_identity))
+
+    for identity in identities:
+        desired = desired_by_identity.get(identity) or []
+        placed = placed_by_identity.get(identity) or []
+        desired_ranges = [(ci.start_frame, ci.end_frame) for ci in desired]
+        placed_ranges = [(pc.source_start, pc.source_end) for pc in placed]
+
+        pairs, only_desired, only_placed = diff_ranges(desired_ranges, placed_ranges)
+
+        for desired_index, placed_index in pairs:
+            clip_info = desired[desired_index]
+            placed_clip = placed[placed_index]
+            kind = classify_change(
+                desired_ranges[desired_index], placed_ranges[placed_index],
+                (placed_clip.accepted_start, placed_clip.accepted_end),
+                tolerance, shrink_tolerance,
+            )
+            diffs.append(ClipDiff(
+                identity=identity,
+                kind=kind,
+                clip_info=clip_info,
+                placed=placed_clip,
+                head_delta=clip_info.start_frame - placed_clip.source_start,
+                tail_delta=clip_info.end_frame - placed_clip.source_end,
+            ))
+
+        for desired_index in only_desired:
+            diffs.append(ClipDiff(identity=identity, kind="new",
+                                  clip_info=desired[desired_index]))
+
+        for placed_index in only_placed:
+            diffs.append(ClipDiff(identity=identity, kind="dropped",
+                                  placed=placed[placed_index]))
+
+    return diffs
+
+
+def summarise_diffs(diffs: list) -> dict:
+    """Counts per change kind, for logging and the manifest run record."""
+    counts = {"unchanged": 0, "extended": 0, "shortened": 0, "both": 0,
+              "new": 0, "dropped": 0}
+    for diff in diffs:
+        counts[diff.kind] = counts.get(diff.kind, 0) + 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Main Workflow
+# ---------------------------------------------------------------------------
+
+def run_workflow(
+    dst_timeline_name: str,
+    selection_method: str,
+    sorting_method: str,
+    connection_threshold: int,
+    allow_disabled_clips: bool,
+    video_only: bool,
+    mark_duplicates: bool,
+    mark_retimed_clips: bool,
+    use_xml_retime: bool,
+    import_clip_names: bool,
+    preserve_track_layout: bool,
+    merge_by_source_file: bool = True,
+    progress: Optional["ProgressUI"] = None,
+) -> None:
+    """Execute the complete timeline generation workflow."""
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress is not None:
+            progress.set(stage, current, total)
+
+    # Get project context — resolve is a pre-injected global in Resolve's scripting environment
+    project_manager = resolve.GetProjectManager()  # noqa: F821
+    project = project_manager.GetCurrentProject()
+    media_pool = project.GetMediaPool()
+    num_timelines = project.GetTimelineCount()
+
+    # Build timeline name lookup. Kept eager because it has a second consumer —
+    # destination-timeline name deduplication further down — which runs on every
+    # invocation. As a way of resolving a source timeline it is superseded by
+    # get_timeline_for_media_pool_item() and only used as the pre-21.0.4
+    # fallback. (The Lua variant builds this lazily; it has no second consumer.)
+    project_timelines = {}
+    for timeline_idx in range(1, num_timelines + 1):
+        tl = project.GetTimelineByIndex(timeline_idx)
+        if tl is not None:
+            project_timelines[tl.GetName()] = tl
+
+    source_timelines = resolve_source_timelines(
+        media_pool, selection_method, project_timelines, progress_cb=_p,
+    )
+    if not source_timelines:
+        return
+
+    all_clip_infos, timeline_markers, dup_set_count = collect_desired_clips(
+        source_timelines,
+        connection_threshold=connection_threshold,
+        allow_disabled_clips=allow_disabled_clips,
+        mark_duplicates=mark_duplicates,
+        mark_retimed_clips=mark_retimed_clips,
+        use_xml_retime=use_xml_retime,
+        import_clip_names=import_clip_names,
+        preserve_track_layout=preserve_track_layout,
+        merge_by_source_file=merge_by_source_file,
+        sorting_method=sorting_method,
+        progress_cb=_p,
+    )
+    if not all_clip_infos:
+        return
+
     # Create new timeline — dedupe name against existing project timelines.
     # If "All_Sources" exists, try "All_Sources_01", "All_Sources_02", …
     if dst_timeline_name in project_timelines:
@@ -1182,6 +2314,23 @@ def run_workflow(
     except (TypeError, ValueError):
         _timeline_fps = None
     print(f"Timeline FPS: {_timeline_fps_str or '<unknown>'}")
+
+    # AppendToTimeline's recordFrame is ABSOLUTE - the same space as
+    # TimelineItem.GetStart() - while the preserve-layout cursor and its block
+    # markers are both zero-based offsets. A new timeline normally starts at
+    # 01:00:00:00, so passing the raw cursor puts every clip an hour before the
+    # timeline's own start: verified on 21.0.4.5, recordFrame=0 on a timeline
+    # starting at 90000 places the clip at absolute frame 0, GetEndFrame() does
+    # not even count it, and the block marker meant to label it lands 90000
+    # frames away. Rebase the cursor onto the timeline start so clips and
+    # markers agree.
+    _timeline_start = 0
+    _start_getter = getattr(new_timeline, "GetStartFrame", None)
+    if callable(_start_getter):
+        try:
+            _timeline_start = int(_start_getter() or 0)
+        except Exception:
+            _timeline_start = 0
 
     # Pre-create video tracks to cover the highest source_track_index
     if preserve_track_layout and all_clip_infos:
@@ -1222,142 +2371,24 @@ def run_workflow(
             print(f"  Original clip status: {', '.join(status_parts)}")
             print("  (Adding normalized forward-playing version)")
 
-        # Quiet FPS-mismatch check (loud warning only when triggered).
-        # Used by the widening fallback to bound the request to media End.
-        mpi = clip_info.media_pool_item
-        try:
-            _clip_fps_raw = mpi.GetClipProperty("FPS")
-            _clip_fps_val = float(_clip_fps_raw) if _clip_fps_raw not in (None, "") else None
-        except (TypeError, ValueError, Exception):
-            _clip_fps_val = None
-        if (_timeline_fps is not None and _clip_fps_val is not None
-                and abs(_timeline_fps - _clip_fps_val) > 0.01):
-            print(
-                f"  WARN: FPS mismatch on '{clip_name}' "
-                f"(clip={_clip_fps_val}, timeline={_timeline_fps})"
-            )
-
-        api_dict = sanitize_for_api(clip_info)
-        # Audio filtering: mediaType=1 is the documented way to import video
-        # only and works across all Resolve versions. importVideo/importAudio
-        # are kept as a belt-and-suspenders hint for newer API builds.
-        if video_only:
-            api_dict["mediaType"] = 1  # 1 = video, 2 = audio
-        api_dict["importVideo"] = True
-        api_dict["importAudio"] = not video_only
-        if preserve_track_layout:
-            api_dict["recordFrame"] = clip_info.timeline_inpoint
-            api_dict["trackIndex"] = clip_info.source_track_index
-        try:
-            placed_items = media_pool.AppendToTimeline([api_dict])
-            append_success_count += 1
-            if preserve_track_layout:
-                print(f"  Placed on track {clip_info.source_track_index} "
-                      f"at frame {clip_info.timeline_inpoint}")
-            # Detect and compensate for source-frame slip introduced by
-            # AppendToTimeline. Resolve sometimes places clips with their
-            # source in/out shifted by ±1 frame (codec/internal anchor
-            # quirks). We re-query the placed clip; if it differs from
-            # the target, delete it and retry with startFrame/endFrame
-            # adjusted by the inverse of the observed slip. Capped at
-            # SLIP_RETRY_LIMIT retries; if still off, fall back to
-            # widening the request by ±1 so the target range is fully
-            # contained in the placed range (extra handle frames are
-            # acceptable; missing frames are not).
-            target_start = api_dict["startFrame"]
-            target_end = api_dict["endFrame"]
-            retry_count = 0
-            while placed_items and retry_count <= SLIP_RETRY_LIMIT:
-                if len(placed_items) != 1:
-                    break  # unexpected multi-item return; don't try to fix
-                placed = placed_items[0]
-                try:
-                    actual_start = placed.GetSourceStartFrame()
-                    actual_end = placed.GetSourceEndFrame()
-                except Exception:
-                    actual_start = None
-                    actual_end = None
-                if actual_start is None or actual_end is None:
-                    break
-                start_delta = actual_start - target_start
-                end_delta = actual_end - target_end
-                if start_delta == 0 and end_delta == 0:
-                    if retry_count > 0:
-                        slip_corrected_count += 1
-                    break
-                if retry_count >= SLIP_RETRY_LIMIT:
-                    # Widening fallback — extra frames are acceptable.
-                    try:
-                        new_timeline.DeleteClips([placed], False)
-                    except Exception:
-                        print(
-                            f"  ERROR: '{clip_name}' slip unfixable and "
-                            f"DeleteClips failed before widening; clip left "
-                            f"at {actual_start}-{actual_end} "
-                            f"(target {target_start}-{target_end})"
-                        )
-                        slip_unfixed_count += 1
-                        break
-                    wide_start = max(0, target_start - 1)
-                    wide_end = target_end + 1
-                    try:
-                        _media_end_raw = mpi.GetClipProperty("End")
-                        _media_end = int(_media_end_raw) if _media_end_raw not in (None, "") else None
-                    except (TypeError, ValueError, Exception):
-                        _media_end = None
-                    if _media_end is not None:
-                        wide_end = min(wide_end, _media_end)
-                    api_dict["startFrame"] = wide_start
-                    api_dict["endFrame"] = wide_end
-                    wide_items = media_pool.AppendToTimeline([api_dict])
-                    covers = False
-                    w_start = w_end = None
-                    if wide_items and len(wide_items) == 1:
-                        try:
-                            w_start = wide_items[0].GetSourceStartFrame()
-                            w_end = wide_items[0].GetSourceEndFrame()
-                        except Exception:
-                            pass
-                        if w_start is not None and w_end is not None:
-                            covers = (w_start <= target_start
-                                      and w_end >= target_end)
-                    if covers:
-                        print(
-                            f"  WARN: '{clip_name}' slip unfixable "
-                            f"(target {target_start}-{target_end}); "
-                            f"widened to {w_start}-{w_end} — "
-                            f"target frames preserved with handles"
-                        )
-                        slip_widened_count += 1
-                    else:
-                        print(
-                            f"  ERROR: '{clip_name}' slip unfixable; "
-                            f"widened to {w_start}-{w_end} but target "
-                            f"{target_start}-{target_end} NOT covered "
-                            f"(frames missing)"
-                        )
-                        slip_unfixed_count += 1
-                    break
-                # Silent retry with inverse-of-observed-slip compensation.
-                try:
-                    new_timeline.DeleteClips([placed], False)
-                except Exception:
-                    print(
-                        f"  ERROR: '{clip_name}' DeleteClips failed during "
-                        f"retry; leaving slipped clip at "
-                        f"{actual_start}-{actual_end} "
-                        f"(target {target_start}-{target_end})"
-                    )
-                    slip_unfixed_count += 1
-                    break
-                api_dict["startFrame"] = target_start - start_delta
-                api_dict["endFrame"] = target_end - end_delta
-                placed_items = media_pool.AppendToTimeline([api_dict])
-                retry_count += 1
-        except Exception:
-            print(f"  ERROR: Failed to add clip: {clip_info.media_pool_item.GetName()}")
-            print(f"  Frame range attempted: {api_dict['startFrame']} to {api_dict['endFrame']}")
+        _item, _status, _s, _e = append_clip_with_slip_compensation(
+            media_pool, new_timeline, clip_info,
+            video_only=video_only,
+            track_index=clip_info.source_track_index if preserve_track_layout else None,
+            record_frame=(_timeline_start + clip_info.timeline_inpoint
+                          if preserve_track_layout else None),
+            timeline_fps=_timeline_fps,
+        )
+        if _status == "error":
             append_error_count += 1
+        else:
+            append_success_count += 1
+        if _status == "corrected":
+            slip_corrected_count += 1
+        elif _status == "widened":
+            slip_widened_count += 1
+        elif _status == "unfixed":
+            slip_unfixed_count += 1
 
     print(f"Clip addition summary: {append_success_count} succeeded, "
           f"{append_error_count} failed")
@@ -1403,10 +2434,7 @@ def run_workflow(
                         and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
                         and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
 
-                    set_idx = clip_info.duplicate_set_index
-                    color = DUPLICATE_MARKER_COLORS[set_idx % len(DUPLICATE_MARKER_COLORS)]
-                    marker_text = (f"Dup Set #{set_idx + 1} "
-                                   f"({clip_info.duplicate_position + 1}/{clip_info.duplicate_set_size})")
+                    color, marker_text, marker_note = build_duplicate_marker_text(clip_info)
                     source_start = timeline_clip.clip.GetSourceStartFrame()
                     clip_duration = timeline_clip.clip.GetDuration()
                     marker_position = source_start + math.floor(clip_duration * 0.25)
@@ -1414,7 +2442,7 @@ def run_workflow(
                     try:
                         success = timeline_clip.clip.AddMarker(
                             marker_position, color, marker_text,
-                            "Duplicate clip detected", 1, "",
+                            marker_note, 1, "",
                         )
                     except Exception:
                         success = False
@@ -1455,23 +2483,7 @@ def run_workflow(
                         marker_position = source_start + math.floor(clip_duration * 0.5)
 
                         # Distinguish marker types
-                        if clip_info.is_frame_hold:
-                            marker_text = "Frame Hold"
-                            marker_note = ("Source clip used a frame hold (freeze frame). "
-                                           "Manual check recommended.")
-                        elif clip_info.is_non_linear_retime:
-                            marker_text = "Non-Linear Retime"
-                            marker_note = ("Speed curve/ramp detected. Source range may not "
-                                           "cover all frames used. Manual check recommended.")
-                            if clip_info.is_reversed:
-                                marker_note += " (originally reversed)"
-                        else:
-                            speed_value = clip_info.retime_percentage
-                            speed_str = f"{speed_value:.1f}" if speed_value is not None else "Unknown"
-                            marker_text = "Retimed Clip"
-                            marker_note = f"Manual check recommended. Speed: {speed_str}%"
-                            if clip_info.is_reversed:
-                                marker_note += " (originally reversed)"
+                        marker_text, marker_note = build_retime_marker_text(clip_info)
 
                         try:
                             success = timeline_clip.clip.AddMarker(
@@ -1595,6 +2607,1150 @@ def run_workflow(
 
 
 # ---------------------------------------------------------------------------
+# Update Execution Helpers
+# ---------------------------------------------------------------------------
+
+def local_now_str() -> str:
+    """Local wall clock as 2026-08-06 14:22, for human-readable changelogs."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def format_change_line(now_str: str, run_no: int, head_delta: int,
+                       tail_delta: int, old_range: tuple,
+                       new_range: tuple) -> str:
+    """One changelog line. head_delta/tail_delta are desired minus placed.
+
+    Reported from the clip's point of view: "head +12f" means twelve more frames
+    at the head, which is a head_delta of -12.
+    """
+    parts = []
+    head_grow = -head_delta
+    if head_grow:
+        parts.append(f"head {head_grow:+d}f")
+    if tail_delta:
+        parts.append(f"tail {tail_delta:+d}f")
+    change = ", ".join(parts) if parts else "no range change"
+    return CHANGELOG_SEPARATOR.join([
+        now_str,
+        f"run {run_no}",
+        change,
+        f"{old_range[0]}-{old_range[1]} -> {new_range[0]}-{new_range[1]}",
+    ])
+
+
+def merge_changelog(previous_note, new_line: str,
+                    max_lines: int = CHANGELOG_MAX_LINES) -> str:
+    """Prepend a change line to a marker note, keeping a bounded history.
+
+    The previous note has to be read off the old marker before the clip is
+    deleted — a rebuilt clip has no markers of its own until they are restored.
+    Any earlier truncation count is folded in rather than lost.
+    """
+    earlier = 0
+    kept = []
+    for line in (previous_note or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(CHANGELOG_TRUNCATION_MARK):
+            digits = "".join(ch for ch in stripped if ch.isdigit())
+            if digits:
+                earlier += int(digits)
+            continue
+        kept.append(stripped)
+
+    room = max(0, max_lines - 1)
+    lines = [new_line] + kept[:room]
+    dropped = max(0, len(kept) - room) + earlier
+    if dropped > 0:
+        lines.append(f"{CHANGELOG_TRUNCATION_MARK}{dropped} earlier "
+                     f"change{'s' if dropped != 1 else ''})")
+    return "\n".join(lines)
+
+
+def pick_marker_frame(source_start: int, duration: int, existing_frames,
+                      fraction: float) -> int:
+    """Frame for a clip marker at `fraction` through it, stepping off collisions.
+
+    Resolve permits one marker per frame, and this file already puts markers at
+    0.25 (duplicates) and 0.5 (retimes), so on a short clip the preferred frame
+    is often taken. Returns -1 when every frame of the clip has a marker.
+    """
+    duration = max(1, duration)
+    upper = source_start + duration - 1
+    preferred = source_start + int(math.floor(duration * fraction))
+    preferred = min(max(preferred, source_start), upper)
+    return first_free_frame(existing_frames, preferred,
+                            lower=source_start, upper=upper)
+
+
+def format_update_track_name(run_no: int, date_str: str) -> str:
+    """Track name for the clips a run adds, e.g. 'Update 3 - 2026-08-06'."""
+    return f"Update {run_no} - {date_str}"[:60]
+
+
+def build_update_customdata(run_no: int, kind: str, desired_start,
+                            desired_end) -> str:
+    """customData for a per-clip update marker.
+
+    ds/de are the desired range the clip was reconciled against — the accepted
+    range classify_change() reads back to stop an unreachable target being
+    retried on every run.
+    """
+    payload = {"v": 1, "run": run_no, "kind": kind}
+    if desired_start is not None and desired_end is not None:
+        payload["ds"] = int(desired_start)
+        payload["de"] = int(desired_end)
+    return UPDATE_MARKER_PREFIX + json.dumps(payload, sort_keys=True,
+                                             separators=(",", ":"))
+
+
+def timeline_marker_offset(timeline, absolute_frame: int) -> int:
+    """Timeline marker frames are offsets from GetStartFrame(), not absolutes.
+
+    Verified on 21.0.4.5: AddMarker(0, ...) on a timeline starting at frame
+    90000 comes back from GetMarkers() keyed 0.
+
+    Note that AppendToTimeline's recordFrame is the opposite — it is absolute,
+    in the same space as TimelineItem.GetStart() (asked for 90100, landed on
+    90100). Marker frames and record frames are therefore NOT interchangeable
+    on a timeline that does not start at zero, which is why every marker frame
+    in the update path goes through this function.
+    """
+    start = 0
+    getter = getattr(timeline, "GetStartFrame", None)
+    if callable(getter):
+        try:
+            start = getter() or 0
+        except Exception:
+            start = 0
+    return max(0, int(absolute_frame) - int(start))
+
+
+def capture_item_state(item, track_index: int) -> ItemState:
+    """Read back everything about a TimelineItem worth restoring after a rebuild."""
+    state = ItemState(track_index=track_index)
+
+    def _try(getter_name, default=None):
+        getter = getattr(item, getter_name, None)
+        if not callable(getter):
+            return default
+        try:
+            value = getter()
+        except Exception:
+            return default
+        return default if value is None else value
+
+    state.name = _try("GetName")
+    state.clip_color = _try("GetClipColor")
+    state.flags = list(_try("GetFlagList", []) or [])
+    state.enabled = _try("GetClipEnabled")
+    state.markers = normalised_markers(item)
+    state.fusion_comp_count = int(_try("GetFusionCompCount", 0) or 0)
+    state.record_start = int(_try("GetStart", 0) or 0)
+    state.duration = int(_try("GetDuration", 0) or 0)
+
+    raw_start = _try("GetSourceStartFrame", 0) or 0
+    raw_end = _try("GetSourceEndFrame", 0) or 0
+    state.source_start = min(raw_start, raw_end)
+    state.source_end = max(raw_start, raw_end)
+
+    versions = getattr(item, "GetVersionNameList", None)
+    if callable(versions):
+        try:
+            state.version_names = list(versions(0) or [])
+        except Exception:
+            state.version_names = []
+
+    linked = getattr(item, "GetLinkedItems", None)
+    if callable(linked):
+        try:
+            state.linked_item_count = max(0, len(linked() or []) - 1)
+        except Exception:
+            state.linked_item_count = 0
+
+    return state
+
+
+def restore_item_state(item, state: ItemState, new_source_start: int,
+                       new_source_end: int,
+                       skip_customdata_prefix: Optional[str] = None) -> dict:
+    """Put a rebuilt clip's name, colour, flags and markers back.
+
+    TimelineItem marker frames are in source/media frame space — verified on
+    21.0.4.5: a marker added at GetSourceStartFrame() + 5 on a clip starting at
+    source frame 100 reads back keyed 105. So a restored marker lands on the same
+    picture even when the clip's head has moved, which is the whole reason the
+    frames are reused unchanged.
+
+    Markers whose frame falls outside the new source range are dropped rather
+    than clamped: that picture is no longer in the clip, so a marker there would
+    point at something else.
+    """
+    result = {"name": False, "color": False, "flags": 0, "markers": 0,
+              "markers_dropped": 0, "enabled": False}
+
+    if state.name:
+        setter = getattr(item, "SetName", None)
+        if callable(setter):
+            try:
+                result["name"] = bool(setter(state.name))
+            except Exception:
+                result["name"] = False
+
+    if state.clip_color:
+        setter = getattr(item, "SetClipColor", None)
+        if callable(setter):
+            try:
+                result["color"] = bool(setter(state.clip_color))
+            except Exception:
+                result["color"] = False
+
+    adder = getattr(item, "AddFlag", None)
+    if callable(adder):
+        for flag in state.flags:
+            try:
+                if adder(flag):
+                    result["flags"] += 1
+            except Exception:
+                pass
+
+    if state.enabled is False:
+        setter = getattr(item, "SetClipEnabled", None)
+        if callable(setter):
+            try:
+                result["enabled"] = bool(setter(False))
+            except Exception:
+                result["enabled"] = False
+
+    marker_adder = getattr(item, "AddMarker", None)
+    if callable(marker_adder):
+        for frame in sorted(state.markers):
+            info = state.markers[frame] or {}
+            custom = info.get("customData") or ""
+            if (skip_customdata_prefix and isinstance(custom, str)
+                    and custom.startswith(skip_customdata_prefix)):
+                continue
+            if frame < new_source_start or frame > new_source_end:
+                result["markers_dropped"] += 1
+                continue
+            try:
+                ok = marker_adder(
+                    frame, info.get("color") or "Blue", info.get("name") or "",
+                    info.get("note") or "", int(info.get("duration") or 1),
+                    custom if isinstance(custom, str) else "",
+                )
+            except Exception:
+                ok = False
+            if ok:
+                result["markers"] += 1
+
+    return result
+
+
+def add_update_track(timeline, track_name: str) -> Optional[int]:
+    """Append a video track and name it. Returns its index, or None on failure.
+
+    Deliberately never passes {"index": n}: that INSERTS a track and renumbers
+    every track above it, which would invalidate every track index held by the
+    run in flight.
+    """
+    try:
+        before = timeline.GetTrackCount("video")
+    except Exception:
+        return None
+    try:
+        if not timeline.AddTrack("video"):
+            return None
+    except Exception:
+        return None
+    try:
+        after = timeline.GetTrackCount("video")
+    except Exception:
+        return None
+    if after <= before:
+        return None
+
+    setter = getattr(timeline, "SetTrackName", None)
+    if callable(setter):
+        try:
+            setter("video", after, track_name)
+        except Exception:
+            pass
+    print(f"  Added video track {after} '{track_name}'")
+    return after
+
+
+def build_track_occupancy(timeline) -> dict:
+    """track index -> sorted [[start, end_exclusive], ...] for every video item.
+
+    Includes items the diff cannot identify (titles, generators, compound clips):
+    they still occupy the track, so a rebuilt clip must not be planned on top of
+    them. Maintained in memory for the rest of the run — we are the only writer,
+    and re-querying per clip would be O(n^2) bridge calls.
+    """
+    occupancy: dict = {}
+    try:
+        track_count = timeline.GetTrackCount("video")
+    except Exception:
+        return occupancy
+
+    for track_index in range(1, (track_count or 0) + 1):
+        bounds = []
+        try:
+            items = timeline.GetItemListInTrack("video", track_index)
+        except Exception:
+            items = None
+        for item in items or []:
+            if item is None:
+                continue
+            try:
+                start = item.GetStart()
+                duration = item.GetDuration()
+            except Exception:
+                continue
+            if start is None or duration is None:
+                continue
+            bounds.append([int(start), int(start) + int(duration)])
+        bounds.sort()
+        occupancy[track_index] = bounds
+    return occupancy
+
+
+def occupancy_index(bounds: list, record_start: int) -> int:
+    """Index of the entry starting at `record_start`, or -1."""
+    for index, (start, _end) in enumerate(bounds):
+        if start == record_start:
+            return index
+    return -1
+
+
+def insert_occupancy(bounds: list, start: int, end: int) -> None:
+    """Insert [start, end) keeping the track's bounds sorted."""
+    position = len(bounds)
+    for index, (existing_start, _existing_end) in enumerate(bounds):
+        if existing_start > start:
+            position = index
+            break
+    bounds.insert(position, [int(start), int(end)])
+
+
+def resolve_timelines_by_source_record(project, sources: list) -> tuple:
+    """Resolve manifest source records to timelines. Returns (resolved, missing).
+
+    Matches on GetUniqueId() first — it survives renames — and falls back to the
+    recorded name, which is the only thing a human can act on when a uid stops
+    resolving.
+    """
+    by_uid = {}
+    by_name = {}
+    try:
+        count = project.GetTimelineCount()
+    except Exception:
+        count = 0
+    for index in range(1, (count or 0) + 1):
+        try:
+            timeline = project.GetTimelineByIndex(index)
+        except Exception:
+            timeline = None
+        if timeline is None:
+            continue
+        try:
+            name = timeline.GetName()
+        except Exception:
+            continue
+        uid = None
+        getter = getattr(timeline, "GetUniqueId", None)
+        if callable(getter):
+            try:
+                uid = getter()
+            except Exception:
+                uid = None
+        if uid:
+            by_uid[uid] = (name, timeline)
+        by_name.setdefault(name, (name, timeline))
+
+    resolved = []
+    missing = []
+    for source in sources or []:
+        uid = source.get("uid")
+        name = source.get("name")
+        hit = by_uid.get(uid) if uid else None
+        if hit is None and name:
+            hit = by_name.get(name)
+            if hit is not None and uid:
+                print(f"  NOTE: source '{name}' matched by name — its unique id "
+                      f"changed since the last run.")
+        if hit is None:
+            missing.append(name or uid or "?")
+        else:
+            resolved.append(hit)
+    return resolved, missing
+
+
+def timeline_source_record(name: str, timeline) -> dict:
+    """{"uid": ..., "name": ...} for the manifest's source list."""
+    uid = ""
+    getter = getattr(timeline, "GetUniqueId", None)
+    if callable(getter):
+        try:
+            uid = getter() or ""
+        except Exception:
+            uid = ""
+    return {"uid": uid, "name": name}
+
+
+def clamp_desired_to_media(clip_info: ClipInfo) -> tuple:
+    """(start, end) clamped to the media's own extents.
+
+    Asking for frames past the end of the file produces a placement that can
+    never match the request, which without clamping reads as a change forever.
+    Update-path only — create mode's behaviour is deliberately untouched.
+    """
+    start = max(0, clip_info.start_frame)
+    end = clip_info.end_frame
+    try:
+        raw = clip_info.media_pool_item.GetClipProperty("End")
+        media_end = int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError, Exception):
+        media_end = None
+    if media_end is not None:
+        end = min(end, media_end)
+    if end < start:
+        end = start
+    return start, end
+
+
+def write_update_marker(item, kind: str, run_no: int, note: str,
+                        marker_name: str, desired_range=None) -> bool:
+    """Add this run's marker to a clip, stepping off any frame already taken."""
+    adder = getattr(item, "AddMarker", None)
+    if not callable(adder):
+        return False
+    try:
+        source_start = item.GetSourceStartFrame()
+        duration = item.GetDuration()
+    except Exception:
+        return False
+    if source_start is None or duration is None:
+        return False
+
+    existing = normalised_markers(item)
+    frame = pick_marker_frame(int(source_start), int(duration), existing,
+                              UPDATE_MARKER_FRACTION)
+    if frame < 0:
+        print(f"  WARNING: no free frame for an update marker on "
+              f"'{marker_name}'.")
+        return False
+
+    custom = build_update_customdata(
+        run_no, kind,
+        desired_range[0] if desired_range else None,
+        desired_range[1] if desired_range else None,
+    )
+    try:
+        return bool(adder(frame, UPDATE_MARKER_COLORS.get(kind, "Blue"),
+                          marker_name, note, 1, custom))
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Update Workflow
+# ---------------------------------------------------------------------------
+
+def previous_update_note(markers: dict) -> str:
+    """The note off a clip's own update marker, so the changelog can accumulate."""
+    for frame in sorted(markers, reverse=True):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if isinstance(custom, str) and custom.startswith(UPDATE_MARKER_PREFIX):
+            return info.get("note") or ""
+    return ""
+
+
+def previous_update_kind(markers: dict) -> Optional[str]:
+    """The kind recorded by a clip's own update marker, or None.
+
+    Used to avoid stacking a fresh "no longer used" marker onto a clip on every
+    subsequent run — it stays unused, and one marker saying so is enough.
+    """
+    for frame in sorted(markers, reverse=True):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if not isinstance(custom, str) or not custom.startswith(UPDATE_MARKER_PREFIX):
+            continue
+        try:
+            data = json.loads(custom[len(UPDATE_MARKER_PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("kind"), str):
+            return data["kind"]
+    return None
+
+
+def run_update_workflow(
+    source_selection_mode: str,
+    selection_method: str,
+    connection_threshold: int,
+    allow_disabled_clips: bool,
+    video_only: bool,
+    mark_duplicates: bool,
+    mark_retimed_clips: bool,
+    use_xml_retime: bool,
+    import_clip_names: bool,
+    merge_by_source_file: bool,
+    protect_graded_clips: bool,
+    dry_run: bool,
+    progress: Optional["ProgressUI"] = None,
+) -> None:
+    """Reconcile the current All Clips timeline against its source timelines.
+
+    Minimal disturbance: only clips whose source range actually moved are
+    rebuilt, because Resolve has no trim or move and a rebuild costs that clip
+    its grade and Fusion comps. Everything else is left exactly as it is.
+    """
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress is not None:
+            progress.set(stage, current, total)
+
+    project_manager = resolve.GetProjectManager()  # noqa: F821
+    project = project_manager.GetCurrentProject()
+    if project is None:
+        print("No project is open.")
+        return
+    media_pool = project.GetMediaPool()
+
+    target = project.GetCurrentTimeline()
+    if target is None:
+        print("No current timeline. Open the All Clips timeline you want to update.")
+        return
+
+    target_name = target.GetName()
+    target_uid = ""
+    uid_getter = getattr(target, "GetUniqueId", None)
+    if callable(uid_getter):
+        try:
+            target_uid = uid_getter() or ""
+        except Exception:
+            target_uid = ""
+    print(f"Update target: '{target_name}' (uid {target_uid or '<unavailable>'})")
+
+    current_settings = {
+        "connection_threshold": connection_threshold,
+        "merge_by_source_file": merge_by_source_file,
+        "video_only": video_only,
+        "allow_disabled_clips": allow_disabled_clips,
+        "use_xml_retime": use_xml_retime,
+        "import_clip_names": import_clip_names,
+        "mark_duplicates": mark_duplicates,
+        "mark_retimed_clips": mark_retimed_clips,
+    }
+
+    manifest, store = read_manifest(target)
+    adopted = manifest is None
+    forked = False
+
+    if manifest is None:
+        print("This timeline carries no All Clips manifest.")
+        if source_selection_mode == "Recorded":
+            print("  Nothing records where its clips came from, so there is nothing "
+                  "to re-read. Choose 'Current selection' as the source to adopt "
+                  "this timeline, or use Create New Timeline instead.")
+            return
+        print("  ADOPTING unmanaged timeline — sources come from the current selection.")
+    else:
+        print(f"Manifest found via {store}: run {manifest.get('run_counter', 0)}, "
+              f"last {manifest.get('last_run_utc', '?')}, "
+              f"{len(manifest.get('sources') or [])} recorded source timeline(s)")
+        recorded = manifest.get("settings") or {}
+        for key in ("connection_threshold", "merge_by_source_file",
+                    "use_xml_retime", "allow_disabled_clips"):
+            if key in recorded and recorded[key] != current_settings[key]:
+                print(f"  WARNING: {key} changed since the last run "
+                      f"({recorded[key]!r} -> {current_settings[key]!r}). Merged "
+                      f"ranges will differ and many clips may read as changed.")
+        if recorded.get("preserve_track_layout"):
+            print("  NOTE: this timeline was built with Preserve Source Track "
+                  "Layout. Update mode reconciles by clip identity only — block "
+                  "boundaries are not re-derived.")
+        if target_uid and manifest.get("timeline_uid") \
+                and manifest["timeline_uid"] != target_uid:
+            print("  NOTE: this is a copy of the timeline the manifest was written "
+                  "for. Taking it over; the history is kept.")
+            forked = True
+
+    # Build the pre-21.0.4 name fallback map once, for resolve_source_timelines.
+    project_timelines = {}
+    try:
+        timeline_count = project.GetTimelineCount()
+    except Exception:
+        timeline_count = 0
+    for index in range(1, (timeline_count or 0) + 1):
+        try:
+            tl = project.GetTimelineByIndex(index)
+        except Exception:
+            tl = None
+        if tl is not None:
+            project_timelines[tl.GetName()] = tl
+
+    # ---- source timelines -------------------------------------------------
+    sources = []
+    if manifest is not None and source_selection_mode in ("Recorded", "Union"):
+        recorded_sources, missing = resolve_timelines_by_source_record(
+            project, manifest.get("sources") or [])
+        sources.extend(recorded_sources)
+        if missing:
+            print(f"  WARNING: {len(missing)} recorded source timeline(s) no longer "
+                  f"resolve: {', '.join(missing)}")
+            print("  Every shot that came only from them will be reported as no "
+                  "longer used. Cancel now if that is not what you meant.")
+
+    if manifest is None or source_selection_mode in ("Selection", "Union"):
+        sources.extend(resolve_source_timelines(
+            media_pool, selection_method, project_timelines, progress_cb=_p))
+
+    unique_sources = []
+    seen_keys = set()
+    for name, timeline in sources:
+        record = timeline_source_record(name, timeline)
+        if target_uid and record["uid"] == target_uid:
+            print(f"  Skipping '{name}': that is the timeline being updated.")
+            continue
+        key = record["uid"] or f"name:{name}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_sources.append((name, timeline))
+
+    if not unique_sources:
+        print("No source timelines to read. Nothing to do.")
+        return
+    print(f"Reading {len(unique_sources)} source timeline(s): "
+          f"{', '.join(name for name, _tl in unique_sources)}")
+
+    # ---- desired state ----------------------------------------------------
+    all_clip_infos, _blocks, _dup_count = collect_desired_clips(
+        unique_sources,
+        connection_threshold=connection_threshold,
+        allow_disabled_clips=allow_disabled_clips,
+        mark_duplicates=mark_duplicates,
+        mark_retimed_clips=mark_retimed_clips,
+        use_xml_retime=use_xml_retime,
+        import_clip_names=import_clip_names,
+        preserve_track_layout=False,
+        merge_by_source_file=merge_by_source_file,
+        sorting_method="Source Name",
+        progress_cb=_p,
+    )
+    if not all_clip_infos:
+        return
+
+    for clip_info in all_clip_infos:
+        clip_info.start_frame, clip_info.end_frame = clamp_desired_to_media(clip_info)
+
+    # ---- current state ----------------------------------------------------
+    _p("Scanning the timeline...", 0, 0)
+    placed_by_identity, unmanaged = scan_timeline_placements(
+        target, merge_by_source_file)
+    placed_total = sum(len(v) for v in placed_by_identity.values())
+    print(f"Scanned {placed_total} placed clip(s) on '{target_name}'")
+    if unmanaged:
+        print(f"NOTE: {len(unmanaged)} timeline item(s) have no source clip "
+              f"(titles, generators, compound or Fusion clips). Left untouched.")
+
+    desired_by_identity = group_desired_by_identity(
+        all_clip_infos, merge_by_source_file)
+    diffs = diff_desired_vs_placed(desired_by_identity, placed_by_identity)
+    counts = summarise_diffs(diffs)
+
+    run_no = (manifest.get("run_counter", 0) if manifest else 0) + 1
+    now_local = local_now_str()
+    now_utc = utc_now_iso()
+
+    # Shrinking frees space a later grow can use, so range changes are applied
+    # by net duration change ascending: every shortening before any lengthening.
+    def _net_change(diff):
+        old = diff.placed.source_end - diff.placed.source_start
+        new = diff.clip_info.end_frame - diff.clip_info.start_frame
+        return new - old
+
+    changed = sorted(
+        [d for d in diffs if d.kind in ("extended", "shortened", "both")],
+        key=_net_change)
+    added = [d for d in diffs if d.kind == "new"]
+
+    # A shot that dropped out stays dropped. Once it carries a marker saying so,
+    # it is not actionable again — otherwise every later run would report it and
+    # stack another marker on it.
+    removed = []
+    already_flagged = 0
+    for diff in diffs:
+        if diff.kind != "dropped":
+            continue
+        if previous_update_kind(normalised_markers(diff.placed.item)) in (
+                "dropped", "superseded"):
+            already_flagged += 1
+        else:
+            removed.append(diff)
+
+    print("")
+    print(f"=== Update plan for '{target_name}' (run {run_no}) ===")
+    print(f"  acting on growth over {UPDATE_CHANGE_TOLERANCE}f and shrink over "
+          f"{UPDATE_SHRINK_TOLERANCE}f")
+    print(f"  unchanged      {counts.get('unchanged', 0)}")
+    print(f"  extended       {counts.get('extended', 0)}")
+    print(f"  shortened      {counts.get('shortened', 0)}")
+    print(f"  both ends      {counts.get('both', 0)}")
+    print(f"  new            {len(added)}")
+    print(f"  no longer used {len(removed)}")
+    if already_flagged:
+        print(f"  ({already_flagged} already flagged as unused by an earlier run)")
+    for diff in diffs:
+        if diff.kind == "unchanged":
+            continue
+        if diff.kind == "new":
+            print(f"  + new       {diff.clip_info.media_pool_item.GetName()} "
+                  f"{diff.clip_info.start_frame}-{diff.clip_info.end_frame}")
+        elif diff.kind == "dropped":
+            print(f"  - unused    {diff.placed.name or diff.identity} "
+                  f"{diff.placed.source_start}-{diff.placed.source_end}")
+        else:
+            print(f"  ~ {diff.kind:<9} {diff.placed.name or diff.identity} "
+                  f"{diff.placed.source_start}-{diff.placed.source_end} -> "
+                  f"{diff.clip_info.start_frame}-{diff.clip_info.end_frame} "
+                  f"(head {-diff.head_delta:+d}f, tail {diff.tail_delta:+d}f)")
+    print("")
+
+    source_records = [timeline_source_record(n, t) for n, t in unique_sources]
+
+    def _save_manifest(run_record) -> None:
+        """Write the manifest back. run_record=None records no run.
+
+        A run that changed nothing still refreshes the sources, settings and
+        timestamp — that is what makes adopting an already-matching timeline
+        useful — but it does not bump the run counter or add to the history,
+        which would fill the log with no-ops.
+        """
+        nonlocal manifest
+        if manifest is None:
+            manifest = build_manifest(target_uid, target_name, source_records,
+                                      current_settings, now_utc, TOOL_VERSION)
+            manifest["adopted"] = True
+        else:
+            manifest = dict(manifest)
+            manifest["timeline_uid"] = target_uid
+            manifest["timeline_name"] = target_name
+            manifest["sources"] = source_records
+            manifest["settings"] = current_settings
+            manifest["tool_version"] = TOOL_VERSION
+        if run_record is None:
+            manifest["last_run_utc"] = now_utc
+        else:
+            manifest = manifest_add_run(manifest, run_record)
+        write_manifest(target, manifest)
+
+    actionable = changed + added + removed
+    if not actionable:
+        print("Nothing to do — the timeline already matches its sources.")
+        if not dry_run:
+            _save_manifest(None)
+        _p("Done!", 1, 1)
+        return
+
+    if dry_run:
+        print("DRY RUN — nothing was changed. Untick 'Dry run' to apply this plan.")
+        _p("Done!", 1, 1)
+        return
+
+    # ---- execute ----------------------------------------------------------
+    if not project.SetCurrentTimeline(target):
+        print("ERROR: could not make the target timeline current. AppendToTimeline "
+              "always targets the current timeline, so this run would edit the "
+              "wrong one. Aborting without changes.")
+        return
+
+    timeline_fps = None
+    for getter, name in ((target, "timelineFrameRate"), (project, "timelineFrameRate")):
+        try:
+            raw = getter.GetSetting(name)
+        except Exception:
+            raw = None
+        if raw:
+            try:
+                timeline_fps = float(raw)
+            except (TypeError, ValueError):
+                timeline_fps = None
+            break
+
+    timeline_start = 0
+    start_getter = getattr(target, "GetStartFrame", None)
+    if callable(start_getter):
+        try:
+            timeline_start = int(start_getter() or 0)
+        except Exception:
+            timeline_start = 0
+
+    occupancy = build_track_occupancy(target)
+
+    # Anchor the run's cursor on where the video content actually ends, not on
+    # GetEndFrame(). They agree on a normally built timeline, but a timeline
+    # whose clips sit before its declared start - which is what preserve-layout
+    # produced before the recordFrame rebase - reports an end frame that does not
+    # account for its own content, and new clips would land an hour past it.
+    content_end = None
+    for bounds in occupancy.values():
+        for _start, bound_end in bounds:
+            content_end = bound_end if content_end is None else max(content_end,
+                                                                   bound_end)
+    if content_end is None:
+        content_end = timeline_start
+        end_getter = getattr(target, "GetEndFrame", None)
+        if callable(end_getter):
+            try:
+                content_end = int(end_getter() or timeline_start)
+            except Exception:
+                content_end = timeline_start
+    end_frame = content_end
+
+    track_name = format_update_track_name(run_no, now_local.split(" ")[0])
+    state_box = {
+        "track": None,
+        "cursor": end_frame + INTER_TIMELINE_GAP,
+        "warned_record": False,
+        "first_new_record": None,
+    }
+    tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
+             "dropped": 0, "skipped": 0, "failed": 0}
+
+    def _ensure_update_track():
+        if state_box["track"] is None:
+            index = add_update_track(target, track_name)
+            if index is None:
+                print("ERROR: could not add a video track for this run's clips.")
+                return None
+            state_box["track"] = index
+            occupancy.setdefault(index, [])
+        return state_box["track"]
+
+    def _record_placement(item, track_index, requested_record):
+        """Book a placed item into the occupancy map. Returns its duration.
+
+        recordFrame was verified to be absolute, in the same space as GetStart(),
+        on 21.0.4.5. The check below stays as a guard: it is undocumented, and a
+        silent frame-space change would otherwise scatter clips across the
+        timeline with nothing in the log to explain it.
+        """
+        try:
+            actual_start = int(item.GetStart())
+            duration = int(item.GetDuration())
+        except Exception:
+            actual_start, duration = requested_record, 1
+        if actual_start != requested_record and not state_box["warned_record"]:
+            print(f"  WARNING: asked for record frame {requested_record} but the "
+                  f"clip landed at {actual_start}. recordFrame and GetStart() "
+                  f"appear to use different frame spaces on this build; "
+                  f"placement may be off by {actual_start - requested_record} "
+                  f"frames for the rest of this run.")
+            state_box["warned_record"] = True
+        insert_occupancy(occupancy.setdefault(track_index, []),
+                         actual_start, actual_start + max(1, duration))
+        return duration
+
+    def _accepted_for(clip_info, achieved_start, achieved_end):
+        """The desired range, but only when the placement could not reach it."""
+        if achieved_start is None or achieved_end is None:
+            return (clip_info.start_frame, clip_info.end_frame)
+        if (abs(achieved_start - clip_info.start_frame) > UPDATE_CHANGE_TOLERANCE
+                or abs(achieved_end - clip_info.end_frame) > UPDATE_CHANGE_TOLERANCE):
+            return (clip_info.start_frame, clip_info.end_frame)
+        return None
+
+    def _annotate_new(item, clip_info):
+        """Duplicate/retime markers and imported names for a clip we just placed."""
+        try:
+            source_start = int(item.GetSourceStartFrame())
+            duration = int(item.GetDuration())
+        except Exception:
+            return
+        if mark_duplicates and clip_info.duplicate_set_index is not None:
+            color, text, note = build_duplicate_marker_text(clip_info)
+            frame = pick_marker_frame(source_start, duration,
+                                      normalised_markers(item), 0.25)
+            if frame >= 0:
+                try:
+                    item.AddMarker(frame, color, text, note, 1, "")
+                except Exception:
+                    pass
+        if mark_retimed_clips and clip_info.is_retimed:
+            text, note = build_retime_marker_text(clip_info)
+            frame = pick_marker_frame(source_start, duration,
+                                      normalised_markers(item), 0.5)
+            if frame >= 0:
+                try:
+                    item.AddMarker(frame, "Red", text, note, 1, "")
+                except Exception:
+                    pass
+        if import_clip_names and clip_info.source_name:
+            try:
+                item.SetName(clip_info.source_name)
+            except Exception:
+                pass
+            for version_name in clip_info.version_names or []:
+                try:
+                    item.AddVersion(version_name, 0)
+                except Exception:
+                    pass
+            if clip_info.current_version_name:
+                try:
+                    item.SetCurrentVersion(clip_info.current_version_name, 0)
+                except Exception:
+                    pass
+
+    def _place_on_update_track(clip_info, kind, marker_name, note):
+        track = _ensure_update_track()
+        if track is None:
+            return None
+        requested = state_box["cursor"]
+        item, status, achieved_start, achieved_end = \
+            append_clip_with_slip_compensation(
+                media_pool, target, clip_info, video_only=video_only,
+                track_index=track, record_frame=requested,
+                timeline_fps=timeline_fps)
+        if item is None:
+            print(f"  ERROR: could not place '{clip_info.media_pool_item.GetName()}' "
+                  f"on the update track (status {status}).")
+            return None
+        duration = _record_placement(item, track, requested)
+        if state_box["first_new_record"] is None:
+            state_box["first_new_record"] = requested
+        state_box["cursor"] = requested + max(1, duration) + INTER_TIMELINE_GAP
+        _annotate_new(item, clip_info)
+        write_update_marker(item, kind, run_no, note, marker_name,
+                            _accepted_for(clip_info, achieved_start, achieved_end))
+        return item
+
+    def _mark_in_place(placed, kind, marker_name, note):
+        write_update_marker(placed.item, kind, run_no, note, marker_name)
+
+    def _rebuild(diff) -> str:
+        placed = diff.placed
+        clip_info = diff.clip_info
+        state = capture_item_state(placed.item, placed.track_index)
+        label = state.name or placed.name or clip_info.media_pool_item.GetName()
+        old_src = (placed.source_start, placed.source_end)
+        new_src = (clip_info.start_frame, clip_info.end_frame)
+        line = format_change_line(now_local, run_no, diff.head_delta,
+                                  diff.tail_delta, old_src, new_src)
+        history = merge_changelog(previous_update_note(state.markers), line)
+
+        if state.linked_item_count > 0:
+            print(f"  SKIP '{label}': it has linked audio. Deleting the video item "
+                  f"would orphan it, and re-appending gives no control over the "
+                  f"audio track. Update it by hand.")
+            _mark_in_place(placed, "manual", f"Needs manual update (run {run_no})",
+                           history)
+            return "skipped"
+
+        loses_work = state.fusion_comp_count > 0 or len(state.version_names) > 1
+        if loses_work and protect_graded_clips:
+            print(f"  SKIP '{label}': rebuilding would lose "
+                  f"{state.fusion_comp_count} Fusion comp(s) and "
+                  f"{len(state.version_names)} colour version(s). Untick "
+                  f"'Protect clips with Fusion comps' to rebuild it anyway.")
+            _mark_in_place(placed, "manual", f"Needs manual update (run {run_no})",
+                           history)
+            return "skipped"
+        if loses_work:
+            print(f"  WARNING: '{label}' loses {state.fusion_comp_count} Fusion "
+                  f"comp(s) and {len(state.version_names)} colour version(s) — "
+                  f"they cannot survive a delete and re-append.")
+
+        new_record, new_duration, head_need, tail_need = plan_rebuild_placement(
+            placed.record_start, old_src, new_src)
+
+        bounds = occupancy.setdefault(placed.track_index, [])
+        index = occupancy_index(bounds, placed.record_start)
+        if index < 0:
+            free_before = free_after = 0
+        else:
+            free_before, free_after = compute_free_space(bounds, index,
+                                                         timeline_start)
+        fits = fits_in_place(free_before, free_after, head_need, tail_need)
+        may_widen = fits_in_place(free_before, free_after, head_need, tail_need,
+                                  REBUILD_FIT_SLACK)
+
+        if not fits:
+            print(f"  '{label}' needs {head_need}f before and {tail_need}f after "
+                  f"but has {free_before}f/{free_after}f — placing the updated "
+                  f"version on the update track instead.")
+            new_item = _place_on_update_track(
+                clip_info, diff.kind, f"Updated (moved, run {run_no})", history)
+            if new_item is None:
+                return "failed"
+            _mark_in_place(placed, "superseded", f"Superseded (run {run_no})",
+                           merge_changelog(
+                               previous_update_note(state.markers),
+                               f"{now_local}{CHANGELOG_SEPARATOR}run {run_no}"
+                               f"{CHANGELOG_SEPARATOR}superseded by the updated "
+                               f"copy on '{track_name}'"))
+            return "superseded"
+
+        original_mpi = None
+        try:
+            original_mpi = placed.item.GetMediaPoolItem()
+        except Exception:
+            original_mpi = None
+
+        if index >= 0:
+            bounds.pop(index)
+        try:
+            deleted = target.DeleteClips([placed.item], False)
+        except Exception:
+            deleted = False
+        if not deleted:
+            print(f"  ERROR: DeleteClips failed for '{label}'; leaving it alone.")
+            if index >= 0:
+                insert_occupancy(bounds, placed.record_start, placed.record_end)
+            return "failed"
+
+        item, status, achieved_start, achieved_end = \
+            append_clip_with_slip_compensation(
+                media_pool, target, clip_info, video_only=video_only,
+                track_index=placed.track_index, record_frame=new_record,
+                timeline_fps=timeline_fps, allow_widening=may_widen)
+
+        if item is None:
+            print(f"  ERROR: re-append failed for '{label}' (status {status}); "
+                  f"restoring the previous version.")
+            rollback = ClipInfo(media_pool_item=original_mpi or clip_info.media_pool_item,
+                                start_frame=old_src[0], end_frame=old_src[1])
+            back, back_status, _bs, _be = append_clip_with_slip_compensation(
+                media_pool, target, rollback, video_only=video_only,
+                track_index=placed.track_index, record_frame=placed.record_start,
+                timeline_fps=timeline_fps)
+            if back is None:
+                print(f"  ERROR: rollback ALSO failed for '{label}'. The clip is "
+                      f"gone from the timeline. Re-add "
+                      f"{old_src[0]}-{old_src[1]} on track "
+                      f"{placed.track_index} at frame {placed.record_start}.")
+            else:
+                _record_placement(back, placed.track_index, placed.record_start)
+                restore_item_state(back, state, old_src[0], old_src[1],
+                                   UPDATE_MARKER_PREFIX)
+            return "failed"
+
+        _record_placement(item, placed.track_index, new_record)
+        restored = restore_item_state(item, state, new_src[0], new_src[1],
+                                      UPDATE_MARKER_PREFIX)
+        if restored["markers_dropped"]:
+            print(f"  {restored['markers_dropped']} marker(s) on '{label}' fell "
+                  f"outside the new range and were not restored.")
+        _annotate_new(item, clip_info)
+        write_update_marker(item, diff.kind, run_no, history,
+                            f"Updated ({diff.kind}, run {run_no})",
+                            _accepted_for(clip_info, achieved_start, achieved_end))
+        return diff.kind
+
+    total_steps = len(changed) + len(added) + len(removed)
+    step = 0
+
+    print(f"Applying {len(changed)} range change(s)...")
+    for diff in changed:
+        step += 1
+        _p(f"Updating: {diff.placed.name or diff.identity}", step, total_steps)
+        outcome = _rebuild(diff)
+        tally[outcome] = tally.get(outcome, 0) + 1
+
+    print(f"Adding {len(added)} new shot(s)...")
+    for diff in added:
+        step += 1
+        name = diff.clip_info.media_pool_item.GetName()
+        _p(f"Adding: {name}", step, total_steps)
+        note = (f"{now_local}{CHANGELOG_SEPARATOR}run {run_no}"
+                f"{CHANGELOG_SEPARATOR}new shot"
+                f"{CHANGELOG_SEPARATOR}"
+                f"{diff.clip_info.start_frame}-{diff.clip_info.end_frame}")
+        item = _place_on_update_track(diff.clip_info, "new",
+                                      f"New (run {run_no})", note)
+        tally["new" if item is not None else "failed"] += 1
+
+    print(f"Marking {len(removed)} shot(s) that are no longer used...")
+    for diff in removed:
+        step += 1
+        _p(f"Marking unused: {diff.placed.name or diff.identity}", step, total_steps)
+        markers = normalised_markers(diff.placed.item)
+        note = merge_changelog(
+            previous_update_note(markers),
+            f"{now_local}{CHANGELOG_SEPARATOR}run {run_no}"
+            f"{CHANGELOG_SEPARATOR}no longer used in any source timeline")
+        if write_update_marker(diff.placed.item, "dropped", run_no, note,
+                               f"No longer used (run {run_no})"):
+            tally["dropped"] += 1
+
+    # ---- record the run ---------------------------------------------------
+    run_record = {
+        "n": run_no,
+        "utc": now_utc,
+        "track": state_box["track"],
+        "track_name": track_name if state_box["track"] else "",
+        "unchanged": counts.get("unchanged", 0),
+        "extended": tally.get("extended", 0),
+        "shortened": tally.get("shortened", 0),
+        "both": tally.get("both", 0),
+        "new": tally.get("new", 0),
+        "superseded": tally.get("superseded", 0),
+        "dropped": tally.get("dropped", 0),
+        "skipped": tally.get("skipped", 0),
+        "failed": tally.get("failed", 0),
+        "sources": [timeline_source_record(n, t)["uid"] for n, t in unique_sources],
+    }
+    if forked:
+        run_record["forked"] = True
+    _save_manifest(run_record)
+
+    # Sit the run marker at the start of what this run added, so the ruler reads
+    # as a changelog. Offset 0 is the manifest badge, hence lower=1.
+    preferred_run_frame = 1
+    if state_box["first_new_record"] is not None:
+        preferred_run_frame = max(
+            1, timeline_marker_offset(target, state_box["first_new_record"]))
+    run_marker_frame = first_free_frame(normalised_markers(target),
+                                        preferred_run_frame, lower=1)
+    if run_marker_frame >= 0:
+        try:
+            target.AddMarker(
+                run_marker_frame, RUN_MARKER_COLOR,
+                f"Update run {run_no} - {now_local}",
+                (f"{tally.get('extended', 0)} extended, "
+                 f"{tally.get('shortened', 0)} shortened, "
+                 f"{tally.get('both', 0)} both ends, "
+                 f"{tally.get('new', 0)} new, "
+                 f"{tally.get('superseded', 0)} superseded, "
+                 f"{tally.get('dropped', 0)} no longer used, "
+                 f"{tally.get('skipped', 0)} skipped, "
+                 f"{tally.get('failed', 0)} failed.\nSources: "
+                 + ", ".join(n for n, _t in unique_sources)),
+                1, RUN_MARKER_PREFIX + json.dumps(
+                    {"v": 1, "run": run_no, "utc": now_utc},
+                    sort_keys=True, separators=(",", ":")),
+            )
+        except Exception:
+            pass
+
+    print("")
+    print(f"=== Update run {run_no} complete ===")
+    for key in ("extended", "shortened", "both", "new", "superseded", "dropped",
+                "skipped", "failed"):
+        print(f"  {key:<11} {tally.get(key, 0)}")
+    if tally.get("failed"):
+        print("  Check the log above for the clips that failed.")
+    _p("Done!", 1, 1)
+    print("Done!")
+
+
+# ---------------------------------------------------------------------------
 # Progress UI
 # ---------------------------------------------------------------------------
 
@@ -1683,7 +3839,32 @@ def build_and_show_ui() -> Optional[dict]:
     # fu and bmd are pre-injected globals in Resolve's scripting environment
     ui = fu.UIManager  # noqa: F821
     disp = bmd.UIDispatcher(ui)  # noqa: F821
-    width, height = 540, 510
+    width, height = 560, 640
+
+    # Look at the current timeline up front so update mode can say what it would
+    # be updating, and offer the settings the timeline was last built with.
+    target_label = "Update mode acts on the current timeline (none open)"
+    recorded_settings: dict = {}
+    try:
+        _project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
+        _target = _project.GetCurrentTimeline() if _project else None
+    except Exception:
+        _target = None
+    if _target is not None:
+        try:
+            _manifest, _store = read_manifest(_target)
+            _name = _target.GetName()
+        except Exception:
+            _manifest, _name = None, "?"
+        if _manifest:
+            recorded_settings = _manifest.get("settings") or {}
+            target_label = (
+                f"Update target: '{_name}' - managed, run "
+                f"{_manifest.get('run_counter', 0)}, "
+                f"{len(_manifest.get('sources') or [])} source timeline(s)")
+        else:
+            target_label = (f"Update target: '{_name}' - not managed yet; pick a "
+                            f"source that includes the current selection to adopt it")
 
     win = disp.AddWindow({
         "ID": "MyWin",
@@ -1692,6 +3873,28 @@ def build_and_show_ui() -> Optional[dict]:
         "Spacing": 10,
     }, [
         ui.VGroup({"ID": "root"}, [
+            ui.HGroup({}, [
+                ui.Label({"ID": "modeLabel", "Text": "Mode:"}),
+                ui.ComboBox({"ID": "mode"}),
+            ]),
+            ui.Label({"ID": "targetLabel", "Text": target_label}),
+            ui.HGroup({}, [
+                ui.Label({"ID": "sourceTimelinesLabel",
+                          "Text": "Update Sources:"}),
+                ui.ComboBox({
+                    "ID": "sourceTimelines",
+                    "ToolTip": (
+                        "Which source timelines an update re-reads.\n\n"
+                        "Recorded in timeline: the ones stored on the All Clips "
+                        "timeline when it was last built or updated.\n\n"
+                        "Current selection: the timelines selected in the Media "
+                        "Pool. Use this to adopt a timeline that has no record "
+                        "of its sources.\n\n"
+                        "Recorded + current selection: both, which is how you "
+                        "add a new reel to an existing All Clips timeline."
+                    ),
+                }),
+            ]),
             ui.HGroup({"ID": "dst"}, [
                 ui.Label({"ID": "DstLabel", "Text": "New Timeline Name"}),
                 ui.TextEdit({
@@ -1771,6 +3974,33 @@ def build_and_show_ui() -> Optional[dict]:
                     "rely on sub-clips being treated as their own sources)."
                 ),
             }),
+            ui.CheckBox({
+                "ID": "protectGradedClips",
+                "Text": "Update only: skip clips with Fusion comps or extra colour versions",
+                "Checked": True,
+                "ToolTip": (
+                    "Resolve has no trim or move, so changing a clip's range "
+                    "means deleting and re-appending it. Its name, colour, "
+                    "flags and markers are put back, but its grade and any "
+                    "Fusion comps cannot be — there is no API to read a grade "
+                    "back out.\n\n"
+                    "When ON (default): a clip carrying a Fusion comp or more "
+                    "than one colour version is left alone and marked for "
+                    "manual attention instead.\n\n"
+                    "When OFF: it is rebuilt anyway and that work is lost."
+                ),
+            }),
+            ui.CheckBox({
+                "ID": "dryRun",
+                "Text": "Update only: dry run (report the plan, change nothing)",
+                "Checked": False,
+                "ToolTip": (
+                    "Prints exactly what would be extended, shortened, added "
+                    "and marked unused, and writes nothing at all.\n\n"
+                    "Resolve's undo stack is not scriptable, so an update "
+                    "cannot be undone as a single step. Run this first."
+                ),
+            }),
             ui.HGroup({"ID": "buttons"}, [
                 ui.Button({"ID": "cancelButton", "Text": "Cancel"}),
                 ui.Button({"ID": "goButton", "Text": "Go"}),
@@ -1801,6 +4031,12 @@ def build_and_show_ui() -> Optional[dict]:
     itm = win.GetItems()
 
     # Populate combo boxes
+    itm["mode"].AddItem(MODE_CREATE)
+    itm["mode"].AddItem(MODE_UPDATE)
+
+    for label, _value in SOURCE_MODES:
+        itm["sourceTimelines"].AddItem(label)
+
     itm["selectionMethod"].AddItem("Current Selection")
     itm["selectionMethod"].AddItem("Current Bin")
 
@@ -1809,6 +4045,47 @@ def build_and_show_ui() -> Optional[dict]:
     itm["sortingMethod"].AddItem("Inpoint on Timeline")
     itm["sortingMethod"].AddItem("Reel Name")
     itm["sortingMethod"].AddItem("None")
+
+    def _set(widget_id: str, attr: str, value) -> None:
+        """UIManager silently ignores some properties on some builds."""
+        try:
+            setattr(itm[widget_id], attr, value)
+        except Exception:
+            pass
+
+    prefilled = {"done": False}
+
+    def on_mode(ev):
+        updating = itm["mode"].CurrentText == MODE_UPDATE
+        # Create-only: an update never renames, re-sorts or re-blocks a timeline
+        # that already exists and that the user has since worked on.
+        for widget_id in ("DstTimelineName", "sortingMethod", "preserveTrackLayout"):
+            _set(widget_id, "Enabled", not updating)
+        for widget_id in ("sourceTimelines", "protectGradedClips", "dryRun"):
+            _set(widget_id, "Enabled", updating)
+        if updating and recorded_settings and not prefilled["done"]:
+            # Offer the settings this timeline was last built with: changing the
+            # connection threshold between runs reshapes nearly every merged
+            # range, which would read as "everything changed".
+            prefilled["done"] = True
+            threshold_value = str(recorded_settings.get(
+                "connection_threshold", DEFAULT_CONNECTION_THRESHOLD))
+            _set("ConnectionThreshold", "PlainText", threshold_value)
+            _set("ConnectionThreshold", "Text", threshold_value)
+            for widget_id, key in (
+                ("includeDisabledItems", "allow_disabled_clips"),
+                ("videoOnly", "video_only"),
+                ("markDuplicates", "mark_duplicates"),
+                ("markRetimedClips", "mark_retimed_clips"),
+                ("useXmlRetime", "use_xml_retime"),
+                ("importClipNames", "import_clip_names"),
+                ("mergeBySourceFile", "merge_by_source_file"),
+            ):
+                if key in recorded_settings:
+                    _set(widget_id, "Checked", bool(recorded_settings[key]))
+
+    win.On.mode.CurrentIndexChanged = on_mode
+    on_mode(None)
 
     win.Show()
     disp.RunLoop()
@@ -1825,7 +4102,12 @@ def build_and_show_ui() -> Optional[dict]:
     except (ValueError, TypeError):
         threshold = DEFAULT_CONNECTION_THRESHOLD
 
+    source_label = itm["sourceTimelines"].CurrentText
+    source_mode = dict(SOURCE_MODES).get(source_label, "Recorded")
+
     return {
+        "mode": itm["mode"].CurrentText,
+        "source_selection_mode": source_mode,
         "dst_timeline_name": timeline_name,
         "selection_method": itm["selectionMethod"].CurrentText,
         "sorting_method": itm["sortingMethod"].CurrentText,
@@ -1838,6 +4120,8 @@ def build_and_show_ui() -> Optional[dict]:
         "import_clip_names": itm["importClipNames"].Checked,
         "preserve_track_layout": itm["preserveTrackLayout"].Checked,
         "merge_by_source_file": itm["mergeBySourceFile"].Checked,
+        "protect_graded_clips": itm["protectGradedClips"].Checked,
+        "dry_run": itm["dryRun"].Checked,
     }
 
 
@@ -1846,13 +4130,32 @@ def build_and_show_ui() -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    """Script entry point: show UI, collect parameters, run workflow."""
+    """Script entry point: show UI, collect parameters, run the chosen workflow."""
     params = build_and_show_ui()
     if params is None:
         return
+
+    mode = params.get("mode", MODE_CREATE)
+    shared = (
+        "selection_method", "connection_threshold", "allow_disabled_clips",
+        "video_only", "mark_duplicates", "mark_retimed_clips", "use_xml_retime",
+        "import_clip_names", "merge_by_source_file",
+    )
+
     progress = ProgressUI()
     try:
-        run_workflow(progress=progress, **params)
+        if mode == MODE_UPDATE:
+            call = {key: params[key] for key in shared}
+            call["source_selection_mode"] = params["source_selection_mode"]
+            call["protect_graded_clips"] = params["protect_graded_clips"]
+            call["dry_run"] = params["dry_run"]
+            run_update_workflow(progress=progress, **call)
+        else:
+            call = {key: params[key] for key in shared}
+            call["dst_timeline_name"] = params["dst_timeline_name"]
+            call["sorting_method"] = params["sorting_method"]
+            call["preserve_track_layout"] = params["preserve_track_layout"]
+            run_workflow(progress=progress, **call)
     finally:
         progress.close()
 
