@@ -100,11 +100,17 @@ class Item:
 
     def __init__(self, mpi, source_start, source_end, record_start, track=1,
                  name=None, fusion_comps=0, versions=None, linked=0,
-                 color=None, flags=None, enabled=True):
+                 color=None, flags=None, enabled=True, reported_end=None):
         Item._seq += 1
         self.uid = f"item{Item._seq}"
         self.mpi = mpi
+        # source_start/source_end are the frames the clip actually covers,
+        # inclusive. reported_end is what GetSourceEndFrame() answers, which is
+        # NOT the same thing for a clip AppendToTimeline placed from an explicit
+        # range: Resolve mirrors back the exclusive endFrame that was requested.
+        # Verified on 21.0.4.5. Clips a human cut report the inclusive end.
         self.source_start, self.source_end = source_start, source_end
+        self.reported_end = source_end if reported_end is None else reported_end
         self.record_start = record_start
         self.track = track
         self.name = name or mpi.GetName()
@@ -121,7 +127,7 @@ class Item:
         return self.source_start
 
     def GetSourceEndFrame(self):
-        return self.source_end
+        return self.reported_end
 
     def GetStart(self):
         return self.record_start
@@ -306,7 +312,13 @@ class MediaPool:
             items = timeline.tracks.setdefault(track, [])
             start = info["startFrame"]
             end = info["endFrame"]
-            duration = end - start + 1
+            # endFrame is EXCLUSIVE: the clip covers start..end-1. A zero-length
+            # request is refused outright, which is what silently swallowed frame
+            # holds before sanitize_for_api() started adding the +1.
+            duration = end - start
+            if duration <= 0:
+                self.refused += 1
+                return []
             record = info.get("recordFrame")
             if record is None:
                 record = (max((i.GetEnd() for i in items), default=timeline.start_frame))
@@ -315,7 +327,8 @@ class MediaPool:
                 if record < existing.GetEnd() and existing.record_start < record + duration:
                     self.refused += 1
                     return []
-            item = Item(info["mediaPoolItem"], start, end, record, track)
+            item = Item(info["mediaPoolItem"], start, end - 1, record, track,
+                        reported_end=end)
             items.append(item)
             placed.append(item)
         return placed
@@ -898,6 +911,69 @@ check("the block marker is aligned with the block it labels",
 # Relative layout within the block is still preserved.
 check("relative spacing between clips is unchanged",
       placed_starts[1] - placed_starts[0], 101)
+
+
+# ---------------------------------------------------------------------------
+# 13. The exclusive endFrame (create mode)
+# ---------------------------------------------------------------------------
+#
+# AppendToTimeline's endFrame is exclusive: endFrame=E places start..E-1.
+# Measured on 21.0.4.5 against a 158-frame clip - a bare append gave duration
+# 158, endFrame=157 gave 157, endFrame=158 gave 158, and endFrame==startFrame was
+# refused outright. Before sanitize_for_api() added the +1, every generated clip
+# lost the last frame of its range and every frame hold silently vanished.
+
+print("\n== exclusive endFrame ==")
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_hold": [(900, 900)]}, [])
+mod = load(res)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="EndFrame_Test",
+        selection_method="Current Selection",
+        sorting_method="Source Name",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=False,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=False,
+        merge_by_source_file=True,
+    )
+
+built = project.timelines[-1]
+placed = {i.mpi.GetName(): i for i in built.all_items()}
+check("both source clips were placed", sorted(placed), ["shot_a", "shot_hold"])
+
+normal = placed.get("shot_a")
+if normal is not None:
+    check("the requested range is covered end to end",
+          (normal.source_start, normal.source_end), (100, 200))
+    check("including its last frame, so the duration is right",
+          normal.GetDuration(), 101)
+
+# The regression that made freeze frames disappear: start == end asked for a
+# zero-length clip, which Resolve refuses.
+hold = placed.get("shot_hold")
+check_true("a frame hold survives", hold is not None)
+if hold is not None:
+    check("a frame hold is exactly one frame",
+          (hold.source_start, hold.source_end, hold.GetDuration()),
+          (900, 900, 1))
+
+requests = {c["mediaPoolItem"].GetName(): c
+            for c in project.media_pool.append_calls}
+check("no zero-length request is ever made",
+      [n for n, c in requests.items() if c["endFrame"] <= c["startFrame"]], [])
+check("the frame hold is requested as a one-frame range",
+      (requests["shot_hold"]["startFrame"], requests["shot_hold"]["endFrame"]),
+      (900, 901))
+check("nothing was refused by the stub", project.media_pool.refused, 0)
 
 
 # ---------------------------------------------------------------------------

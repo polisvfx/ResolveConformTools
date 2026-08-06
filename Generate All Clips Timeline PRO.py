@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.2
+Version: 2.3
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.2"
+TOOL_VERSION = "2.3"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -746,11 +746,29 @@ def is_clip_retimed(clip: TimelineClipData) -> tuple[bool, Optional[float], bool
 # ---------------------------------------------------------------------------
 
 def sanitize_for_api(clip_info: ClipInfo) -> dict:
-    """Create a clean dict with only API-recognized fields for AppendToTimeline."""
+    """Create a clean dict with only API-recognized fields for AppendToTimeline.
+
+    AppendToTimeline's endFrame is EXCLUSIVE: requesting endFrame=E places source
+    frames start..E-1. ClipInfo ranges are inclusive (they come from a source
+    clip's GetSourceStartFrame/GetSourceEndFrame, where the last frame is
+    included), so the request has to be end + 1.
+
+    Measured on 21.0.4.5 against a 158-frame clip:
+
+        bare append, whole clip          duration 158   (ground truth)
+        startFrame=0, endFrame=157       duration 157   one frame short
+        startFrame=0, endFrame=158       duration 158   correct
+        startFrame=10, endFrame=19       duration 9     covers 10..18
+        startFrame=10, endFrame=10       REFUSED        zero-length
+
+    Without the +1 every generated clip lost the last frame of its range, and a
+    frame hold - where start == end - asked for a zero-length clip, which Resolve
+    refuses outright, so freeze frames silently never appeared on the timeline.
+    """
     return {
         "mediaPoolItem": clip_info.media_pool_item,
         "startFrame": clip_info.start_frame,
-        "endFrame": clip_info.end_frame,
+        "endFrame": clip_info.end_frame + 1,
     }
 
 
@@ -1262,9 +1280,12 @@ def collect_desired_clips(
                 norm_start = min(raw_start, raw_end)
                 norm_end = max(raw_start, raw_end)
 
-                # GetSourceEndFrame() is inclusive in the Resolve API, and
-                # AppendToTimeline.endFrame is inclusive too — pass norm_end through
-                # unchanged. (is_frame_hold is still used downstream for marker text.)
+                # GetSourceEndFrame() on a source clip is the inclusive last
+                # frame, so norm_end is inclusive and passes through unchanged.
+                # AppendToTimeline.endFrame is EXCLUSIVE, which is not the same
+                # convention — sanitize_for_api() does that conversion, once, at
+                # the point of the API call. (is_frame_hold is still used
+                # downstream for marker text.)
 
                 # Capture the raw API-reported range BEFORE any XML expansion
                 # or merging — used by the Range Audit at the end of the run.
@@ -1740,7 +1761,10 @@ def append_clip_with_slip_compensation(
             except (TypeError, ValueError, Exception):
                 _media_end = None
             if _media_end is not None:
-                wide_end = min(wide_end, _media_end)
+                # GetClipProperty("End") is the inclusive last frame of the
+                # media; endFrame is exclusive, so the largest legal request is
+                # one past it.
+                wide_end = min(wide_end, _media_end + 1)
             api_dict["startFrame"] = wide_start
             api_dict["endFrame"] = wide_end
             try:
@@ -2086,6 +2110,21 @@ def scan_timeline_placements(timeline, merge_by_source_file: bool) -> tuple:
             # A clip the user reversed by hand would otherwise scan backwards.
             source_start = min(raw_start, raw_end)
             source_end = max(raw_start, raw_end)
+
+            # GetSourceEndFrame() does not answer with one convention. On a clip
+            # a human cut it is the inclusive last frame, so end - start + 1 ==
+            # duration. On a clip AppendToTimeline placed from an explicit range
+            # it mirrors back the EXCLUSIVE endFrame that was requested, so
+            # end - start + 1 == duration + 1. Duration is the reliable one, so
+            # use it to spot the exclusive form and bring it back to inclusive —
+            # otherwise every clip this tool placed reads one frame longer than
+            # the conform clip it was pulled from.
+            #
+            # Only an exact one-frame overhang is corrected. A retimed clip has a
+            # timeline duration unrelated to its source span and must not be
+            # touched here.
+            if source_end - source_start + 1 - duration == 1:
+                source_end -= 1
 
             accepted_start, accepted_end = read_accepted_range(normalised_markers(item))
 

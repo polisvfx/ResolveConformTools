@@ -19,6 +19,9 @@ A full Python rewrite of the Lua script with improved retime handling and XML-ba
 - **XML retime analysis**: Optionally exports the source timeline to FCP 7 XML and parses Time Remap keyframes to compute precise source frame ranges — particularly useful for speed ramps and non-linear retimes where the API-reported range may be inaccurate.
 - **Distinct retime markers**: Red markers distinguish between "Frame Hold", "Non-Linear Retime", and "Retimed Clip" (with speed percentage), with a note when the source was originally reversed.
 - **Clean API calls**: Only API-recognized fields are passed to `AppendToTimeline`, preventing silent failures caused by extra metadata.
+- **Complete source ranges (2.3+)**: `AppendToTimeline`'s `endFrame` is *exclusive* — asking for `endFrame=E` places frames up to `E-1`. Every clip is now requested one frame past its last frame, so the range that lands is the range that was asked for.
+
+  > **If you generated an All Clips timeline with version 2.2 or earlier**, every clip on it is missing the last frame of its range, and any freeze frame in the source is missing entirely — a one-frame request was zero-length under the exclusive rule and Resolve refused it outright. Update mode will *not* repair these: a single frame is below the change threshold, so those clips read as unchanged. Regenerate the timeline if the tail frame matters, which for a VFX pull it usually does.
 - All features from the Lua version (sorting, merging, duplicate marking, audio removal) are fully preserved.
 
 #### Update Timeline mode (2.0+)
