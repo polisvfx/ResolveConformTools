@@ -1,10 +1,14 @@
 name: Release
 
-# Pushing a vX.Y.Z tag ships a release. Nothing else triggers this.
+# Pushing a vX.Y.Z tag ships a release. The tag filter is a glob, not a regex.
+# workflow_dispatch is for re-running a tag that failed part way; run it against
+# the tag itself (`gh workflow run release.yml --ref v1.0.0`), since the version
+# comes from the ref name -- dispatching from a branch fails the build step.
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v*.*.*"
+  workflow_dispatch:
 
 permissions:
   contents: write
