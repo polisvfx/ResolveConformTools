@@ -2,6 +2,25 @@
 
 A small assortment of scripts that might be helpful for everyday conform and onlining tasks. This is being develeoped from the viewpoint of a VFX artist working in the realm of car, beauty and other commericals/ads/TVCs.
 
+## Install
+
+Grab the latest `ResolveConformTools-X.Y.Z.zip` from the
+[Releases page](https://github.com/polisvfx/ResolveConformTools/releases) and unzip it
+into Resolve's Utility scripts folder, so the scripts land in a `ResolveConformTools`
+subfolder:
+
+| | |
+|---|---|
+| Windows | `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility` |
+| macOS | `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility` |
+| Linux | `/opt/resolve/Fusion/Scripts/Utility` |
+
+They then show up under **Workspace > Scripts > ResolveConformTools**. The zip carries
+a `VERSIONS.txt` listing the version of every script in it.
+
+Cloning the repo into that same folder works just as well — it only additionally brings
+the test suite, which does nothing inside Resolve.
+
 ## Create all Clips Timeline
 This script will create a Timeline with all used clips based on selection or bin.
 This script builds upon work done by [Thatcher Freeman](https://github.com/thatcherfreeman/resolve-scripts "Thatcher Freeman"), definetly check him out!
