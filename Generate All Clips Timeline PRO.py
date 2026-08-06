@@ -1,17 +1,31 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 1.3
+Version: 2.0
 
-Creates a master timeline from selected timelines, collecting all unique source clips,
-merging overlapping source ranges, and placing them on a new timeline.
+Two modes.
 
-Supports detection and marking of:
+CREATE: builds a master timeline from the selected timelines, collecting all
+unique source clips, merging overlapping source ranges, and placing them on a
+new timeline. Detects and marks:
 - Duplicate clips (colored markers)
 - Retimed clips (red markers with speed info)
 - Frame holds / freeze frames
 - Non-linear retimes / speed ramps (via XML analysis)
 - Reversed clips (normalized to forward-playing)
+
+UPDATE: re-reads the source timelines and reconciles an existing All Clips
+timeline against them — lengthening and shortening shots to the newest state,
+appending genuinely new shots on a track of their own, and marking every shot it
+touched with a timestamped changelog. The source timelines and the settings used
+are stamped onto the timeline so a later run can find them again.
+
+Update mode only rebuilds clips whose source range actually moved, because
+Resolve has no trim and no move: changing a clip's range means deleting and
+re-appending it. Its name, clip colour, flags, enabled state and markers are
+restored afterwards, but ITS GRADE AND FUSION COMPS CANNOT BE — there is no API
+to read a grade back out. Clips carrying that work are skipped by default, and
+dry run exists because Resolve's undo stack is not scriptable.
 """
 
 from __future__ import annotations
@@ -29,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "1.3"
+TOOL_VERSION = "2.0"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -120,6 +134,16 @@ CHANGELOG_TRUNCATION_MARK = "... ("
 # Marker text stays ASCII: it round-trips through the scripting bridge and back
 # out through GetMarkers on every subsequent run.
 CHANGELOG_SEPARATOR = " | "
+
+# UI mode labels, and the update-source options mapped to the internal names
+# run_update_workflow expects.
+MODE_CREATE = "Create New Timeline"
+MODE_UPDATE = "Update Existing Timeline"
+SOURCE_MODES = [
+    ("Recorded in timeline", "Recorded"),
+    ("Current selection", "Selection"),
+    ("Recorded + current selection", "Union"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -3694,7 +3718,32 @@ def build_and_show_ui() -> Optional[dict]:
     # fu and bmd are pre-injected globals in Resolve's scripting environment
     ui = fu.UIManager  # noqa: F821
     disp = bmd.UIDispatcher(ui)  # noqa: F821
-    width, height = 540, 510
+    width, height = 560, 640
+
+    # Look at the current timeline up front so update mode can say what it would
+    # be updating, and offer the settings the timeline was last built with.
+    target_label = "Update mode acts on the current timeline (none open)"
+    recorded_settings: dict = {}
+    try:
+        _project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
+        _target = _project.GetCurrentTimeline() if _project else None
+    except Exception:
+        _target = None
+    if _target is not None:
+        try:
+            _manifest, _store = read_manifest(_target)
+            _name = _target.GetName()
+        except Exception:
+            _manifest, _name = None, "?"
+        if _manifest:
+            recorded_settings = _manifest.get("settings") or {}
+            target_label = (
+                f"Update target: '{_name}' - managed, run "
+                f"{_manifest.get('run_counter', 0)}, "
+                f"{len(_manifest.get('sources') or [])} source timeline(s)")
+        else:
+            target_label = (f"Update target: '{_name}' - not managed yet; pick a "
+                            f"source that includes the current selection to adopt it")
 
     win = disp.AddWindow({
         "ID": "MyWin",
@@ -3703,6 +3752,28 @@ def build_and_show_ui() -> Optional[dict]:
         "Spacing": 10,
     }, [
         ui.VGroup({"ID": "root"}, [
+            ui.HGroup({}, [
+                ui.Label({"ID": "modeLabel", "Text": "Mode:"}),
+                ui.ComboBox({"ID": "mode"}),
+            ]),
+            ui.Label({"ID": "targetLabel", "Text": target_label}),
+            ui.HGroup({}, [
+                ui.Label({"ID": "sourceTimelinesLabel",
+                          "Text": "Update Sources:"}),
+                ui.ComboBox({
+                    "ID": "sourceTimelines",
+                    "ToolTip": (
+                        "Which source timelines an update re-reads.\n\n"
+                        "Recorded in timeline: the ones stored on the All Clips "
+                        "timeline when it was last built or updated.\n\n"
+                        "Current selection: the timelines selected in the Media "
+                        "Pool. Use this to adopt a timeline that has no record "
+                        "of its sources.\n\n"
+                        "Recorded + current selection: both, which is how you "
+                        "add a new reel to an existing All Clips timeline."
+                    ),
+                }),
+            ]),
             ui.HGroup({"ID": "dst"}, [
                 ui.Label({"ID": "DstLabel", "Text": "New Timeline Name"}),
                 ui.TextEdit({
@@ -3782,6 +3853,33 @@ def build_and_show_ui() -> Optional[dict]:
                     "rely on sub-clips being treated as their own sources)."
                 ),
             }),
+            ui.CheckBox({
+                "ID": "protectGradedClips",
+                "Text": "Update only: skip clips with Fusion comps or extra colour versions",
+                "Checked": True,
+                "ToolTip": (
+                    "Resolve has no trim or move, so changing a clip's range "
+                    "means deleting and re-appending it. Its name, colour, "
+                    "flags and markers are put back, but its grade and any "
+                    "Fusion comps cannot be — there is no API to read a grade "
+                    "back out.\n\n"
+                    "When ON (default): a clip carrying a Fusion comp or more "
+                    "than one colour version is left alone and marked for "
+                    "manual attention instead.\n\n"
+                    "When OFF: it is rebuilt anyway and that work is lost."
+                ),
+            }),
+            ui.CheckBox({
+                "ID": "dryRun",
+                "Text": "Update only: dry run (report the plan, change nothing)",
+                "Checked": False,
+                "ToolTip": (
+                    "Prints exactly what would be extended, shortened, added "
+                    "and marked unused, and writes nothing at all.\n\n"
+                    "Resolve's undo stack is not scriptable, so an update "
+                    "cannot be undone as a single step. Run this first."
+                ),
+            }),
             ui.HGroup({"ID": "buttons"}, [
                 ui.Button({"ID": "cancelButton", "Text": "Cancel"}),
                 ui.Button({"ID": "goButton", "Text": "Go"}),
@@ -3812,6 +3910,12 @@ def build_and_show_ui() -> Optional[dict]:
     itm = win.GetItems()
 
     # Populate combo boxes
+    itm["mode"].AddItem(MODE_CREATE)
+    itm["mode"].AddItem(MODE_UPDATE)
+
+    for label, _value in SOURCE_MODES:
+        itm["sourceTimelines"].AddItem(label)
+
     itm["selectionMethod"].AddItem("Current Selection")
     itm["selectionMethod"].AddItem("Current Bin")
 
@@ -3820,6 +3924,47 @@ def build_and_show_ui() -> Optional[dict]:
     itm["sortingMethod"].AddItem("Inpoint on Timeline")
     itm["sortingMethod"].AddItem("Reel Name")
     itm["sortingMethod"].AddItem("None")
+
+    def _set(widget_id: str, attr: str, value) -> None:
+        """UIManager silently ignores some properties on some builds."""
+        try:
+            setattr(itm[widget_id], attr, value)
+        except Exception:
+            pass
+
+    prefilled = {"done": False}
+
+    def on_mode(ev):
+        updating = itm["mode"].CurrentText == MODE_UPDATE
+        # Create-only: an update never renames, re-sorts or re-blocks a timeline
+        # that already exists and that the user has since worked on.
+        for widget_id in ("DstTimelineName", "sortingMethod", "preserveTrackLayout"):
+            _set(widget_id, "Enabled", not updating)
+        for widget_id in ("sourceTimelines", "protectGradedClips", "dryRun"):
+            _set(widget_id, "Enabled", updating)
+        if updating and recorded_settings and not prefilled["done"]:
+            # Offer the settings this timeline was last built with: changing the
+            # connection threshold between runs reshapes nearly every merged
+            # range, which would read as "everything changed".
+            prefilled["done"] = True
+            threshold_value = str(recorded_settings.get(
+                "connection_threshold", DEFAULT_CONNECTION_THRESHOLD))
+            _set("ConnectionThreshold", "PlainText", threshold_value)
+            _set("ConnectionThreshold", "Text", threshold_value)
+            for widget_id, key in (
+                ("includeDisabledItems", "allow_disabled_clips"),
+                ("videoOnly", "video_only"),
+                ("markDuplicates", "mark_duplicates"),
+                ("markRetimedClips", "mark_retimed_clips"),
+                ("useXmlRetime", "use_xml_retime"),
+                ("importClipNames", "import_clip_names"),
+                ("mergeBySourceFile", "merge_by_source_file"),
+            ):
+                if key in recorded_settings:
+                    _set(widget_id, "Checked", bool(recorded_settings[key]))
+
+    win.On.mode.CurrentIndexChanged = on_mode
+    on_mode(None)
 
     win.Show()
     disp.RunLoop()
@@ -3836,7 +3981,12 @@ def build_and_show_ui() -> Optional[dict]:
     except (ValueError, TypeError):
         threshold = DEFAULT_CONNECTION_THRESHOLD
 
+    source_label = itm["sourceTimelines"].CurrentText
+    source_mode = dict(SOURCE_MODES).get(source_label, "Recorded")
+
     return {
+        "mode": itm["mode"].CurrentText,
+        "source_selection_mode": source_mode,
         "dst_timeline_name": timeline_name,
         "selection_method": itm["selectionMethod"].CurrentText,
         "sorting_method": itm["sortingMethod"].CurrentText,
@@ -3849,6 +3999,8 @@ def build_and_show_ui() -> Optional[dict]:
         "import_clip_names": itm["importClipNames"].Checked,
         "preserve_track_layout": itm["preserveTrackLayout"].Checked,
         "merge_by_source_file": itm["mergeBySourceFile"].Checked,
+        "protect_graded_clips": itm["protectGradedClips"].Checked,
+        "dry_run": itm["dryRun"].Checked,
     }
 
 
@@ -3857,13 +4009,32 @@ def build_and_show_ui() -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    """Script entry point: show UI, collect parameters, run workflow."""
+    """Script entry point: show UI, collect parameters, run the chosen workflow."""
     params = build_and_show_ui()
     if params is None:
         return
+
+    mode = params.get("mode", MODE_CREATE)
+    shared = (
+        "selection_method", "connection_threshold", "allow_disabled_clips",
+        "video_only", "mark_duplicates", "mark_retimed_clips", "use_xml_retime",
+        "import_clip_names", "merge_by_source_file",
+    )
+
     progress = ProgressUI()
     try:
-        run_workflow(progress=progress, **params)
+        if mode == MODE_UPDATE:
+            call = {key: params[key] for key in shared}
+            call["source_selection_mode"] = params["source_selection_mode"]
+            call["protect_graded_clips"] = params["protect_graded_clips"]
+            call["dry_run"] = params["dry_run"]
+            run_update_workflow(progress=progress, **call)
+        else:
+            call = {key: params[key] for key in shared}
+            call["dst_timeline_name"] = params["dst_timeline_name"]
+            call["sorting_method"] = params["sorting_method"]
+            call["preserve_track_layout"] = params["preserve_track_layout"]
+            run_workflow(progress=progress, **call)
     finally:
         progress.close()
 

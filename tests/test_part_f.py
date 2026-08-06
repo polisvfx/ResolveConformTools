@@ -745,6 +745,93 @@ check("a run marker is written to the timeline ruler", len(run_marker), 1)
 check_true("it names the run", run_marker[0]["name"].startswith("Update run 1"))
 
 # ---------------------------------------------------------------------------
+# 11. main() dispatch
+# ---------------------------------------------------------------------------
+#
+# The dialog cannot be driven headlessly, but the parameter hand-off from it to
+# the two workflows can — and a mismatched keyword there would only surface as a
+# TypeError inside Resolve.
+
+print("\n== main() dispatch ==")
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)]}, [make_dest("shot_a", (100, 200), 86400)])
+mod = load(res)
+
+UI_RESULT = {
+    "mode": mod.MODE_CREATE,
+    "source_selection_mode": "Union",
+    "dst_timeline_name": "All_Sources",
+    "selection_method": "Current Selection",
+    "sorting_method": "Source Name",
+    "connection_threshold": 25,
+    "allow_disabled_clips": False,
+    "video_only": True,
+    "mark_duplicates": True,
+    "mark_retimed_clips": True,
+    "use_xml_retime": False,
+    "import_clip_names": False,
+    "preserve_track_layout": False,
+    "merge_by_source_file": True,
+    "protect_graded_clips": True,
+    "dry_run": True,
+}
+
+calls = []
+mod.run_workflow = lambda **kw: calls.append(("create", kw))
+mod.run_update_workflow = lambda **kw: calls.append(("update", kw))
+mod.ProgressUI = lambda: types.SimpleNamespace(close=lambda: None, set=lambda *a: None)
+
+mod.build_and_show_ui = lambda: dict(UI_RESULT)
+mod.main()
+check("create mode calls run_workflow", calls[-1][0], "create")
+check("create mode passes the destination name",
+      calls[-1][1]["dst_timeline_name"], "All_Sources")
+check("create mode does not pass update-only options",
+      [k for k in ("dry_run", "protect_graded_clips", "source_selection_mode")
+       if k in calls[-1][1]], [])
+
+mod.build_and_show_ui = lambda: dict(UI_RESULT, mode=mod.MODE_UPDATE)
+mod.main()
+check("update mode calls run_update_workflow", calls[-1][0], "update")
+check("update mode passes the source mode",
+      calls[-1][1]["source_selection_mode"], "Union")
+check("update mode passes dry run", calls[-1][1]["dry_run"], True)
+check("update mode does not pass create-only options",
+      [k for k in ("dst_timeline_name", "sorting_method", "preserve_track_layout")
+       if k in calls[-1][1]], [])
+
+mod.build_and_show_ui = lambda: None
+mod.main()
+check("cancelling the dialog runs nothing", len(calls), 2)
+
+# The kwargs the dialog produces must actually satisfy the two signatures.
+import inspect  # noqa: E402
+
+fresh = load(res)
+for mode, func in ((mod.MODE_CREATE, fresh.run_workflow),
+                   (mod.MODE_UPDATE, fresh.run_update_workflow)):
+    captured = []
+    fresh.run_workflow = lambda **kw: captured.append(kw)
+    fresh.run_update_workflow = lambda **kw: captured.append(kw)
+    fresh.ProgressUI = lambda: types.SimpleNamespace(close=lambda: None,
+                                                     set=lambda *a: None)
+    fresh.build_and_show_ui = lambda m=mode: dict(UI_RESULT, mode=m)
+    fresh.main()
+    try:
+        # captured[0] already carries the progress kwarg main() supplies.
+        inspect.signature(func).bind(**captured[0])
+        bound = True
+        problem = ""
+    except TypeError as exc:
+        bound = False
+        problem = str(exc)
+    check(f"{mode} kwargs satisfy the workflow signature", bound, True)
+    if not bound:
+        print(f"       {problem}")
+
+
+# ---------------------------------------------------------------------------
 
 print("")
 if fails:
