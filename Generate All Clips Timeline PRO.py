@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.3
+Version: 2.4
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.3"
+TOOL_VERSION = "2.4"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -3229,6 +3229,40 @@ def run_update_workflow(
         return
     print(f"Reading {len(unique_sources)} source timeline(s): "
           f"{', '.join(name for name, _tl in unique_sources)}")
+
+    # Compare this run's source set against the recorded one. In "Current
+    # selection" mode the recorded list is not otherwise consulted, so dropping a
+    # source by forgetting to select it would silently mark every shot that came
+    # only from it as no longer used. Edit changes usually arrive as a new
+    # version of a timeline rather than an edit to the old one, so replacing the
+    # source set is the normal path — and quietly losing an unrelated source
+    # along with it is the accident worth catching.
+    recorded_records = (manifest.get("sources") or []) if manifest else []
+    if recorded_records:
+        recorded_names = {}
+        for record in recorded_records:
+            key = record.get("uid") or f"name:{record.get('name', '')}"
+            recorded_names[key] = record.get("name") or "?"
+        current_names = {}
+        for name, timeline in unique_sources:
+            record = timeline_source_record(name, timeline)
+            current_names[record["uid"] or f"name:{name}"] = name
+
+        kept = [n for k, n in recorded_names.items() if k in current_names]
+        dropped = [n for k, n in recorded_names.items() if k not in current_names]
+        added = [n for k, n in current_names.items() if k not in recorded_names]
+
+        print(f"Source set: {len(kept)} kept, {len(added)} added, "
+              f"{len(dropped)} dropped")
+        if added:
+            print(f"  added:   {', '.join(added)}")
+        if dropped:
+            print(f"  DROPPED: {', '.join(dropped)}")
+            print("  WARNING: those were recorded sources and are not part of this "
+                  "run. Every shot that came only from them will be reported as "
+                  "no longer used. If you meant to replace one version of an edit "
+                  "with another, that is expected — if you simply forgot to "
+                  "select a source, cancel and include it.")
 
     # ---- desired state ----------------------------------------------------
     all_clip_infos, _blocks, _dup_count = collect_desired_clips(

@@ -95,8 +95,35 @@ you rearrange between runs is respected rather than overwritten.
 A timeline with no such record can be **adopted**: choose *Current selection*
 (or *Recorded + current selection*) as the update source, and the timelines you
 have selected in the Media Pool become its recorded sources. The script never
-guesses them. *Recorded + current selection* is also how you add a new reel to
-an existing All Clips timeline.
+guesses them.
+
+##### When a new cut arrives as a new timeline
+
+Edit changes usually turn up as `..._V2` rather than as an edit to `..._V1`, so
+the source set has to change. Pick the mode by what you mean:
+
+- ***Current selection*** **replaces** the recorded sources with what you have
+  selected. This is the one for a version bump: shots only in V1 are marked *no
+  longer used*, shots new in V2 are added, shots in both are left alone.
+  Select **every source that is still current**, not just the new one.
+- ***Recorded + current selection*** **adds** to them. Right when you are
+  genuinely bringing in another reel; wrong for a version bump, because V1 stays
+  a source forever and nothing ever drops out.
+
+Either way the run prints what changed about the source set before it does
+anything, and warns when a recorded source is not part of this run:
+
+```
+Source set: 2 kept, 1 added, 1 dropped
+  added:   VW_GW_30s_V2
+  DROPPED: VW_GW_30s_V1
+  WARNING: those were recorded sources and are not part of this run...
+```
+
+Sources are matched by timeline ID, so V2 is simply a different source — there
+is no automatic "V2 supersedes V1" link, which is exactly why that warning
+exists. Combined with dry run, a source you forgot to select is obvious before
+anything is written.
 
 ## Shot Naming
 The script will insert custom numbering into the "Shot" Metadata field. A shortcoming of Resolve is that theres no API access to set any custom timeline based values to a clip/event that can also be read via Tokens (eg. on the Deliver Page) so we are stuck with setting this data on a global/media bin level. This is problematic if you deal with source material that is used multiple times as the unique numbering can only be applied once and not for each instance.

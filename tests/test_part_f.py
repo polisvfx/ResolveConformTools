@@ -678,6 +678,9 @@ before_appends = len(project.media_pool.append_calls)
 before_tracks = dest.GetTrackCount("video")
 log2 = run_update(mod, source_selection_mode="Recorded")
 check_true("the second run finds nothing to do", "Nothing to do" in log2)
+# The source-set comparison must not cry wolf on an ordinary repeat run.
+check_true("and does not claim the source set changed",
+           "1 kept, 0 added, 0 dropped" in log2 and "DROPPED:" not in log2)
 check("no clip was re-appended",
       len(project.media_pool.append_calls), before_appends)
 check("no track was added", dest.GetTrackCount("video"), before_tracks)
@@ -974,6 +977,77 @@ check("the frame hold is requested as a one-frame range",
       (requests["shot_hold"]["startFrame"], requests["shot_hold"]["endFrame"]),
       (900, 901))
 check("nothing was refused by the stub", project.media_pool.refused, 0)
+
+
+# ---------------------------------------------------------------------------
+# 14. Swapping a source for a new version of it
+# ---------------------------------------------------------------------------
+#
+# Edit changes usually arrive as a NEW timeline rather than an edit to the old
+# one, so replacing the source set is the normal path. "Current selection" does
+# that, and the run has to say what it is dropping - forgetting to select an
+# unrelated source would otherwise silently mark every shot from it as unused.
+
+print("\n== swapping a source version ==")
+
+
+def add_version_two(project, src_timeline, keep_shot):
+    """A second source timeline carrying only `keep_shot`, and select it."""
+    original = {i.mpi.GetName(): i.mpi
+                for i in src_timeline.GetItemListInTrack("video", 1)}
+    items = {1: [Item(original[keep_shot], 100, 200, 0)]}
+    v2 = Timeline("SRC_01_V2", "tl:src01v2", items, start_frame=0)
+    v2_mpi = MPI("SRC_01_V2", "mid_srctl_v2", "", clip_type="Timeline")
+    v2_mpi.timeline = v2
+    project.timelines.append(v2)
+    project.media_pool.selection = [v2_mpi]
+    return v2
+
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+mod = load(res)
+run_update(mod)  # adopt: sources = SRC_01
+
+add_version_two(project, src, "shot_a")
+log = run_update(mod, source_selection_mode="Selection")
+
+check_true("the run reports the source set", "Source set:" in log)
+check_true("it counts one added and one dropped",
+           "0 kept, 1 added, 1 dropped" in log)
+check_true("it names the dropped source", "DROPPED: SRC_01" in log)
+check_true("and warns what that means", "no longer used" in log)
+
+shot_b = [i for i in dest.all_items() if i.mpi.GetName() == "shot_b"][0]
+check("the shot only in the old version is marked",
+      [m["color"] for m in update_markers(shot_b)], ["Rose"])
+check("but it is not removed", shot_b in dest.all_items(), True)
+
+manifest, _store = mod.read_manifest(dest)
+check("the manifest now points at the new version",
+      [s["name"] for s in manifest["sources"]], ["SRC_01_V2"])
+
+# Union is the other intent: keep the old source and add the new one.
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+mod = load(res)
+run_update(mod)
+add_version_two(project, src, "shot_a")
+log = run_update(mod, source_selection_mode="Union")
+
+check_true("union keeps the recorded source", "1 kept, 1 added, 0 dropped" in log)
+check_true("union drops nothing", "DROPPED:" not in log)
+shot_b = [i for i in dest.all_items() if i.mpi.GetName() == "shot_b"][0]
+check("so the shot from the old version is untouched",
+      update_markers(shot_b), [])
+
+manifest, _store = mod.read_manifest(dest)
+check("and both sources are recorded",
+      sorted(s["name"] for s in manifest["sources"]), ["SRC_01", "SRC_01_V2"])
 
 
 # ---------------------------------------------------------------------------
