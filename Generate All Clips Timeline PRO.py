@@ -394,6 +394,44 @@ def merge_all_overlapping(clip_infos: list[ClipInfo], threshold: int) -> list[Cl
 
 
 # ---------------------------------------------------------------------------
+# Clip Identity
+# ---------------------------------------------------------------------------
+
+def clip_identity_key(media_pool_item, merge_by_source_file: bool) -> Optional[str]:
+    """Bucket identity for a MediaPoolItem.
+
+    - merge_by_source_file=True: key by File Path so two MediaPoolItems pointing
+      at the same source file (the dual-import scenario from round-tripped
+      conform timelines) land in the same bucket and get merged. Falls back to
+      the MediaId when File Path is empty.
+    - merge_by_source_file=False: key by MediaId (legacy behaviour).
+
+    Returns None when neither is available; the caller skips the clip.
+
+    Both the collection pass and the update pass's timeline scan go through this
+    so a clip already on an All Clips timeline is recognised as the same shot the
+    collector just produced. Any track suffix (preserve-track-layout mode) is the
+    caller's business: an output-timeline track has no relationship to a source
+    track and must never enter the identity.
+    """
+    media_id = None
+    try:
+        media_id = media_pool_item.GetMediaId()
+    except Exception:
+        media_id = None
+
+    if merge_by_source_file:
+        try:
+            file_path = media_pool_item.GetClipProperty("File Path") or ""
+        except Exception:
+            file_path = ""
+        if file_path:
+            return f"FP:{file_path}"
+
+    return media_id or None
+
+
+# ---------------------------------------------------------------------------
 # Duplicate Detection & Marking
 # ---------------------------------------------------------------------------
 
@@ -594,51 +632,25 @@ def get_timeline_for_media_pool_item(media_pool_item):
 
 
 # ---------------------------------------------------------------------------
-# Main Workflow
+# Source Timeline Resolution
 # ---------------------------------------------------------------------------
 
-def run_workflow(
-    dst_timeline_name: str,
-    selection_method: str,
-    sorting_method: str,
-    connection_threshold: int,
-    allow_disabled_clips: bool,
-    video_only: bool,
-    mark_duplicates: bool,
-    mark_retimed_clips: bool,
-    use_xml_retime: bool,
-    import_clip_names: bool,
-    preserve_track_layout: bool,
-    merge_by_source_file: bool = True,
-    progress: Optional["ProgressUI"] = None,
-) -> None:
-    """Execute the complete timeline generation workflow."""
+def resolve_source_timelines(media_pool, selection_method: str,
+                             project_timelines: dict, progress_cb=None) -> list:
+    """Resolve the user's Media Pool selection into [(name, Timeline), ...].
+
+    Non-timeline items are reported and skipped. Returns an empty list when
+    nothing usable was selected — the caller decides what to say about that.
+    """
 
     def _p(stage: str, current: int = 0, total: int = 0) -> None:
-        if progress is not None:
-            progress.set(stage, current, total)
-
-    # Get project context — resolve is a pre-injected global in Resolve's scripting environment
-    project_manager = resolve.GetProjectManager()  # noqa: F821
-    project = project_manager.GetCurrentProject()
-    media_pool = project.GetMediaPool()
-    num_timelines = project.GetTimelineCount()
-    selected_bin = media_pool.GetCurrentFolder()
-
-    # Build timeline name lookup. Kept eager because it has a second consumer —
-    # destination-timeline name deduplication further down — which runs on every
-    # invocation. As a way of resolving a source timeline it is superseded by
-    # get_timeline_for_media_pool_item() below and only used as the pre-21.0.4
-    # fallback. (The Lua variant builds this lazily; it has no second consumer.)
-    project_timelines = {}
-    for timeline_idx in range(1, num_timelines + 1):
-        tl = project.GetTimelineByIndex(timeline_idx)
-        if tl is not None:
-            project_timelines[tl.GetName()] = tl
+        if progress_cb is not None:
+            progress_cb(stage, current, total)
 
     # Get selected clips
     selected_clips = []
     if selection_method == "Current Bin":
+        selected_bin = media_pool.GetCurrentFolder()
         if selected_bin:
             bin_clips = selected_bin.GetClipList()
             if bin_clips:
@@ -649,18 +661,17 @@ def run_workflow(
             selected_clips = sel_clips
     else:
         print("Unknown selection method.")
-        return
+        return []
 
     if not selected_clips:
         print("No clips selected or found in bin. Please select clips or timelines.")
-        return
+        return []
 
     print("Processing selected clips...")
 
-    # Collect clips from all selected timelines
-    clips: dict[str, list[ClipInfo]] = {}
+    resolved = []
     total_selected = len(selected_clips)
-    _p("Reading clips...", 0, total_selected)
+    _p("Resolving timelines...", 0, total_selected)
 
     for sel_idx, media_pool_item in enumerate(selected_clips, start=1):
         if media_pool_item is None:
@@ -680,8 +691,7 @@ def run_workflow(
             continue
 
         timeline_name = media_pool_item.GetName()
-        print(f"Processing timeline: {timeline_name}")
-        _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
+        _p(f"Resolving: {timeline_name} ({sel_idx}/{total_selected})",
            sel_idx, total_selected)
 
         # Ask the item for its own timeline (Resolve 21.0.4+). The name lookup
@@ -693,6 +703,54 @@ def run_workflow(
         if not curr_timeline:
             print(f"Timeline not found in project: {timeline_name}")
             continue
+
+        resolved.append((timeline_name, curr_timeline))
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Clip Collection
+# ---------------------------------------------------------------------------
+
+def collect_desired_clips(
+    source_timelines: list,
+    *,
+    connection_threshold: int,
+    allow_disabled_clips: bool,
+    mark_duplicates: bool,
+    mark_retimed_clips: bool,
+    use_xml_retime: bool,
+    import_clip_names: bool,
+    preserve_track_layout: bool,
+    merge_by_source_file: bool,
+    sorting_method: str,
+    progress_cb=None,
+) -> tuple:
+    """Walk the source timelines and produce the desired clip set.
+
+    Returns (all_clip_infos, timeline_block_markers, duplicate_set_count).
+
+    This is the whole "what belongs on the output timeline" computation: track
+    walk, retime and XML analysis, identity bucketing, overlap merging, the
+    optional per-source-timeline layout, duplicate stamping and sorting. The
+    create and update workflows both run it and differ only in what they do with
+    the result.
+    """
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress_cb is not None:
+            progress_cb(stage, current, total)
+
+    # Collect clips from all selected timelines
+    clips: dict[str, list[ClipInfo]] = {}
+    total_selected = len(source_timelines)
+    _p("Reading clips...", 0, total_selected)
+
+    for sel_idx, (timeline_name, curr_timeline) in enumerate(source_timelines, start=1):
+        print(f"Processing timeline: {timeline_name}")
+        _p(f"Reading: {timeline_name} ({sel_idx}/{total_selected})",
+           sel_idx, total_selected)
 
         # XML retime analysis for this timeline
         xml_lookup = {}
@@ -911,22 +969,9 @@ def run_workflow(
                     api_source_start=api_source_start,
                     api_source_end=api_source_end,
                 )
-                # Bucket key strategy:
-                # - merge_by_source_file=True: key by File Path so two MediaPoolItems
-                #   pointing at the same source file (dual-import scenario from
-                #   round-tripped conform timelines) land in the same bucket and get
-                #   merged. Falls back to media_id when File Path is empty.
-                # - merge_by_source_file=False: key by media_id (legacy behavior).
-                # When preserving track layout, we also include the track index in the
-                # key to prevent cross-track merging.
-                identity_key = media_id
-                if merge_by_source_file:
-                    try:
-                        fp = media_item.GetClipProperty("File Path") or ""
-                    except Exception:
-                        fp = ""
-                    if fp:
-                        identity_key = f"FP:{fp}"
+                # Bucket key: see clip_identity_key(). When preserving track layout
+                # we also include the track index to prevent cross-track merging.
+                identity_key = clip_identity_key(media_item, merge_by_source_file) or media_id
                 clips_key = f"{identity_key}_T{track_idx}" if preserve_track_layout else identity_key
                 clips.setdefault(clips_key, []).append(clip_info)
                 print(f"  Added clip to processing list: {item_name} "
@@ -942,7 +987,7 @@ def run_workflow(
 
     if not clips:
         print("No valid clips found to process.")
-        return
+        return [], [], 0
 
     # Cross-bucket scan: files appearing under multiple bucket keys. With
     # merge-by-file-path ON this should be empty (or only flag clips with
@@ -1148,6 +1193,297 @@ def run_workflow(
         print(f"Unknown sorting method '{sorting_method}', using default (Source Name)")
         sort_by_source_name(all_clip_infos)
 
+    return all_clip_infos, timeline_markers, dup_set_count
+
+
+# ---------------------------------------------------------------------------
+# Append Helper
+# ---------------------------------------------------------------------------
+
+def append_clip_with_slip_compensation(
+    media_pool,
+    timeline,
+    clip_info: ClipInfo,
+    *,
+    video_only: bool,
+    track_index: Optional[int] = None,
+    record_frame: Optional[int] = None,
+    timeline_fps: Optional[float] = None,
+    allow_widening: bool = True,
+) -> tuple:
+    """Append one ClipInfo, compensating for AppendToTimeline source-frame slip.
+
+    `timeline` must already be the project's current timeline — AppendToTimeline
+    always targets the current one.
+
+    Resolve sometimes places clips with their source in/out shifted by ±1 frame
+    (codec/internal anchor quirks). We re-query the placed clip; if it differs
+    from the target, delete it and retry with startFrame/endFrame adjusted by the
+    inverse of the observed slip. Capped at SLIP_RETRY_LIMIT retries; if still
+    off, fall back to widening the request by ±1 so the target range is fully
+    contained in the placed range (extra handle frames are acceptable, missing
+    frames are not). Pass allow_widening=False when the clip is going into a
+    tight gap where that extra frame has nowhere to go.
+
+    Returns (item, status, placed_source_start, placed_source_end). status is one
+    of "exact", "corrected", "widened", "unfixed", "unknown" or "error";
+    "unknown" covers an append that raised nothing but gave back no single
+    usable item to verify.
+    """
+    mpi = clip_info.media_pool_item
+    clip_name = mpi.GetName()
+
+    # Quiet FPS-mismatch check (loud warning only when triggered).
+    try:
+        _clip_fps_raw = mpi.GetClipProperty("FPS")
+        _clip_fps_val = float(_clip_fps_raw) if _clip_fps_raw not in (None, "") else None
+    except (TypeError, ValueError, Exception):
+        _clip_fps_val = None
+    if (timeline_fps is not None and _clip_fps_val is not None
+            and abs(timeline_fps - _clip_fps_val) > 0.01):
+        print(
+            f"  WARN: FPS mismatch on '{clip_name}' "
+            f"(clip={_clip_fps_val}, timeline={timeline_fps})"
+        )
+
+    api_dict = sanitize_for_api(clip_info)
+    # Audio filtering: mediaType=1 is the documented way to import video only and
+    # works across all Resolve versions. importVideo/importAudio are kept as a
+    # belt-and-suspenders hint for newer API builds.
+    if video_only:
+        api_dict["mediaType"] = 1  # 1 = video, 2 = audio
+    api_dict["importVideo"] = True
+    api_dict["importAudio"] = not video_only
+    if track_index is not None:
+        api_dict["trackIndex"] = track_index
+    if record_frame is not None:
+        api_dict["recordFrame"] = record_frame
+
+    target_start = api_dict["startFrame"]
+    target_end = api_dict["endFrame"]
+
+    try:
+        placed_items = media_pool.AppendToTimeline([api_dict])
+    except Exception:
+        print(f"  ERROR: Failed to add clip: {clip_name}")
+        print(f"  Frame range attempted: {api_dict['startFrame']} to {api_dict['endFrame']}")
+        return None, "error", None, None
+
+    if record_frame is not None:
+        print(f"  Placed on track {track_index} at frame {record_frame}")
+
+    last_item = None
+    retry_count = 0
+    while placed_items and retry_count <= SLIP_RETRY_LIMIT:
+        if len(placed_items) != 1:
+            break  # unexpected multi-item return; don't try to fix
+        placed = placed_items[0]
+        last_item = placed
+        try:
+            actual_start = placed.GetSourceStartFrame()
+            actual_end = placed.GetSourceEndFrame()
+        except Exception:
+            actual_start = None
+            actual_end = None
+        if actual_start is None or actual_end is None:
+            break
+        start_delta = actual_start - target_start
+        end_delta = actual_end - target_end
+        if start_delta == 0 and end_delta == 0:
+            return (placed, "corrected" if retry_count > 0 else "exact",
+                    actual_start, actual_end)
+        if retry_count >= SLIP_RETRY_LIMIT:
+            if not allow_widening:
+                print(
+                    f"  WARN: '{clip_name}' slip unfixable (target "
+                    f"{target_start}-{target_end}, placed "
+                    f"{actual_start}-{actual_end}); no room to widen here"
+                )
+                return placed, "unfixed", actual_start, actual_end
+            # Widening fallback — extra frames are acceptable.
+            try:
+                timeline.DeleteClips([placed], False)
+            except Exception:
+                print(
+                    f"  ERROR: '{clip_name}' slip unfixable and DeleteClips "
+                    f"failed before widening; clip left at "
+                    f"{actual_start}-{actual_end} "
+                    f"(target {target_start}-{target_end})"
+                )
+                return placed, "unfixed", actual_start, actual_end
+            wide_start = max(0, target_start - 1)
+            wide_end = target_end + 1
+            try:
+                _media_end_raw = mpi.GetClipProperty("End")
+                _media_end = int(_media_end_raw) if _media_end_raw not in (None, "") else None
+            except (TypeError, ValueError, Exception):
+                _media_end = None
+            if _media_end is not None:
+                wide_end = min(wide_end, _media_end)
+            api_dict["startFrame"] = wide_start
+            api_dict["endFrame"] = wide_end
+            try:
+                wide_items = media_pool.AppendToTimeline([api_dict])
+            except Exception:
+                print(
+                    f"  ERROR: '{clip_name}' widening append raised; clip is "
+                    f"no longer on the timeline (target "
+                    f"{target_start}-{target_end})"
+                )
+                return None, "unfixed", None, None
+            covers = False
+            w_start = w_end = None
+            wide_item = None
+            if wide_items and len(wide_items) == 1:
+                wide_item = wide_items[0]
+                try:
+                    w_start = wide_item.GetSourceStartFrame()
+                    w_end = wide_item.GetSourceEndFrame()
+                except Exception:
+                    pass
+                if w_start is not None and w_end is not None:
+                    covers = (w_start <= target_start and w_end >= target_end)
+            if covers:
+                print(
+                    f"  WARN: '{clip_name}' slip unfixable "
+                    f"(target {target_start}-{target_end}); "
+                    f"widened to {w_start}-{w_end} — "
+                    f"target frames preserved with handles"
+                )
+                return wide_item, "widened", w_start, w_end
+            print(
+                f"  ERROR: '{clip_name}' slip unfixable; "
+                f"widened to {w_start}-{w_end} but target "
+                f"{target_start}-{target_end} NOT covered "
+                f"(frames missing)"
+            )
+            return wide_item, "unfixed", w_start, w_end
+        # Silent retry with inverse-of-observed-slip compensation.
+        try:
+            timeline.DeleteClips([placed], False)
+        except Exception:
+            print(
+                f"  ERROR: '{clip_name}' DeleteClips failed during "
+                f"retry; leaving slipped clip at "
+                f"{actual_start}-{actual_end} "
+                f"(target {target_start}-{target_end})"
+            )
+            return placed, "unfixed", actual_start, actual_end
+        api_dict["startFrame"] = target_start - start_delta
+        api_dict["endFrame"] = target_end - end_delta
+        try:
+            placed_items = media_pool.AppendToTimeline([api_dict])
+        except Exception:
+            print(
+                f"  ERROR: '{clip_name}' retry append raised; clip is no "
+                f"longer on the timeline (target {target_start}-{target_end})"
+            )
+            return None, "unfixed", None, None
+        last_item = None
+        retry_count += 1
+
+    return last_item, "unknown", None, None
+
+
+# ---------------------------------------------------------------------------
+# Marker Text
+# ---------------------------------------------------------------------------
+
+def build_duplicate_marker_text(clip_info: ClipInfo) -> tuple:
+    """(color, name, note) for a duplicate-set marker."""
+    set_idx = clip_info.duplicate_set_index
+    color = DUPLICATE_MARKER_COLORS[set_idx % len(DUPLICATE_MARKER_COLORS)]
+    marker_text = (f"Dup Set #{set_idx + 1} "
+                   f"({clip_info.duplicate_position + 1}/{clip_info.duplicate_set_size})")
+    return color, marker_text, "Duplicate clip detected"
+
+
+def build_retime_marker_text(clip_info: ClipInfo) -> tuple:
+    """(name, note) for a retime marker. The colour is always Red."""
+    if clip_info.is_frame_hold:
+        marker_text = "Frame Hold"
+        marker_note = ("Source clip used a frame hold (freeze frame). "
+                       "Manual check recommended.")
+    elif clip_info.is_non_linear_retime:
+        marker_text = "Non-Linear Retime"
+        marker_note = ("Speed curve/ramp detected. Source range may not "
+                       "cover all frames used. Manual check recommended.")
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    else:
+        speed_value = clip_info.retime_percentage
+        speed_str = f"{speed_value:.1f}" if speed_value is not None else "Unknown"
+        marker_text = "Retimed Clip"
+        marker_note = f"Manual check recommended. Speed: {speed_str}%"
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    return marker_text, marker_note
+
+
+# ---------------------------------------------------------------------------
+# Main Workflow
+# ---------------------------------------------------------------------------
+
+def run_workflow(
+    dst_timeline_name: str,
+    selection_method: str,
+    sorting_method: str,
+    connection_threshold: int,
+    allow_disabled_clips: bool,
+    video_only: bool,
+    mark_duplicates: bool,
+    mark_retimed_clips: bool,
+    use_xml_retime: bool,
+    import_clip_names: bool,
+    preserve_track_layout: bool,
+    merge_by_source_file: bool = True,
+    progress: Optional["ProgressUI"] = None,
+) -> None:
+    """Execute the complete timeline generation workflow."""
+
+    def _p(stage: str, current: int = 0, total: int = 0) -> None:
+        if progress is not None:
+            progress.set(stage, current, total)
+
+    # Get project context — resolve is a pre-injected global in Resolve's scripting environment
+    project_manager = resolve.GetProjectManager()  # noqa: F821
+    project = project_manager.GetCurrentProject()
+    media_pool = project.GetMediaPool()
+    num_timelines = project.GetTimelineCount()
+
+    # Build timeline name lookup. Kept eager because it has a second consumer —
+    # destination-timeline name deduplication further down — which runs on every
+    # invocation. As a way of resolving a source timeline it is superseded by
+    # get_timeline_for_media_pool_item() and only used as the pre-21.0.4
+    # fallback. (The Lua variant builds this lazily; it has no second consumer.)
+    project_timelines = {}
+    for timeline_idx in range(1, num_timelines + 1):
+        tl = project.GetTimelineByIndex(timeline_idx)
+        if tl is not None:
+            project_timelines[tl.GetName()] = tl
+
+    source_timelines = resolve_source_timelines(
+        media_pool, selection_method, project_timelines, progress_cb=_p,
+    )
+    if not source_timelines:
+        return
+
+    all_clip_infos, timeline_markers, dup_set_count = collect_desired_clips(
+        source_timelines,
+        connection_threshold=connection_threshold,
+        allow_disabled_clips=allow_disabled_clips,
+        mark_duplicates=mark_duplicates,
+        mark_retimed_clips=mark_retimed_clips,
+        use_xml_retime=use_xml_retime,
+        import_clip_names=import_clip_names,
+        preserve_track_layout=preserve_track_layout,
+        merge_by_source_file=merge_by_source_file,
+        sorting_method=sorting_method,
+        progress_cb=_p,
+    )
+    if not all_clip_infos:
+        return
+
     # Create new timeline — dedupe name against existing project timelines.
     # If "All_Sources" exists, try "All_Sources_01", "All_Sources_02", …
     if dst_timeline_name in project_timelines:
@@ -1222,142 +1558,23 @@ def run_workflow(
             print(f"  Original clip status: {', '.join(status_parts)}")
             print("  (Adding normalized forward-playing version)")
 
-        # Quiet FPS-mismatch check (loud warning only when triggered).
-        # Used by the widening fallback to bound the request to media End.
-        mpi = clip_info.media_pool_item
-        try:
-            _clip_fps_raw = mpi.GetClipProperty("FPS")
-            _clip_fps_val = float(_clip_fps_raw) if _clip_fps_raw not in (None, "") else None
-        except (TypeError, ValueError, Exception):
-            _clip_fps_val = None
-        if (_timeline_fps is not None and _clip_fps_val is not None
-                and abs(_timeline_fps - _clip_fps_val) > 0.01):
-            print(
-                f"  WARN: FPS mismatch on '{clip_name}' "
-                f"(clip={_clip_fps_val}, timeline={_timeline_fps})"
-            )
-
-        api_dict = sanitize_for_api(clip_info)
-        # Audio filtering: mediaType=1 is the documented way to import video
-        # only and works across all Resolve versions. importVideo/importAudio
-        # are kept as a belt-and-suspenders hint for newer API builds.
-        if video_only:
-            api_dict["mediaType"] = 1  # 1 = video, 2 = audio
-        api_dict["importVideo"] = True
-        api_dict["importAudio"] = not video_only
-        if preserve_track_layout:
-            api_dict["recordFrame"] = clip_info.timeline_inpoint
-            api_dict["trackIndex"] = clip_info.source_track_index
-        try:
-            placed_items = media_pool.AppendToTimeline([api_dict])
-            append_success_count += 1
-            if preserve_track_layout:
-                print(f"  Placed on track {clip_info.source_track_index} "
-                      f"at frame {clip_info.timeline_inpoint}")
-            # Detect and compensate for source-frame slip introduced by
-            # AppendToTimeline. Resolve sometimes places clips with their
-            # source in/out shifted by ±1 frame (codec/internal anchor
-            # quirks). We re-query the placed clip; if it differs from
-            # the target, delete it and retry with startFrame/endFrame
-            # adjusted by the inverse of the observed slip. Capped at
-            # SLIP_RETRY_LIMIT retries; if still off, fall back to
-            # widening the request by ±1 so the target range is fully
-            # contained in the placed range (extra handle frames are
-            # acceptable; missing frames are not).
-            target_start = api_dict["startFrame"]
-            target_end = api_dict["endFrame"]
-            retry_count = 0
-            while placed_items and retry_count <= SLIP_RETRY_LIMIT:
-                if len(placed_items) != 1:
-                    break  # unexpected multi-item return; don't try to fix
-                placed = placed_items[0]
-                try:
-                    actual_start = placed.GetSourceStartFrame()
-                    actual_end = placed.GetSourceEndFrame()
-                except Exception:
-                    actual_start = None
-                    actual_end = None
-                if actual_start is None or actual_end is None:
-                    break
-                start_delta = actual_start - target_start
-                end_delta = actual_end - target_end
-                if start_delta == 0 and end_delta == 0:
-                    if retry_count > 0:
-                        slip_corrected_count += 1
-                    break
-                if retry_count >= SLIP_RETRY_LIMIT:
-                    # Widening fallback — extra frames are acceptable.
-                    try:
-                        new_timeline.DeleteClips([placed], False)
-                    except Exception:
-                        print(
-                            f"  ERROR: '{clip_name}' slip unfixable and "
-                            f"DeleteClips failed before widening; clip left "
-                            f"at {actual_start}-{actual_end} "
-                            f"(target {target_start}-{target_end})"
-                        )
-                        slip_unfixed_count += 1
-                        break
-                    wide_start = max(0, target_start - 1)
-                    wide_end = target_end + 1
-                    try:
-                        _media_end_raw = mpi.GetClipProperty("End")
-                        _media_end = int(_media_end_raw) if _media_end_raw not in (None, "") else None
-                    except (TypeError, ValueError, Exception):
-                        _media_end = None
-                    if _media_end is not None:
-                        wide_end = min(wide_end, _media_end)
-                    api_dict["startFrame"] = wide_start
-                    api_dict["endFrame"] = wide_end
-                    wide_items = media_pool.AppendToTimeline([api_dict])
-                    covers = False
-                    w_start = w_end = None
-                    if wide_items and len(wide_items) == 1:
-                        try:
-                            w_start = wide_items[0].GetSourceStartFrame()
-                            w_end = wide_items[0].GetSourceEndFrame()
-                        except Exception:
-                            pass
-                        if w_start is not None and w_end is not None:
-                            covers = (w_start <= target_start
-                                      and w_end >= target_end)
-                    if covers:
-                        print(
-                            f"  WARN: '{clip_name}' slip unfixable "
-                            f"(target {target_start}-{target_end}); "
-                            f"widened to {w_start}-{w_end} — "
-                            f"target frames preserved with handles"
-                        )
-                        slip_widened_count += 1
-                    else:
-                        print(
-                            f"  ERROR: '{clip_name}' slip unfixable; "
-                            f"widened to {w_start}-{w_end} but target "
-                            f"{target_start}-{target_end} NOT covered "
-                            f"(frames missing)"
-                        )
-                        slip_unfixed_count += 1
-                    break
-                # Silent retry with inverse-of-observed-slip compensation.
-                try:
-                    new_timeline.DeleteClips([placed], False)
-                except Exception:
-                    print(
-                        f"  ERROR: '{clip_name}' DeleteClips failed during "
-                        f"retry; leaving slipped clip at "
-                        f"{actual_start}-{actual_end} "
-                        f"(target {target_start}-{target_end})"
-                    )
-                    slip_unfixed_count += 1
-                    break
-                api_dict["startFrame"] = target_start - start_delta
-                api_dict["endFrame"] = target_end - end_delta
-                placed_items = media_pool.AppendToTimeline([api_dict])
-                retry_count += 1
-        except Exception:
-            print(f"  ERROR: Failed to add clip: {clip_info.media_pool_item.GetName()}")
-            print(f"  Frame range attempted: {api_dict['startFrame']} to {api_dict['endFrame']}")
+        _item, _status, _s, _e = append_clip_with_slip_compensation(
+            media_pool, new_timeline, clip_info,
+            video_only=video_only,
+            track_index=clip_info.source_track_index if preserve_track_layout else None,
+            record_frame=clip_info.timeline_inpoint if preserve_track_layout else None,
+            timeline_fps=_timeline_fps,
+        )
+        if _status == "error":
             append_error_count += 1
+        else:
+            append_success_count += 1
+        if _status == "corrected":
+            slip_corrected_count += 1
+        elif _status == "widened":
+            slip_widened_count += 1
+        elif _status == "unfixed":
+            slip_unfixed_count += 1
 
     print(f"Clip addition summary: {append_success_count} succeeded, "
           f"{append_error_count} failed")
@@ -1403,10 +1620,7 @@ def run_workflow(
                         and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
                         and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
 
-                    set_idx = clip_info.duplicate_set_index
-                    color = DUPLICATE_MARKER_COLORS[set_idx % len(DUPLICATE_MARKER_COLORS)]
-                    marker_text = (f"Dup Set #{set_idx + 1} "
-                                   f"({clip_info.duplicate_position + 1}/{clip_info.duplicate_set_size})")
+                    color, marker_text, marker_note = build_duplicate_marker_text(clip_info)
                     source_start = timeline_clip.clip.GetSourceStartFrame()
                     clip_duration = timeline_clip.clip.GetDuration()
                     marker_position = source_start + math.floor(clip_duration * 0.25)
@@ -1414,7 +1628,7 @@ def run_workflow(
                     try:
                         success = timeline_clip.clip.AddMarker(
                             marker_position, color, marker_text,
-                            "Duplicate clip detected", 1, "",
+                            marker_note, 1, "",
                         )
                     except Exception:
                         success = False
@@ -1455,23 +1669,7 @@ def run_workflow(
                         marker_position = source_start + math.floor(clip_duration * 0.5)
 
                         # Distinguish marker types
-                        if clip_info.is_frame_hold:
-                            marker_text = "Frame Hold"
-                            marker_note = ("Source clip used a frame hold (freeze frame). "
-                                           "Manual check recommended.")
-                        elif clip_info.is_non_linear_retime:
-                            marker_text = "Non-Linear Retime"
-                            marker_note = ("Speed curve/ramp detected. Source range may not "
-                                           "cover all frames used. Manual check recommended.")
-                            if clip_info.is_reversed:
-                                marker_note += " (originally reversed)"
-                        else:
-                            speed_value = clip_info.retime_percentage
-                            speed_str = f"{speed_value:.1f}" if speed_value is not None else "Unknown"
-                            marker_text = "Retimed Clip"
-                            marker_note = f"Manual check recommended. Speed: {speed_str}%"
-                            if clip_info.is_reversed:
-                                marker_note += " (originally reversed)"
+                        marker_text, marker_note = build_retime_marker_text(clip_info)
 
                         try:
                             success = timeline_clip.clip.AddMarker(
