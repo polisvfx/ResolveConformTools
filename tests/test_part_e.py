@@ -41,7 +41,11 @@ def _repo_root():
 
 REPO = _repo_root()
 SCRIPT = os.path.join(REPO, "Generate All Clips Timeline PRO.py")
-WANTED = ["clip_identity_key"]
+WANTED = [
+    "clip_identity_key",
+    "build_manifest", "manifest_add_run", "encode_manifest", "decode_manifest",
+    "trim_manifest_for_marker", "first_free_frame", "find_manifest_marker_frame",
+]
 
 
 def extract(path, names):
@@ -94,6 +98,18 @@ def extract(path, names):
 
 ns = extract(SCRIPT, WANTED)
 clip_identity_key = ns["clip_identity_key"]
+build_manifest = ns["build_manifest"]
+manifest_add_run = ns["manifest_add_run"]
+encode_manifest = ns["encode_manifest"]
+decode_manifest = ns["decode_manifest"]
+trim_manifest_for_marker = ns["trim_manifest_for_marker"]
+first_free_frame = ns["first_free_frame"]
+find_manifest_marker_frame = ns["find_manifest_marker_frame"]
+
+MANIFEST_KEY = ns["MANIFEST_KEY"]
+MANIFEST_MARKER_PREFIX = ns["MANIFEST_MARKER_PREFIX"]
+MANIFEST_SCHEMA = ns["MANIFEST_SCHEMA"]
+MANIFEST_MARKER_MAX_CHARS = ns["MANIFEST_MARKER_MAX_CHARS"]
 
 fails = []
 
@@ -188,6 +204,131 @@ check("two media pool entries, one file, merging on -> same identity",
       clip_identity_key(dual_a, True) == clip_identity_key(dual_b, True), True)
 check("two media pool entries, one file, merging off -> different identity",
       clip_identity_key(dual_a, False) == clip_identity_key(dual_b, False), False)
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+print("\n== manifest ==")
+
+SOURCES = [{"uid": "tl:aaa", "name": "REEL_01"}, {"uid": "tl:bbb", "name": "REEL_02"}]
+SETTINGS = {"connection_threshold": 25, "merge_by_source_file": True,
+            "video_only": True, "allow_disabled_clips": False,
+            "use_xml_retime": True, "import_clip_names": False}
+
+base = build_manifest("tl:dest", "All_Sources", SOURCES, SETTINGS,
+                      "2026-08-06T10:00:00Z", "2.0")
+
+check("new manifest carries the current schema", base["schema"], MANIFEST_SCHEMA)
+check("new manifest starts at run 0", base["run_counter"], 0)
+check("new manifest has no runs", base["runs"], [])
+check("new manifest is not adopted", base["adopted"], False)
+check("sources are kept", base["sources"], SOURCES)
+check("settings are kept", base["settings"], SETTINGS)
+
+check("round trip through encode/decode is identity",
+      decode_manifest(encode_manifest(base)), base)
+check("round trip survives the marker prefix",
+      decode_manifest(MANIFEST_MARKER_PREFIX + encode_manifest(base)), base)
+check("encoding is stable across calls",
+      encode_manifest(base) == encode_manifest(dict(base)), True)
+
+# GetThirdPartyMetadata is documented as string|dict, so a dict has to work too.
+check("decode accepts the {key: value} dict form",
+      decode_manifest({MANIFEST_KEY: encode_manifest(base)}), base)
+
+check("decode of None is None", decode_manifest(None), None)
+check("decode of empty string is None", decode_manifest(""), None)
+check("decode of whitespace is None", decode_manifest("   "), None)
+check("decode of junk is None", decode_manifest("not json at all"), None)
+check("decode of a bare object with no schema is None", decode_manifest("{}"), None)
+check("decode of a JSON list is None", decode_manifest("[1,2,3]"), None)
+check("decode of a JSON string is None", decode_manifest('"hello"'), None)
+check("decode of a bare prefix is None", decode_manifest(MANIFEST_MARKER_PREFIX), None)
+check("decode of an unsupported schema is None",
+      decode_manifest('{"schema":99,"sources":[]}'), None)
+check("decode of a non-string non-dict is None", decode_manifest(12345), None)
+
+run1 = {"n": 1, "utc": "2026-08-06T11:00:00Z", "added": 3, "extended": 1}
+after1 = manifest_add_run(base, run1)
+check("adding a run bumps the counter", after1["run_counter"], 1)
+check("adding a run stamps last_run_utc", after1["last_run_utc"], run1["utc"])
+check("adding a run appends it", after1["runs"], [run1])
+check("adding a run does not mutate the original", base["runs"], [])
+
+many = base
+for n in range(1, 41):
+    many = manifest_add_run(many, {"n": n, "utc": f"2026-08-06T{n % 24:02d}:00:00Z"})
+check("run history caps at MANIFEST_MAX_RUNS", len(many["runs"]),
+      ns["MANIFEST_MAX_RUNS"])
+check("the cap drops the oldest runs first", many["runs"][0]["n"],
+      41 - ns["MANIFEST_MAX_RUNS"])
+check("the cap keeps the newest run", many["runs"][-1]["n"], 40)
+check("run_counter tracks the newest run", many["run_counter"], 40)
+
+fits = trim_manifest_for_marker(many, MANIFEST_MARKER_MAX_CHARS)
+check("a full history already fits the marker budget",
+      fits["runs"] == many["runs"], True)
+check("trimming preserves sources", fits["sources"], SOURCES)
+check("trimming preserves settings", fits["settings"], SETTINGS)
+
+tight = trim_manifest_for_marker(many, 400)
+check("a tight budget drops runs", len(tight["runs"]) < len(many["runs"]), True)
+check("a tight budget still preserves sources", tight["sources"], SOURCES)
+check("a tight budget still preserves settings", tight["settings"], SETTINGS)
+
+# Sources and settings alone can exceed a very small budget. Returning the
+# manifest anyway (rather than dropping them) is the deliberate choice: a
+# too-long marker is recoverable, a manifest missing its sources is not.
+impossible = trim_manifest_for_marker(many, 10)
+check("an impossible budget empties runs but keeps the rest",
+      (impossible["runs"], impossible["sources"]), ([], SOURCES))
+
+
+# ---------------------------------------------------------------------------
+# first_free_frame
+# ---------------------------------------------------------------------------
+
+print("\n== first_free_frame ==")
+
+check("free preferred frame is used", first_free_frame([], 0, lower=0), 0)
+check("taken preferred frame steps forward", first_free_frame([0], 0, lower=0), 1)
+check("steps forward past a run of taken frames",
+      first_free_frame([0, 1, 2], 0, lower=0), 3)
+check("unrelated taken frames are ignored",
+      first_free_frame([0, 1, 2], 5, lower=0), 5)
+check("forward exhausted falls back to searching backward",
+      first_free_frame([10, 11], 10, lower=0, upper=11), 9)
+check("every frame taken returns -1",
+      first_free_frame([0, 1, 2], 1, lower=0, upper=2), -1)
+check("float frames are tolerated", first_free_frame([0.0, 1.0], 0, lower=0), 2)
+check("no lower bound means no backward search",
+      first_free_frame([5, 6], 5, upper=6), -1)
+
+
+# ---------------------------------------------------------------------------
+# find_manifest_marker_frame
+# ---------------------------------------------------------------------------
+
+print("\n== find_manifest_marker_frame ==")
+
+check("no markers means no manifest", find_manifest_marker_frame({}), None)
+check("markers without our prefix are ignored",
+      find_manifest_marker_frame({0: {"customData": "something else"},
+                                  9: {"customData": ""}}), None)
+check("the manifest marker is found by prefix",
+      find_manifest_marker_frame({0: {"customData": "other"},
+                                  5: {"customData": MANIFEST_MARKER_PREFIX + "{}"}}), 5)
+check("the lowest matching frame wins",
+      find_manifest_marker_frame({7: {"customData": MANIFEST_MARKER_PREFIX + "{}"},
+                                  3: {"customData": MANIFEST_MARKER_PREFIX + "{}"}}), 3)
+check("a missing customData key is tolerated",
+      find_manifest_marker_frame({0: {"name": "plain marker"}}), None)
+check("a None marker info is tolerated",
+      find_manifest_marker_frame({0: None}), None)
+check("a non-string customData is tolerated",
+      find_manifest_marker_frame({0: {"customData": 42}}), None)
 
 
 # ---------------------------------------------------------------------------

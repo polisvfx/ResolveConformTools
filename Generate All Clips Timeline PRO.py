@@ -16,11 +16,13 @@ Supports detection and marking of:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 # Constants
@@ -57,6 +59,22 @@ DUPLICATE_MARKER_COLORS = [
     "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink",
     "Fuchsia", "Lavender", "Rose", "Cocoa", "Sand", "Sky", "Mint", "Lemon",
 ]
+
+# Update-mode manifest. Stamped onto an All Clips timeline so a later run knows
+# which source timelines it was built from and with which settings — neither is
+# recoverable by looking at the output. Everything else (which clips are on the
+# timeline, where, and over what source range) is deliberately NOT stored: it is
+# re-scanned every run so edits made in between are respected rather than
+# overwritten from a stale cache.
+MANIFEST_SCHEMA = 1
+MANIFEST_KEY = "RCT_AllClipsManifest"
+MANIFEST_MARKER_PREFIX = "RCT_AllClipsManifest_v1:"
+MANIFEST_MARKER_COLOR = "Cream"  # the one colour no other pass in this file uses
+MANIFEST_MARKER_NAME = "All Clips Manifest"
+MANIFEST_MAX_RUNS = 20
+# The customData size limit is undocumented; keep the marker copy well clear of
+# anything that might be a cliff by dropping the oldest run records first.
+MANIFEST_MARKER_MAX_CHARS = 8000
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +647,269 @@ def get_timeline_for_media_pool_item(media_pool_item):
     if not callable(getattr(timeline, "GetTrackCount", None)):
         return None
     return timeline
+
+
+# ---------------------------------------------------------------------------
+# Update Manifest
+# ---------------------------------------------------------------------------
+
+def utc_now_iso() -> str:
+    """Current UTC time as 2026-08-06T12:22:33Z — the manifest's machine clock."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_manifest(timeline_uid, timeline_name, sources, settings, now_iso,
+                   tool_version) -> dict:
+    """A fresh manifest for an All Clips timeline.
+
+    `sources` is [{"uid": ..., "name": ...}] for the timelines it was built from;
+    the uid is exact and survives renames, the name is the only thing a human can
+    act on once a uid stops resolving. `settings` is the generation settings that
+    shaped the merged ranges — re-running with a different connection threshold
+    reshapes nearly every clip, so the previous value has to be recoverable.
+    """
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "tool": "Generate All Clips Timeline PRO",
+        "tool_version": tool_version,
+        "timeline_uid": timeline_uid or "",
+        "timeline_name": timeline_name or "",
+        "created_utc": now_iso,
+        "last_run_utc": now_iso,
+        "run_counter": 0,
+        "adopted": False,
+        "sources": list(sources or []),
+        "settings": dict(settings or {}),
+        "runs": [],
+    }
+
+
+def manifest_add_run(manifest: dict, run_record: dict,
+                     max_runs: int = MANIFEST_MAX_RUNS) -> dict:
+    """Append a run record, bump the counters, cap the history. Returns a copy."""
+    updated = dict(manifest)
+    runs = list(manifest.get("runs") or [])
+    runs.append(dict(run_record))
+    if max_runs >= 0:
+        runs = runs[-max_runs:] if max_runs else []
+    updated["runs"] = runs
+    updated["run_counter"] = run_record.get("n", manifest.get("run_counter", 0) + 1)
+    if run_record.get("utc"):
+        updated["last_run_utc"] = run_record["utc"]
+    return updated
+
+
+def encode_manifest(manifest: dict) -> str:
+    """Compact, key-sorted JSON so the same manifest always encodes identically."""
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+
+
+def decode_manifest(text) -> Optional[dict]:
+    """Parse a manifest payload, with or without the marker prefix.
+
+    Returns None for anything unusable — absent, junk, not an object, or written
+    by a schema this build does not understand. A newer schema is reported loudly
+    rather than half-read, because acting on a manifest we only partly understand
+    is how an update deletes the wrong clips.
+    """
+    if not text:
+        return None
+    if isinstance(text, dict):
+        # GetThirdPartyMetadata can hand back {key: value} instead of the value.
+        text = text.get(MANIFEST_KEY) or ""
+    if not isinstance(text, str):
+        return None
+    payload = text.strip()
+    if payload.startswith(MANIFEST_MARKER_PREFIX):
+        payload = payload[len(MANIFEST_MARKER_PREFIX):]
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    schema = data.get("schema")
+    if schema != MANIFEST_SCHEMA:
+        if schema is not None:
+            print(f"  NOTE: ignoring manifest with unsupported schema {schema!r} "
+                  f"(this build understands {MANIFEST_SCHEMA}).")
+        return None
+    return data
+
+
+def trim_manifest_for_marker(manifest: dict,
+                             max_chars: int = MANIFEST_MARKER_MAX_CHARS) -> dict:
+    """Drop the oldest run records until the encoded manifest fits `max_chars`.
+
+    Never drops sources or settings — those are the parts that cannot be
+    re-derived. If it still does not fit with no runs left, the manifest is
+    returned as-is and the caller writes what it can.
+    """
+    trimmed = dict(manifest)
+    runs = list(manifest.get("runs") or [])
+    while runs and len(MANIFEST_MARKER_PREFIX) + len(
+            encode_manifest({**trimmed, "runs": runs})) > max_chars:
+        runs = runs[1:]
+    trimmed["runs"] = runs
+    return trimmed
+
+
+def normalised_markers(obj) -> dict:
+    """GetMarkers() as {int frame: info}. Resolve returns float keys (96.0)."""
+    getter = getattr(obj, "GetMarkers", None)
+    if not callable(getter):
+        return {}
+    try:
+        raw = getter()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    markers = {}
+    try:
+        for frame, info in raw.items():
+            try:
+                markers[int(frame)] = info
+            except (TypeError, ValueError):
+                continue
+    except AttributeError:
+        return {}
+    return markers
+
+
+def first_free_frame(existing_frames, preferred: int,
+                     lower: Optional[int] = None,
+                     upper: Optional[int] = None) -> int:
+    """First frame free of `existing_frames` at or after `preferred`.
+
+    Falls back to searching backwards towards `lower` when the forward range is
+    exhausted. Returns -1 when every frame in [lower, upper] is taken. Resolve
+    permits only one marker per frame, so any code adding a marker near a
+    fraction of a clip has to be able to step off a collision.
+    """
+    taken = {int(f) for f in existing_frames}
+    if upper is None:
+        upper = preferred + len(taken) + 1
+    start = preferred if lower is None else max(preferred, lower)
+    for frame in range(start, upper + 1):
+        if frame not in taken:
+            return frame
+    if lower is not None:
+        for frame in range(min(preferred, upper), lower - 1, -1):
+            if frame not in taken:
+                return frame
+    return -1
+
+
+def find_manifest_marker_frame(markers: dict) -> Optional[int]:
+    """Frame of the manifest marker in a normalised markers dict, or None.
+
+    Scans for the customData prefix rather than using GetMarkerByCustomData,
+    which matches the whole string exactly and so cannot find a payload whose
+    tail changes on every run.
+    """
+    for frame in sorted(markers):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if isinstance(custom, str) and custom.startswith(MANIFEST_MARKER_PREFIX):
+            return frame
+    return None
+
+
+def read_manifest(timeline) -> tuple:
+    """Read the manifest off a timeline. Returns (manifest, source).
+
+    source is "metadata", "marker" or "none". Both stores are written on every
+    update; whichever answers first wins. Third-party metadata is the primary
+    because it is invisible, but it is a camera/sidecar concept and a timeline
+    has no media file, so the marker is what makes this work if Resolve declines
+    to persist it.
+    """
+    getter = getattr(timeline, "GetMediaPoolItem", None)
+    if callable(getter):
+        try:
+            mpi = getter()
+        except Exception:
+            mpi = None
+        if mpi is not None:
+            reader = getattr(mpi, "GetThirdPartyMetadata", None)
+            if callable(reader):
+                try:
+                    raw = reader(MANIFEST_KEY)
+                except Exception:
+                    raw = None
+                manifest = decode_manifest(raw)
+                if manifest is not None:
+                    return manifest, "metadata"
+
+    markers = normalised_markers(timeline)
+    frame = find_manifest_marker_frame(markers)
+    if frame is not None:
+        manifest = decode_manifest((markers[frame] or {}).get("customData"))
+        if manifest is not None:
+            return manifest, "marker"
+
+    return None, "none"
+
+
+def write_manifest(timeline, manifest: dict) -> dict:
+    """Write the manifest to both stores. Returns {"metadata": ok, "marker": ok}."""
+    result = {"metadata": False, "marker": False}
+    encoded = encode_manifest(manifest)
+
+    getter = getattr(timeline, "GetMediaPoolItem", None)
+    if callable(getter):
+        try:
+            mpi = getter()
+        except Exception:
+            mpi = None
+        if mpi is not None:
+            writer = getattr(mpi, "SetThirdPartyMetadata", None)
+            if callable(writer):
+                try:
+                    result["metadata"] = bool(writer(MANIFEST_KEY, encoded))
+                except Exception:
+                    result["metadata"] = False
+
+    markers = normalised_markers(timeline)
+    existing = find_manifest_marker_frame(markers)
+    if existing is not None:
+        try:
+            timeline.DeleteMarkerAtFrame(existing)
+        except Exception:
+            pass
+        markers.pop(existing, None)
+
+    trimmed = trim_manifest_for_marker(manifest)
+    dropped = len(manifest.get("runs") or []) - len(trimmed.get("runs") or [])
+    if dropped > 0:
+        print(f"  NOTE: manifest marker trimmed by {dropped} old run record(s) "
+              f"to stay under {MANIFEST_MARKER_MAX_CHARS} characters.")
+
+    frame = existing if existing is not None else first_free_frame(markers, 0, lower=0)
+    if frame < 0:
+        print("  WARNING: no free frame for the manifest marker.")
+        return result
+
+    note = (f"Managed by Generate All Clips Timeline PRO.\n"
+            f"Run {manifest.get('run_counter', 0)} · "
+            f"{manifest.get('last_run_utc', '')}\n"
+            f"Sources: "
+            + ", ".join(s.get("name", "?") for s in manifest.get("sources") or []))
+    try:
+        result["marker"] = bool(timeline.AddMarker(
+            frame, MANIFEST_MARKER_COLOR, MANIFEST_MARKER_NAME, note, 1,
+            MANIFEST_MARKER_PREFIX + encode_manifest(trimmed),
+        ))
+    except Exception:
+        result["marker"] = False
+
+    if not result["metadata"] and not result["marker"]:
+        print("  WARNING: could not persist the manifest — this timeline will "
+              "not be recognised as an All Clips timeline on the next run.")
+    return result
 
 
 # ---------------------------------------------------------------------------
