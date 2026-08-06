@@ -56,3 +56,33 @@ If you change a script's behaviour, extend the matching test in the same commit.
 
 Non-trivial changes should be made on a new branch off `main`, not directly
 on `main`.
+
+## Releases
+
+Releases are cut by pushing a `vX.Y.Z` tag on `main`. That tag is the **repo's**
+version and is independent of the per-script `Version: X.Y` headers above — a
+release rolls up whatever versions the scripts happen to carry at that commit.
+
+Pushing the tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
+which runs the offline Python tests, builds the zip, and publishes a GitHub
+release with GitHub's generated changelog under an install/versions header.
+
+```bash
+git tag -a v1.0.1 -m "Release v1.0.1" && git push origin v1.0.1
+```
+
+Choose the tag by what changed for users: **patch** for fixes, **minor** for a
+new script or feature, **major** for a break in how a script is used.
+
+[tools/make_release_zip.py](tools/make_release_zip.py) builds the payload — every
+`*.py` and `*.lua` at the repo root plus `README.md`, under a `ResolveConformTools/`
+folder, with a generated `VERSIONS.txt`. It **fails the release** if any root
+script is missing its `Version:` header. Run it locally to check what a tag would
+ship, before tagging:
+
+```bash
+python tools/make_release_zip.py 1.0.1 --out dist
+```
+
+The Lua tests and the live Python tests cannot run on a GitHub runner (no
+Resolve, no `fuscript`), so run those locally before tagging.

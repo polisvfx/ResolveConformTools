@@ -1,0 +1,66 @@
+name: Release
+
+# Pushing a vX.Y.Z tag ships a release. Nothing else triggers this.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # The offline half of the suite. The Lua tests need Resolve's fuscript and
+      # test_part_d / final_live_check need a running Resolve, so neither can run
+      # here -- run those locally before tagging (see tests/README.md).
+      - name: Run offline tests
+        run: |
+          for t in test_part_a test_part_b test_part_e test_part_f; do
+            echo "::group::$t"
+            python "tests/$t.py"
+            echo "::endgroup::"
+          done
+
+      - name: Read version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build the zip
+        run: |
+          python tools/make_release_zip.py "$VERSION" \
+            --out dist --notes-out dist/notes-header.md
+
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub's own changelog since the previous tag, under our header.
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${GITHUB_REF_NAME}" \
+            --jq .body > dist/changelog.md || echo "" > dist/changelog.md
+          cat dist/notes-header.md > dist/notes.md
+          printf '\n' >> dist/notes.md
+          cat dist/changelog.md >> dist/notes.md
+          cat dist/notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/ResolveConformTools-${VERSION}.zip" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file dist/notes.md
