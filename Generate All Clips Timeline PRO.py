@@ -3314,6 +3314,7 @@ def run_update_workflow(
         "track": None,
         "cursor": end_frame + INTER_TIMELINE_GAP,
         "warned_record": False,
+        "first_new_record": None,
     }
     tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
              "dropped": 0, "skipped": 0, "failed": 0}
@@ -3411,6 +3412,8 @@ def run_update_workflow(
                   f"on the update track (status {status}).")
             return None
         duration = _record_placement(item, track, requested)
+        if state_box["first_new_record"] is None:
+            state_box["first_new_record"] = requested
         state_box["cursor"] = requested + max(1, duration) + INTER_TIMELINE_GAP
         _annotate_new(item, clip_info)
         write_update_marker(item, kind, run_no, note, marker_name,
@@ -3596,7 +3599,14 @@ def run_update_workflow(
         run_record["forked"] = True
     _save_manifest(run_record)
 
-    run_marker_frame = first_free_frame(normalised_markers(target), 1, lower=1)
+    # Sit the run marker at the start of what this run added, so the ruler reads
+    # as a changelog. Offset 0 is the manifest badge, hence lower=1.
+    preferred_run_frame = 1
+    if state_box["first_new_record"] is not None:
+        preferred_run_frame = max(
+            1, timeline_marker_offset(target, state_box["first_new_record"]))
+    run_marker_frame = first_free_frame(normalised_markers(target),
+                                        preferred_run_frame, lower=1)
     if run_marker_frame >= 0:
         try:
             target.AddMarker(
