@@ -1,6 +1,7 @@
 name: Release
 
-# Pushing a vX.Y.Z tag ships a release. The tag filter is a glob, not a regex.
+# Pushing a vX.Y.Z tag ships a release. The tag filter is a glob -- "*" is fine,
+# and so is the regex-looking "[0-9]+", which globs here read as "one or more".
 # workflow_dispatch is for re-running a tag that failed part way; run it against
 # the tag itself (`gh workflow run release.yml --ref v1.0.0`), since the version
 # comes from the ref name -- dispatching from a branch fails the build step.
