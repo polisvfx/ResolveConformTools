@@ -94,15 +94,23 @@ print(f"  project: {project.GetName()!r}")
 
 # Old path: the eager name map.
 name_map = {}
+name_counts = {}
 for i in range(1, project.GetTimelineCount() + 1):
     tl = project.GetTimelineByIndex(i)
     if tl is not None:
-        name_map[tl.GetName()] = tl
+        tl_name = tl.GetName()
+        name_map[tl_name] = tl
+        name_counts[tl_name] = name_counts.get(tl_name, 0) + 1
+colliding = {n for n, c in name_counts.items() if c > 1}
 print(f"  name map: {len(name_map)} entries from "
       f"{project.GetTimelineCount()} timelines")
-if len(name_map) != project.GetTimelineCount():
+if colliding:
     print(f"  *** NAME COLLISION: {project.GetTimelineCount() - len(name_map)} "
           f"timeline(s) are unreachable via the name map ***")
+    print(f"  duplicated names: {sorted(colliding)}")
+    print("  On these, the two paths SHOULD disagree - that is the whole reason")
+    print("  MediaPoolItem.GetTimeline() is used. A disagreement on a name that")
+    print("  is unique, though, is a real failure.")
 
 
 def walk(folder, out, depth=0):
@@ -123,7 +131,7 @@ other_items = [c for c in clips
 
 print(f"  media pool: {len(clips)} clips, {len(tl_items)} of type Timeline\n")
 
-agree = new_only = old_only = neither = mismatch = 0
+agree = new_only = old_only = neither = mismatch = expected_mismatch = 0
 for mpi in tl_items:
     name = mpi.GetName()
     new = get_timeline_for_media_pool_item(mpi)
@@ -140,6 +148,13 @@ for mpi in tl_items:
                 return ("<err>", str(exc), None)
         if sig(new) == sig(old):
             agree += 1
+        elif name in colliding:
+            # Two timelines share this name, so the name map returned whichever
+            # one it saw last. This is the case GetTimeline() exists to fix, and
+            # a disagreement here is the new path being right.
+            expected_mismatch += 1
+            print(f"  EXPECTED MISMATCH {name!r} (duplicate name): "
+                  f"new={sig(new)} old={sig(old)}")
         else:
             mismatch += 1
             print(f"  MISMATCH {name!r}: new={sig(new)} old={sig(old)}")
@@ -154,7 +169,11 @@ for mpi in tl_items:
         print(f"  NEITHER   {name!r}")
 
 print(f"\n  timeline items: agree={agree} mismatch={mismatch} "
-      f"new_only={new_only} old_only={old_only} neither={neither}")
+      f"expected_mismatch={expected_mismatch} new_only={new_only} "
+      f"old_only={old_only} neither={neither}")
+if expected_mismatch:
+    print(f"  {expected_mismatch} duplicate-name timeline(s) resolved correctly "
+          f"by GetTimeline() and incorrectly by the name map.")
 
 # The gate must still return None for non-timeline items.
 bad = 0
@@ -166,7 +185,7 @@ print(f"  non-timeline items sampled: {min(40, len(other_items))}, "
       f"unexpected Timeline returns: {bad}")
 
 ok = (mismatch == 0 and old_only == 0 and neither == 0 and bad == 0
-      and agree == len(tl_items))
+      and agree + expected_mismatch == len(tl_items))
 
 # ---------------------------------------------------------------------------
 # Update-mode capability probes
