@@ -90,8 +90,9 @@ MANIFEST_MARKER_PREFIX = "RCT_AllClipsManifest_v1:"
 MANIFEST_MARKER_COLOR = "Cream"  # the one colour no other pass in this file uses
 MANIFEST_MARKER_NAME = "All Clips Manifest"
 MANIFEST_MAX_RUNS = 20
-# The customData size limit is undocumented; keep the marker copy well clear of
-# anything that might be a cliff by dropping the oldest run records first.
+# The customData size limit is undocumented. A 16,000-character payload was
+# verified to round-trip intact on 21.0.4.5, so this cap is conservative on
+# purpose — the oldest run records are dropped first if it is ever reached.
 MANIFEST_MARKER_MAX_CHARS = 8000
 
 # customData prefix on the per-clip update marker. Carries the desired range the
@@ -208,8 +209,9 @@ class PlacedClip:
     """A clip found on an existing All Clips timeline during an update scan.
 
     record_end is EXCLUSIVE and is computed as GetStart() + GetDuration() rather
-    than from GetEnd(), whose inclusivity the API docs leave ambiguous. Duration
-    is unambiguous, so occupancy arithmetic never depends on that reading.
+    than from GetEnd(). Verified on 21.0.4.5 that GetEnd() is itself exclusive
+    (start 90100 + duration 79 = end 90179), so the two agree — but duration is
+    unambiguous by definition, so the arithmetic here does not rest on that.
     """
     item: object
     identity: str
@@ -950,9 +952,11 @@ def read_manifest(timeline) -> tuple:
 
     source is "metadata", "marker" or "none". Both stores are written on every
     update; whichever answers first wins. Third-party metadata is the primary
-    because it is invisible, but it is a camera/sidecar concept and a timeline
-    has no media file, so the marker is what makes this work if Resolve declines
-    to persist it.
+    because it is invisible. It was verified to round-trip on a timeline's
+    MediaPoolItem on 21.0.4.5 — which was not a given, since third-party metadata
+    is a camera/sidecar concept and a timeline has no media file — but survival
+    across a project save and reload has not been checked, and the visible marker
+    is the badge that tells a human this timeline is managed. Keep both.
     """
     getter = getattr(timeline, "GetMediaPoolItem", None)
     if callable(getter):
@@ -2624,10 +2628,14 @@ def build_update_customdata(run_no: int, kind: str, desired_start,
 def timeline_marker_offset(timeline, absolute_frame: int) -> int:
     """Timeline marker frames are offsets from GetStartFrame(), not absolutes.
 
-    Isolated here so there is one place to correct if a live probe says
-    otherwise — the docs say "timeline offset" but the existing preserve-layout
-    pass writes block markers at raw record frames, which only agree when the
-    timeline starts at zero.
+    Verified on 21.0.4.5: AddMarker(0, ...) on a timeline starting at frame
+    90000 comes back from GetMarkers() keyed 0.
+
+    Note that AppendToTimeline's recordFrame is the opposite — it is absolute,
+    in the same space as TimelineItem.GetStart() (asked for 90100, landed on
+    90100). Marker frames and record frames are therefore NOT interchangeable
+    on a timeline that does not start at zero, which is why every marker frame
+    in the update path goes through this function.
     """
     start = 0
     getter = getattr(timeline, "GetStartFrame", None)
@@ -2689,9 +2697,15 @@ def restore_item_state(item, state: ItemState, new_source_start: int,
                        skip_customdata_prefix: Optional[str] = None) -> dict:
     """Put a rebuilt clip's name, colour, flags and markers back.
 
+    TimelineItem marker frames are in source/media frame space — verified on
+    21.0.4.5: a marker added at GetSourceStartFrame() + 5 on a clip starting at
+    source frame 100 reads back keyed 105. So a restored marker lands on the same
+    picture even when the clip's head has moved, which is the whole reason the
+    frames are reused unchanged.
+
     Markers whose frame falls outside the new source range are dropped rather
-    than clamped: their picture is gone, so a marker at that frame would point
-    at something else.
+    than clamped: that picture is no longer in the clip, so a marker there would
+    point at something else.
     """
     result = {"name": False, "color": False, "flags": 0, "markers": 0,
               "markers_dropped": 0, "enabled": False}
@@ -3330,7 +3344,13 @@ def run_update_workflow(
         return state_box["track"]
 
     def _record_placement(item, track_index, requested_record):
-        """Book a placed item into the occupancy map. Returns its duration."""
+        """Book a placed item into the occupancy map. Returns its duration.
+
+        recordFrame was verified to be absolute, in the same space as GetStart(),
+        on 21.0.4.5. The check below stays as a guard: it is undocumented, and a
+        silent frame-space change would otherwise scatter clips across the
+        timeline with nothing in the log to explain it.
+        """
         try:
             actual_start = int(item.GetStart())
             duration = int(item.GetDuration())

@@ -48,12 +48,26 @@ only run when opted in:
 RCT_LIVE_WRITE=1 python tests/test_part_d.py
 ```
 
-They answer questions the scripting docs leave open: whether third-party metadata
-persists on a timeline's Media Pool item, the frame space of timeline and clip
-markers, whether `GetEnd()` is exclusive, how much `customData` survives a round
-trip, and whether `AppendToTimeline` will place a clip into a gap on a populated
-track. A "no" is information rather than a failure — each has a fallback in the
-script — so the probes report but never fail the suite on their own.
+They answer questions the scripting docs leave open. A "no" is information rather
+than a failure — each has a fallback in the script — so the probes report but
+never fail the suite on their own.
+
+All of them were run on **21.0.4.5** on 2026-08-06 (25 fps project, timelines
+starting at frame 90000) and every answer came back the way the update path
+assumes:
+
+| Probe | Answer |
+|---|---|
+| `SetThirdPartyMetadata` on a timeline's Media Pool item | round-trips |
+| `customData` capacity | 16,000 chars kept intact |
+| Timeline marker frames | offsets from `GetStartFrame()` |
+| `AppendToTimeline` recordFrame + trackIndex into a gap | places exactly |
+| recordFrame frame space | absolute, same as `GetStart()` |
+| `GetEnd()` | exclusive (`start + duration`) |
+| TimelineItem marker frames | source/media frame space |
+
+Re-run them after a Resolve upgrade; the frame-space answers in particular are
+undocumented and are what the placement arithmetic rests on.
 
 Exit codes: `0` pass, `1` fail, `2` skipped because Resolve was unavailable. A skip
 is not a pass — `test_part_d.py` verifies nothing without a live project.
