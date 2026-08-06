@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.0
+Version: 2.1
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.0"
+TOOL_VERSION = "2.1"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -2253,6 +2253,23 @@ def run_workflow(
         _timeline_fps = None
     print(f"Timeline FPS: {_timeline_fps_str or '<unknown>'}")
 
+    # AppendToTimeline's recordFrame is ABSOLUTE - the same space as
+    # TimelineItem.GetStart() - while the preserve-layout cursor and its block
+    # markers are both zero-based offsets. A new timeline normally starts at
+    # 01:00:00:00, so passing the raw cursor puts every clip an hour before the
+    # timeline's own start: verified on 21.0.4.5, recordFrame=0 on a timeline
+    # starting at 90000 places the clip at absolute frame 0, GetEndFrame() does
+    # not even count it, and the block marker meant to label it lands 90000
+    # frames away. Rebase the cursor onto the timeline start so clips and
+    # markers agree.
+    _timeline_start = 0
+    _start_getter = getattr(new_timeline, "GetStartFrame", None)
+    if callable(_start_getter):
+        try:
+            _timeline_start = int(_start_getter() or 0)
+        except Exception:
+            _timeline_start = 0
+
     # Pre-create video tracks to cover the highest source_track_index
     if preserve_track_layout and all_clip_infos:
         max_track = max(ci.source_track_index for ci in all_clip_infos)
@@ -2296,7 +2313,8 @@ def run_workflow(
             media_pool, new_timeline, clip_info,
             video_only=video_only,
             track_index=clip_info.source_track_index if preserve_track_layout else None,
-            record_frame=clip_info.timeline_inpoint if preserve_track_layout else None,
+            record_frame=(_timeline_start + clip_info.timeline_inpoint
+                          if preserve_track_layout else None),
             timeline_fps=_timeline_fps,
         )
         if _status == "error":
@@ -3312,16 +3330,25 @@ def run_update_workflow(
 
     occupancy = build_track_occupancy(target)
 
-    end_frame = timeline_start
-    end_getter = getattr(target, "GetEndFrame", None)
-    if callable(end_getter):
-        try:
-            end_frame = int(end_getter() or timeline_start)
-        except Exception:
-            end_frame = timeline_start
+    # Anchor the run's cursor on where the video content actually ends, not on
+    # GetEndFrame(). They agree on a normally built timeline, but a timeline
+    # whose clips sit before its declared start - which is what preserve-layout
+    # produced before the recordFrame rebase - reports an end frame that does not
+    # account for its own content, and new clips would land an hour past it.
+    content_end = None
     for bounds in occupancy.values():
         for _start, bound_end in bounds:
-            end_frame = max(end_frame, bound_end)
+            content_end = bound_end if content_end is None else max(content_end,
+                                                                   bound_end)
+    if content_end is None:
+        content_end = timeline_start
+        end_getter = getattr(target, "GetEndFrame", None)
+        if callable(end_getter):
+            try:
+                content_end = int(end_getter() or timeline_start)
+            except Exception:
+                content_end = timeline_start
+    end_frame = content_end
 
     track_name = format_update_track_name(run_no, now_local.split(" ")[0])
     state_box = {

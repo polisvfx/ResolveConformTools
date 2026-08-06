@@ -287,6 +287,16 @@ class MediaPool:
     def GetSelectedClips(self):
         return self.selection
 
+    def CreateEmptyTimeline(self, name):
+        # Real timelines start at 01:00:00:00, which is the whole point of the
+        # preserve-layout regression below.
+        created = Timeline(name, f"tl:{name}", {1: []}, start_frame=86400,
+                           mpi=MPI(name, f"mid_{name}", "", clip_type="Timeline"))
+        created.mpi.timeline = created
+        self.project.timelines.append(created)
+        self.project.current = created
+        return created
+
     def AppendToTimeline(self, clip_infos):
         timeline = self.project.current
         placed = []
@@ -829,6 +839,65 @@ for mode, func in ((mod.MODE_CREATE, fresh.run_workflow),
     check(f"{mode} kwargs satisfy the workflow signature", bound, True)
     if not bound:
         print(f"       {problem}")
+
+
+# ---------------------------------------------------------------------------
+# 12. Preserve Source Track Layout record frames (create mode)
+# ---------------------------------------------------------------------------
+#
+# Regression for a bug that predates update mode. AppendToTimeline's recordFrame
+# is absolute - the same space as GetStart() - while the preserve-layout cursor
+# and its block markers are zero-based offsets from the timeline start. Passing
+# the raw cursor put every clip an hour before the timeline's own start, with the
+# block marker meant to label it 90000 frames away. Verified on 21.0.4.5 before
+# fixing: recordFrame=0 on a timeline starting at 90000 really does place the
+# clip at absolute frame 0.
+
+print("\n== preserve track layout record frames ==")
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400)])
+mod = load(res)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="Layout_Test",
+        selection_method="Current Selection",
+        sorting_method="None",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=False,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=True,
+        merge_by_source_file=True,
+    )
+
+created = project.timelines[-1]
+check("a timeline was created", created.GetName(), "Layout_Test")
+record_frames = [c.get("recordFrame") for c in project.media_pool.append_calls
+                 if c.get("recordFrame") is not None]
+check_true("preserve layout passes explicit record frames", record_frames)
+check("no clip is placed before the timeline start",
+      [f for f in record_frames if f < created.start_frame], [])
+
+placed_starts = sorted(i.GetStart() for i in created.all_items())
+check("the first clip sits at the timeline start",
+      placed_starts[0], created.start_frame)
+
+# The block marker and the block it labels must land on the same picture.
+marker_offsets = sorted(created.markers)
+check_true("a source-timeline block marker was written", marker_offsets)
+check("the block marker is aligned with the block it labels",
+      created.start_frame + marker_offsets[0], placed_starts[0])
+
+# Relative layout within the block is still preserved.
+check("relative spacing between clips is unchanged",
+      placed_starts[1] - placed_starts[0], 101)
 
 
 # ---------------------------------------------------------------------------
