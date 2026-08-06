@@ -76,6 +76,22 @@ MANIFEST_MAX_RUNS = 20
 # anything that might be a cliff by dropping the oldest run records first.
 MANIFEST_MARKER_MAX_CHARS = 8000
 
+# customData prefix on the per-clip update marker. Carries the desired range the
+# clip was last reconciled against, which is what stops a clip whose target is
+# physically unreachable from being rebuilt on every run forever.
+UPDATE_MARKER_PREFIX = "RCT_UPD:"
+# A source range must move by more than this many frames before the update
+# rebuilds the clip. Must stay >= SLIP_TOLERANCE so last run's own placement slip
+# never reads as a change; 3 also matches MIN_FRAME_DIFF, the "difference that
+# matters" threshold the retime detector already uses.
+UPDATE_CHANGE_TOLERANCE = 3
+# Free space after the last clip on a track: there is always more timeline.
+FREE_SPACE_UNBOUNDED = 1 << 30
+# Spare frames to reserve on each side when deciding whether a grown clip may
+# also use the append helper's +/-1 widening fallback. Without it, widening
+# collides with the neighbour and the append fails.
+REBUILD_FIT_SLACK = 1
+
 
 # ---------------------------------------------------------------------------
 # Data Classes
@@ -132,6 +148,40 @@ class RetimeKeyframe:
     """A single keyframe from the FCP XML Time Remap effect."""
     when: int
     value: int
+
+
+@dataclass
+class PlacedClip:
+    """A clip found on an existing All Clips timeline during an update scan.
+
+    record_end is EXCLUSIVE and is computed as GetStart() + GetDuration() rather
+    than from GetEnd(), whose inclusivity the API docs leave ambiguous. Duration
+    is unambiguous, so occupancy arithmetic never depends on that reading.
+    """
+    item: object
+    identity: str
+    source_start: int          # inclusive, normalised so start <= end
+    source_end: int            # inclusive
+    record_start: int          # absolute timeline frame
+    record_end: int            # exclusive
+    track_index: int
+    name: str = ""
+    # Desired range this clip was last reconciled against, read back from its own
+    # update marker. None when the clip has never been through an update.
+    accepted_start: Optional[int] = None
+    accepted_end: Optional[int] = None
+    linked_item_count: int = 0
+
+
+@dataclass
+class ClipDiff:
+    """One reconciliation decision: what to do about one shot."""
+    identity: str
+    kind: str                          # unchanged|extended|shortened|both|new|dropped
+    clip_info: Optional[ClipInfo] = None   # None for "dropped"
+    placed: Optional[PlacedClip] = None    # None for "new"
+    head_delta: int = 0                # desired_start - placed_start; <0 grows
+    tail_delta: int = 0                # desired_end - placed_end;    >0 grows
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1749,328 @@ def build_retime_marker_text(clip_info: ClipInfo) -> tuple:
         if clip_info.is_reversed:
             marker_note += " (originally reversed)"
     return marker_text, marker_note
+
+
+# ---------------------------------------------------------------------------
+# Update Diff
+# ---------------------------------------------------------------------------
+
+def read_accepted_range(markers: dict) -> tuple:
+    """(accepted_start, accepted_end) from a clip's own update marker.
+
+    Returns (None, None) when the clip has never been through an update. If more
+    than one update marker survives, the highest run number wins.
+    """
+    best_run = None
+    best = (None, None)
+    for frame in sorted(markers):
+        info = markers[frame] or {}
+        custom = info.get("customData") or ""
+        if not isinstance(custom, str) or not custom.startswith(UPDATE_MARKER_PREFIX):
+            continue
+        try:
+            data = json.loads(custom[len(UPDATE_MARKER_PREFIX):])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        start, end = data.get("ds"), data.get("de")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        run = data.get("run")
+        run = run if isinstance(run, int) else -1
+        if best_run is None or run >= best_run:
+            best_run = run
+            best = (start, end)
+    return best
+
+
+def diff_ranges(desired_ranges: list, placed_ranges: list) -> tuple:
+    """Greedy maximum-overlap matching between two lists of inclusive ranges.
+
+    Returns (pairs, unmatched_desired, unmatched_placed) where pairs is
+    [(desired_index, placed_index), ...].
+
+    Merging legitimately leaves several disjoint ranges for one source file, so
+    both sides are lists. Pairing them by index breaks the moment one range is
+    deleted or a new one lands in the middle, hence the overlap match. Ties are
+    broken by total endpoint distance and then by index, so the result is
+    deterministic for a given input.
+    """
+    candidates = []
+    for di, (d_start, d_end) in enumerate(desired_ranges):
+        for pi, (p_start, p_end) in enumerate(placed_ranges):
+            overlap = min(d_end, p_end) - max(d_start, p_start) + 1
+            if overlap <= 0:
+                continue
+            distance = abs(d_start - p_start) + abs(d_end - p_end)
+            candidates.append((-overlap, distance, di, pi))
+    candidates.sort()
+
+    pairs = []
+    used_desired = set()
+    used_placed = set()
+    for _overlap, _distance, di, pi in candidates:
+        if di in used_desired or pi in used_placed:
+            continue
+        used_desired.add(di)
+        used_placed.add(pi)
+        pairs.append((di, pi))
+    pairs.sort()
+
+    unmatched_desired = [i for i in range(len(desired_ranges)) if i not in used_desired]
+    unmatched_placed = [i for i in range(len(placed_ranges)) if i not in used_placed]
+    return pairs, unmatched_desired, unmatched_placed
+
+
+def classify_change(desired: tuple, placed: tuple, accepted=None,
+                    tolerance: int = UPDATE_CHANGE_TOLERANCE) -> str:
+    """'unchanged' | 'extended' | 'shortened' | 'both' for one matched pair.
+
+    Both ends are compared with abs(): the append helper's widening fallback can
+    legitimately place a clip a frame WIDER than requested, and a signed test
+    would read every widened clip as shortened forever and rebuild it on every
+    run.
+
+    `accepted` is the desired range this clip was last reconciled against. When
+    the current desired range still matches it, the clip is unchanged no matter
+    where it actually landed — that is the escape hatch for a target that is
+    physically unreachable (media clamp, unfixable slip, sub-clip range limit),
+    which would otherwise be retried forever.
+    """
+    desired_start, desired_end = desired
+    if accepted is not None:
+        accepted_start, accepted_end = accepted
+        if (accepted_start is not None and accepted_end is not None
+                and abs(desired_start - accepted_start) <= tolerance
+                and abs(desired_end - accepted_end) <= tolerance):
+            return "unchanged"
+
+    placed_start, placed_end = placed
+    head_delta = desired_start - placed_start
+    tail_delta = desired_end - placed_end
+    head_changed = abs(head_delta) > tolerance
+    tail_changed = abs(tail_delta) > tolerance
+
+    if not head_changed and not tail_changed:
+        return "unchanged"
+
+    grows = (head_changed and head_delta < 0) or (tail_changed and tail_delta > 0)
+    shrinks = (head_changed and head_delta > 0) or (tail_changed and tail_delta < 0)
+    if grows and shrinks:
+        return "both"
+    return "extended" if grows else "shortened"
+
+
+def plan_rebuild_placement(record_start: int, old_src: tuple,
+                           new_src: tuple) -> tuple:
+    """(new_record, new_duration, head_need, tail_need) for a rebuilt clip.
+
+    Anchored on the source frame, not the record frame: every source frame the
+    clip keeps stays at the same timeline position. A head trim therefore opens
+    the gap at the head instead of sliding the whole clip left, so anything the
+    user lined up against it on another track stays lined up.
+    """
+    old_start, old_end = old_src
+    new_start, new_end = new_src
+    old_duration = max(1, old_end - old_start + 1)
+    new_duration = max(1, new_end - new_start + 1)
+    new_record = record_start + (new_start - old_start)
+    head_need = max(0, record_start - new_record)
+    tail_need = max(0, (new_record + new_duration) - (record_start + old_duration))
+    return new_record, new_duration, head_need, tail_need
+
+
+def compute_free_space(bounds: list, index: int, timeline_start: int = 0) -> tuple:
+    """(free_before, free_after) around bounds[index] on a single track.
+
+    `bounds` is [(start, end_exclusive), ...] for one track, sorted by start.
+    The last clip on a track has unbounded room after it.
+    """
+    start, end = bounds[index]
+    if index == 0:
+        free_before = max(0, start - timeline_start)
+    else:
+        free_before = max(0, start - bounds[index - 1][1])
+    if index >= len(bounds) - 1:
+        free_after = FREE_SPACE_UNBOUNDED
+    else:
+        free_after = max(0, bounds[index + 1][0] - end)
+    return free_before, free_after
+
+
+def fits_in_place(free_before: int, free_after: int, head_need: int,
+                  tail_need: int, slack: int = 0) -> bool:
+    """Whether a rebuilt clip's growth fits the gaps around it.
+
+    Head and tail are independent: a clip can grow left into a gap while having
+    no room at all on the right. Call once with slack=0 to ask "does it fit",
+    then again with slack=REBUILD_FIT_SLACK to ask "and may it also widen".
+    Widening pushes out both ends at once, so it needs a spare frame on each
+    side even when only one end grew.
+    """
+    return (head_need + slack <= free_before
+            and tail_need + slack <= free_after)
+
+
+def group_desired_by_identity(clip_infos: list, merge_by_source_file: bool) -> dict:
+    """identity -> [ClipInfo] sorted by source start, for the diff."""
+    grouped: dict = {}
+    for clip_info in clip_infos:
+        identity = clip_identity_key(clip_info.media_pool_item, merge_by_source_file)
+        if not identity:
+            continue
+        grouped.setdefault(identity, []).append(clip_info)
+    for entries in grouped.values():
+        entries.sort(key=lambda ci: ci.start_frame)
+    return grouped
+
+
+def scan_timeline_placements(timeline, merge_by_source_file: bool) -> tuple:
+    """(placed_by_identity, unmanaged_items) for an existing All Clips timeline.
+
+    The timeline is the authority on what is currently placed — nothing is read
+    from the manifest here, so any reordering, retracking or deletion the user
+    did between runs is simply what we see.
+
+    Items with no MediaPoolItem (titles, generators, compound and Fusion clips)
+    cannot be identified as a shot and are returned separately so the caller can
+    report them. They are never touched.
+    """
+    placed_by_identity: dict = {}
+    unmanaged = []
+
+    try:
+        track_count = timeline.GetTrackCount("video")
+    except Exception:
+        track_count = 0
+
+    for track_index in range(1, (track_count or 0) + 1):
+        try:
+            items = timeline.GetItemListInTrack("video", track_index)
+        except Exception:
+            items = None
+        if not items:
+            continue
+
+        for item in items:
+            if item is None:
+                continue
+            try:
+                media_pool_item = item.GetMediaPoolItem()
+            except Exception:
+                media_pool_item = None
+            if not media_pool_item:
+                unmanaged.append(item)
+                continue
+
+            identity = clip_identity_key(media_pool_item, merge_by_source_file)
+            if not identity:
+                unmanaged.append(item)
+                continue
+
+            try:
+                raw_start = item.GetSourceStartFrame()
+                raw_end = item.GetSourceEndFrame()
+                record_start = item.GetStart()
+                duration = item.GetDuration()
+            except Exception:
+                unmanaged.append(item)
+                continue
+            if None in (raw_start, raw_end, record_start, duration):
+                unmanaged.append(item)
+                continue
+
+            # A clip the user reversed by hand would otherwise scan backwards.
+            source_start = min(raw_start, raw_end)
+            source_end = max(raw_start, raw_end)
+
+            accepted_start, accepted_end = read_accepted_range(normalised_markers(item))
+
+            linked_count = 0
+            linked_getter = getattr(item, "GetLinkedItems", None)
+            if callable(linked_getter):
+                try:
+                    linked = linked_getter() or []
+                    # An item lists itself among its linked items on some builds.
+                    linked_count = max(0, len(linked) - 1)
+                except Exception:
+                    linked_count = 0
+
+            name = ""
+            try:
+                name = item.GetName() or ""
+            except Exception:
+                name = ""
+
+            placed_by_identity.setdefault(identity, []).append(PlacedClip(
+                item=item,
+                identity=identity,
+                source_start=source_start,
+                source_end=source_end,
+                record_start=record_start,
+                record_end=record_start + duration,
+                track_index=track_index,
+                name=name,
+                accepted_start=accepted_start,
+                accepted_end=accepted_end,
+                linked_item_count=linked_count,
+            ))
+
+    for entries in placed_by_identity.values():
+        entries.sort(key=lambda pc: pc.source_start)
+
+    return placed_by_identity, unmanaged
+
+
+def diff_desired_vs_placed(desired_by_identity: dict, placed_by_identity: dict,
+                           tolerance: int = UPDATE_CHANGE_TOLERANCE) -> list:
+    """Reconcile desired against placed. Returns [ClipDiff] in identity order."""
+    diffs = []
+    identities = sorted(set(desired_by_identity) | set(placed_by_identity))
+
+    for identity in identities:
+        desired = desired_by_identity.get(identity) or []
+        placed = placed_by_identity.get(identity) or []
+        desired_ranges = [(ci.start_frame, ci.end_frame) for ci in desired]
+        placed_ranges = [(pc.source_start, pc.source_end) for pc in placed]
+
+        pairs, only_desired, only_placed = diff_ranges(desired_ranges, placed_ranges)
+
+        for desired_index, placed_index in pairs:
+            clip_info = desired[desired_index]
+            placed_clip = placed[placed_index]
+            kind = classify_change(
+                desired_ranges[desired_index], placed_ranges[placed_index],
+                (placed_clip.accepted_start, placed_clip.accepted_end), tolerance,
+            )
+            diffs.append(ClipDiff(
+                identity=identity,
+                kind=kind,
+                clip_info=clip_info,
+                placed=placed_clip,
+                head_delta=clip_info.start_frame - placed_clip.source_start,
+                tail_delta=clip_info.end_frame - placed_clip.source_end,
+            ))
+
+        for desired_index in only_desired:
+            diffs.append(ClipDiff(identity=identity, kind="new",
+                                  clip_info=desired[desired_index]))
+
+        for placed_index in only_placed:
+            diffs.append(ClipDiff(identity=identity, kind="dropped",
+                                  placed=placed[placed_index]))
+
+    return diffs
+
+
+def summarise_diffs(diffs: list) -> dict:
+    """Counts per change kind, for logging and the manifest run record."""
+    counts = {"unchanged": 0, "extended": 0, "shortened": 0, "both": 0,
+              "new": 0, "dropped": 0}
+    for diff in diffs:
+        counts[diff.kind] = counts.get(diff.kind, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------

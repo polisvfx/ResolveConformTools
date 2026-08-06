@@ -45,18 +45,33 @@ WANTED = [
     "clip_identity_key",
     "build_manifest", "manifest_add_run", "encode_manifest", "decode_manifest",
     "trim_manifest_for_marker", "first_free_frame", "find_manifest_marker_frame",
+    "read_accepted_range", "diff_ranges", "classify_change",
+    "plan_rebuild_placement", "compute_free_space", "fits_in_place",
 ]
 
 
+_SELF_CONTAINED_NODES = (
+    ast.Constant, ast.BinOp, ast.UnaryOp, ast.Tuple, ast.List, ast.Set, ast.Dict,
+    ast.operator, ast.unaryop, ast.expr_context,
+)
+
+
+def _is_self_contained(node):
+    """True when an expression can be evaluated with no names in scope."""
+    return all(isinstance(sub, _SELF_CONTAINED_NODES) for sub in ast.walk(node))
+
+
 def extract(path, names):
-    """Pull the named top-level functions, plus every literal module constant.
+    """Pull the named top-level functions, plus every self-contained constant.
 
     Two wrinkles beyond the Part A/B harness:
 
     - Constants come along because functions like merge_changelog() default an
       argument to a module-level constant, and defaults are evaluated at def
-      time. Only assignments whose value is a literal are taken, which skips
-      SORT_METHODS (its values are function references that are not extracted).
+      time. Only assignments whose value is self-contained (a literal, or
+      arithmetic over literals such as `1 << 30`) are taken, which skips
+      SORT_METHODS: its values are function references that are not extracted,
+      so evaluating it would raise NameError.
     - The module is compiled with the `annotations` future flag, matching the
       real file's `from __future__ import annotations`. Without it, an
       annotation like `-> Optional[str]` is evaluated at def time and raises
@@ -73,10 +88,8 @@ def extract(path, names):
         target = n.targets[0]
         if not isinstance(target, ast.Name) or not target.id.isupper():
             continue
-        try:
-            ast.literal_eval(n.value)
-        except (ValueError, TypeError, SyntaxError):
-            continue  # not a literal (e.g. SORT_METHODS) — leave it behind
+        if not _is_self_contained(n.value):
+            continue  # e.g. SORT_METHODS — references names we do not extract
         consts.append(n)
 
     nodes = [n for n in tree.body
@@ -105,6 +118,19 @@ decode_manifest = ns["decode_manifest"]
 trim_manifest_for_marker = ns["trim_manifest_for_marker"]
 first_free_frame = ns["first_free_frame"]
 find_manifest_marker_frame = ns["find_manifest_marker_frame"]
+
+read_accepted_range = ns["read_accepted_range"]
+diff_ranges = ns["diff_ranges"]
+classify_change = ns["classify_change"]
+plan_rebuild_placement = ns["plan_rebuild_placement"]
+compute_free_space = ns["compute_free_space"]
+fits_in_place = ns["fits_in_place"]
+
+UPDATE_MARKER_PREFIX = ns["UPDATE_MARKER_PREFIX"]
+UPDATE_CHANGE_TOLERANCE = ns["UPDATE_CHANGE_TOLERANCE"]
+FREE_SPACE_UNBOUNDED = ns["FREE_SPACE_UNBOUNDED"]
+REBUILD_FIT_SLACK = ns["REBUILD_FIT_SLACK"]
+SLIP_TOLERANCE = ns["SLIP_TOLERANCE"]
 
 MANIFEST_KEY = ns["MANIFEST_KEY"]
 MANIFEST_MARKER_PREFIX = ns["MANIFEST_MARKER_PREFIX"]
@@ -329,6 +355,238 @@ check("a None marker info is tolerated",
       find_manifest_marker_frame({0: None}), None)
 check("a non-string customData is tolerated",
       find_manifest_marker_frame({0: {"customData": 42}}), None)
+
+
+# ---------------------------------------------------------------------------
+# classify_change
+# ---------------------------------------------------------------------------
+
+print("\n== classify_change ==")
+
+check("tolerance is at least the observed placement slip",
+      UPDATE_CHANGE_TOLERANCE >= SLIP_TOLERANCE, True)
+
+for delta in (0, 1, 2, 3, -1, -2, -3):
+    check(f"head moved {delta:+d} is within tolerance",
+          classify_change((100 + delta, 200), (100, 200)), "unchanged")
+    check(f"tail moved {delta:+d} is within tolerance",
+          classify_change((100, 200 + delta), (100, 200)), "unchanged")
+
+check("head reaching further back is extended",
+      classify_change((96, 200), (100, 200)), "extended")
+check("tail reaching further on is extended",
+      classify_change((100, 204), (100, 200)), "extended")
+check("both ends reaching out is extended",
+      classify_change((96, 204), (100, 200)), "extended")
+check("head pulled in is shortened",
+      classify_change((104, 200), (100, 200)), "shortened")
+check("tail pulled in is shortened",
+      classify_change((100, 196), (100, 200)), "shortened")
+check("both ends pulled in is shortened",
+      classify_change((104, 196), (100, 200)), "shortened")
+check("head out and tail in is both",
+      classify_change((96, 196), (100, 200)), "both")
+check("head in and tail out is both",
+      classify_change((104, 204), (100, 200)), "both")
+
+# The regression that would otherwise churn the whole timeline on every run: the
+# append helper's widening fallback places a clip one frame wider than asked, so
+# a signed comparison would read it as shortened forever.
+check("a clip widened by 1 on both ends reads unchanged",
+      classify_change((100, 200), (99, 201)), "unchanged")
+check("a clip widened by 2 on both ends reads unchanged",
+      classify_change((100, 200), (98, 202)), "unchanged")
+
+# The escape hatch for a target that cannot physically be reached.
+check("accepted range matching desired forces unchanged",
+      classify_change((100, 200), (100, 150), (100, 200)), "unchanged")
+check("accepted range within tolerance of desired forces unchanged",
+      classify_change((100, 200), (100, 150), (102, 199)), "unchanged")
+check("a stale accepted range does not suppress a real change",
+      classify_change((100, 300), (100, 200), (100, 200)), "extended")
+check("a half-written accepted range is ignored",
+      classify_change((100, 300), (100, 200), (100, None)), "extended")
+check("no accepted range is ignored",
+      classify_change((100, 300), (100, 200), None), "extended")
+
+check("an explicit tolerance is honoured",
+      classify_change((110, 200), (100, 200), None, 20), "unchanged")
+
+
+# ---------------------------------------------------------------------------
+# diff_ranges
+# ---------------------------------------------------------------------------
+
+print("\n== diff_ranges ==")
+
+check("identical single ranges pair up",
+      diff_ranges([(0, 100)], [(0, 100)]), ([(0, 0)], [], []))
+check("nothing placed means everything is new",
+      diff_ranges([(0, 100), (500, 600)], []), ([], [0, 1], []))
+check("nothing desired means everything is dropped",
+      diff_ranges([], [(0, 100), (500, 600)]), ([], [], [0, 1]))
+check("non-overlapping ranges do not pair",
+      diff_ranges([(0, 100)], [(500, 600)]), ([], [0], [0]))
+check("abutting-but-disjoint ranges do not pair",
+      diff_ranges([(0, 100)], [(101, 200)]), ([], [0], [0]))
+check("a single frame of overlap is enough to pair",
+      diff_ranges([(0, 100)], [(100, 200)]), ([(0, 0)], [], []))
+
+# Index pairing would match desired[1] to placed[1] here and report the wrong
+# clip as changed. Overlap matching gets it right.
+check("a range deleted from the middle does not shift the rest",
+      diff_ranges([(0, 100), (900, 1000)],
+                  [(0, 100), (400, 500), (900, 1000)]),
+      ([(0, 0), (1, 2)], [], [1]))
+
+check("best overlap wins when two placed clips overlap one desired",
+      diff_ranges([(100, 200)], [(100, 120), (150, 210)]),
+      ([(0, 1)], [], [0]))
+check("best overlap wins when two desired ranges overlap one placed",
+      diff_ranges([(100, 120), (150, 210)], [(100, 200)]),
+      ([(1, 0)], [0], []))
+
+grew = diff_ranges([(90, 210)], [(100, 200)])
+check("a grown range still pairs with its old placement", grew, ([(0, 0)], [], []))
+
+many_desired = [(0, 100), (200, 300), (400, 500)]
+many_placed = [(210, 290), (0, 90), (450, 460)]
+once = diff_ranges(many_desired, many_placed)
+twice = diff_ranges(many_desired, many_placed)
+check("matching is deterministic", once, twice)
+check("out-of-order placements match by overlap, not position",
+      once, ([(0, 1), (1, 0), (2, 2)], [], []))
+
+# Equal overlap on both sides: the tie-break is total endpoint distance.
+check("equal overlap is broken by endpoint distance",
+      diff_ranges([(100, 200)], [(100, 200), (50, 250)]),
+      ([(0, 0)], [], [1]))
+
+
+# ---------------------------------------------------------------------------
+# plan_rebuild_placement
+# ---------------------------------------------------------------------------
+
+print("\n== plan_rebuild_placement ==")
+
+check("an unchanged range needs no room and does not move",
+      plan_rebuild_placement(1000, (500, 600), (500, 600)), (1000, 101, 0, 0))
+check("growing at the head moves the record frame back and needs room before",
+      plan_rebuild_placement(1000, (500, 600), (480, 600)), (980, 121, 20, 0))
+check("growing at the tail stays put and needs room after",
+      plan_rebuild_placement(1000, (500, 600), (500, 650)), (1000, 151, 0, 50))
+check("growing both ends needs room on both sides",
+      plan_rebuild_placement(1000, (500, 600), (480, 650)), (980, 171, 20, 50))
+check("trimming the head moves the record frame forward and needs no room",
+      plan_rebuild_placement(1000, (500, 600), (520, 600)), (1020, 81, 0, 0))
+check("trimming the tail stays put and needs no room",
+      plan_rebuild_placement(1000, (500, 600), (500, 580)), (1000, 81, 0, 0))
+check("a head grow with a bigger tail trim needs room only before",
+      plan_rebuild_placement(1000, (500, 600), (490, 550)), (990, 61, 10, 0))
+
+# The invariant the source-frame anchor exists for: a source frame kept by both
+# the old and the new range stays at the same timeline position.
+for kept in (520, 560, 599):
+    for new_src in ((480, 600), (500, 650), (510, 590), (490, 700)):
+        new_record = plan_rebuild_placement(1000, (500, 600), new_src)[0]
+        old_pos = 1000 + (kept - 500)
+        new_pos = new_record + (kept - new_src[0])
+        if old_pos != new_pos:
+            check(f"retained frame {kept} holds position for {new_src}",
+                  new_pos, old_pos)
+            break
+    else:
+        continue
+    break
+else:
+    check("retained source frames hold their timeline position", True, True)
+
+
+# ---------------------------------------------------------------------------
+# compute_free_space / fits_in_place
+# ---------------------------------------------------------------------------
+
+print("\n== compute_free_space ==")
+
+BOUNDS = [(0, 100), (150, 250), (250, 300)]
+check("first clip measures back to the timeline start",
+      compute_free_space(BOUNDS, 0, 0), (0, 50))
+check("middle clip sees the gap on each side",
+      compute_free_space(BOUNDS, 1, 0), (50, 0))
+check("last clip has unbounded room after it",
+      compute_free_space(BOUNDS, 2, 0), (0, FREE_SPACE_UNBOUNDED))
+check("a lone clip has room before it and unbounded room after",
+      compute_free_space([(100, 200)], 0, 0), (100, FREE_SPACE_UNBOUNDED))
+check("a non-zero timeline start is respected",
+      compute_free_space([(86400, 86500)], 0, 86400),
+      (0, FREE_SPACE_UNBOUNDED))
+check("a clip starting before the timeline start clamps to zero",
+      compute_free_space([(86300, 86500)], 0, 86400),
+      (0, FREE_SPACE_UNBOUNDED))
+check("abutting neighbours leave no room at all",
+      compute_free_space([(0, 100), (100, 200), (200, 300)], 1, 0), (0, 0))
+
+print("\n== fits_in_place ==")
+
+check("no growth always fits", fits_in_place(0, 0, 0, 0), True)
+check("growth into a big enough gap fits", fits_in_place(50, 50, 20, 30), True)
+check("growth into an exact gap fits with no slack",
+      fits_in_place(20, 30, 20, 30), True)
+check("growth into an exact gap fails once slack is required",
+      fits_in_place(20, 30, 20, 30, REBUILD_FIT_SLACK), False)
+check("head growth alone is blocked by the gap before",
+      fits_in_place(5, 500, 20, 0), False)
+check("tail growth alone is blocked by the gap after",
+      fits_in_place(500, 5, 0, 20), False)
+check("head growth alone ignores the gap after",
+      fits_in_place(50, 0, 20, 0), True)
+check("tail growth alone ignores the gap before",
+      fits_in_place(0, 50, 0, 20), True)
+check("unbounded room after accommodates any tail growth",
+      fits_in_place(0, FREE_SPACE_UNBOUNDED, 0, 99999), True)
+# Widening pushes out both ends at once, so it needs a spare frame on each side
+# even when only one end grew. A clip abutting its left neighbour cannot widen.
+check("abutting the previous clip rules out widening",
+      fits_in_place(0, FREE_SPACE_UNBOUNDED, 0, 99999, REBUILD_FIT_SLACK), False)
+check("one spare frame on each side permits widening",
+      fits_in_place(1, FREE_SPACE_UNBOUNDED, 0, 99999, REBUILD_FIT_SLACK), True)
+
+
+# ---------------------------------------------------------------------------
+# read_accepted_range
+# ---------------------------------------------------------------------------
+
+print("\n== read_accepted_range ==")
+
+
+def upd(run, ds, de):
+    return UPDATE_MARKER_PREFIX + json.dumps(
+        {"v": 1, "run": run, "kind": "extended", "ds": ds, "de": de})
+
+
+check("no markers means no accepted range", read_accepted_range({}), (None, None))
+check("an update marker yields its accepted range",
+      read_accepted_range({40: {"customData": upd(3, 1188, 1540)}}), (1188, 1540))
+check("unrelated markers are ignored",
+      read_accepted_range({10: {"customData": "RCT_RUN:{}"},
+                           20: {"customData": ""}}), (None, None))
+check("the highest run wins when two update markers survive",
+      read_accepted_range({10: {"customData": upd(2, 100, 200)},
+                           50: {"customData": upd(5, 300, 400)}}), (300, 400))
+check("marker order in the dict does not matter",
+      read_accepted_range({50: {"customData": upd(5, 300, 400)},
+                           10: {"customData": upd(2, 100, 200)}}), (300, 400))
+check("malformed json in an update marker is ignored",
+      read_accepted_range({10: {"customData": UPDATE_MARKER_PREFIX + "{oops"}}),
+      (None, None))
+check("a non-integer accepted range is ignored",
+      read_accepted_range({10: {"customData": UPDATE_MARKER_PREFIX
+                                + '{"ds":"a","de":"b"}'}}), (None, None))
+check("a missing accepted range is ignored",
+      read_accepted_range({10: {"customData": UPDATE_MARKER_PREFIX
+                                + '{"v":1,"run":2}'}}), (None, None))
+check("a None marker info is tolerated",
+      read_accepted_range({10: None}), (None, None))
 
 
 # ---------------------------------------------------------------------------
