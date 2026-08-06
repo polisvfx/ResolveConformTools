@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.1
+Version: 2.2
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.1"
+TOOL_VERSION = "2.2"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -99,11 +99,20 @@ MANIFEST_MARKER_MAX_CHARS = 8000
 # clip was last reconciled against, which is what stops a clip whose target is
 # physically unreachable from being rebuilt on every run forever.
 UPDATE_MARKER_PREFIX = "RCT_UPD:"
-# A source range must move by more than this many frames before the update
+# A source range must GROW by more than this many frames before the update
 # rebuilds the clip. Must stay >= SLIP_TOLERANCE so last run's own placement slip
 # never reads as a change; 3 also matches MIN_FRAME_DIFF, the "difference that
 # matters" threshold the retime detector already uses.
 UPDATE_CHANGE_TOLERANCE = 3
+# ...and by more than this many frames before a clip is SHORTENED. The two are
+# deliberately asymmetric: missing frames break a pull, surplus frames do not.
+# Rebuilding to remove a few frames of handle costs that clip its grade and its
+# Fusion comps and leaves a gap, which is a bad trade for frames nobody minds.
+# Observed in practice: an All Clips timeline built by an earlier version of this
+# script carried a reversed clip with 5 frames of extra handle — real, harmless,
+# and not worth a rebuild. 12 frames is about half a second at 24/25 fps, well
+# clear of handle and rounding differences but far below a genuine edit change.
+UPDATE_SHRINK_TOLERANCE = 12
 # Free space after the last clip on a track: there is always more timeline.
 FREE_SPACE_UNBOUNDED = 1 << 30
 # Spare frames to reserve on each side when deciding whether a grown clip may
@@ -1905,19 +1914,26 @@ def diff_ranges(desired_ranges: list, placed_ranges: list) -> tuple:
 
 
 def classify_change(desired: tuple, placed: tuple, accepted=None,
-                    tolerance: int = UPDATE_CHANGE_TOLERANCE) -> str:
+                    tolerance: int = UPDATE_CHANGE_TOLERANCE,
+                    shrink_tolerance: int = UPDATE_SHRINK_TOLERANCE) -> str:
     """'unchanged' | 'extended' | 'shortened' | 'both' for one matched pair.
 
-    Both ends are compared with abs(): the append helper's widening fallback can
-    legitimately place a clip a frame WIDER than requested, and a signed test
-    would read every widened clip as shortened forever and rebuild it on every
-    run.
+    Each end is tested against a threshold chosen by DIRECTION, not by size:
+    growth beyond `tolerance` counts, shrink only beyond `shrink_tolerance`.
+    Missing frames break a pull; surplus frames are just handle, and rebuilding
+    to remove them costs the clip its grade for nothing.
 
-    `accepted` is the desired range this clip was last reconciled against. When
-    the current desired range still matches it, the clip is unchanged no matter
-    where it actually landed — that is the escape hatch for a target that is
-    physically unreachable (media clamp, unfixable slip, sub-clip range limit),
-    which would otherwise be retried forever.
+    That asymmetry also hardens the anti-churn guarantee. The append helper's
+    widening fallback can place a clip WIDER than requested, which reads as a
+    shrink on both ends — now measured against the larger threshold, so a
+    widened clip stays unchanged by an even wider margin.
+
+    `accepted` is the desired range this clip was last reconciled against, and is
+    compared with the tight tolerance because it asks a different question: has
+    the target itself moved? When it has not, the clip is unchanged no matter
+    where it actually landed — the escape hatch for a target that is physically
+    unreachable (media clamp, unfixable slip, sub-clip range limit), which would
+    otherwise be retried forever.
     """
     desired_start, desired_end = desired
     if accepted is not None:
@@ -1930,14 +1946,19 @@ def classify_change(desired: tuple, placed: tuple, accepted=None,
     placed_start, placed_end = placed
     head_delta = desired_start - placed_start
     tail_delta = desired_end - placed_end
-    head_changed = abs(head_delta) > tolerance
-    tail_changed = abs(tail_delta) > tolerance
 
-    if not head_changed and not tail_changed:
+    # head_delta < 0 reaches further back (growth); > 0 pulls the head in.
+    # tail_delta > 0 reaches further on (growth); < 0 pulls the tail in.
+    head_grows = head_delta < 0 and -head_delta > tolerance
+    head_shrinks = head_delta > 0 and head_delta > shrink_tolerance
+    tail_grows = tail_delta > 0 and tail_delta > tolerance
+    tail_shrinks = tail_delta < 0 and -tail_delta > shrink_tolerance
+
+    grows = head_grows or tail_grows
+    shrinks = head_shrinks or tail_shrinks
+
+    if not grows and not shrinks:
         return "unchanged"
-
-    grows = (head_changed and head_delta < 0) or (tail_changed and tail_delta > 0)
-    shrinks = (head_changed and head_delta > 0) or (tail_changed and tail_delta < 0)
     if grows and shrinks:
         return "both"
     return "extended" if grows else "shortened"
@@ -2105,7 +2126,8 @@ def scan_timeline_placements(timeline, merge_by_source_file: bool) -> tuple:
 
 
 def diff_desired_vs_placed(desired_by_identity: dict, placed_by_identity: dict,
-                           tolerance: int = UPDATE_CHANGE_TOLERANCE) -> list:
+                           tolerance: int = UPDATE_CHANGE_TOLERANCE,
+                           shrink_tolerance: int = UPDATE_SHRINK_TOLERANCE) -> list:
     """Reconcile desired against placed. Returns [ClipDiff] in identity order."""
     diffs = []
     identities = sorted(set(desired_by_identity) | set(placed_by_identity))
@@ -2123,7 +2145,8 @@ def diff_desired_vs_placed(desired_by_identity: dict, placed_by_identity: dict,
             placed_clip = placed[placed_index]
             kind = classify_change(
                 desired_ranges[desired_index], placed_ranges[placed_index],
-                (placed_clip.accepted_start, placed_clip.accepted_end), tolerance,
+                (placed_clip.accepted_start, placed_clip.accepted_end),
+                tolerance, shrink_tolerance,
             )
             diffs.append(ClipDiff(
                 identity=identity,
@@ -3235,6 +3258,8 @@ def run_update_workflow(
 
     print("")
     print(f"=== Update plan for '{target_name}' (run {run_no}) ===")
+    print(f"  acting on growth over {UPDATE_CHANGE_TOLERANCE}f and shrink over "
+          f"{UPDATE_SHRINK_TOLERANCE}f")
     print(f"  unchanged      {counts.get('unchanged', 0)}")
     print(f"  extended       {counts.get('extended', 0)}")
     print(f"  shortened      {counts.get('shortened', 0)}")

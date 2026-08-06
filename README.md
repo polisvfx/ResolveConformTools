@@ -61,8 +61,15 @@ the same run, which is why range changes are applied smallest-delta first.
 
 Other things to know:
 
-- **The tool owns source ranges.** A clip you trimmed by hand reads as changed
-  and is put back to the collected range. Every such rebuild is marked.
+- **Growing and shrinking are not treated alike.** A shot is rebuilt once it
+  needs more than 3 frames it does not have, but only once it is carrying more
+  than 12 surplus frames. Missing frames break a pull; surplus frames are just
+  handle, and rebuilding to remove a few of them would cost that clip its grade
+  for nothing. Both are constants near the top of the script
+  (`UPDATE_CHANGE_TOLERANCE`, `UPDATE_SHRINK_TOLERANCE`) if your handles differ.
+- **The tool owns source ranges.** A clip you trimmed by hand — by more than
+  those thresholds — reads as changed and is put back to the collected range.
+  Every such rebuild is marked.
 - **Video only.** A clip with linked audio is skipped: deleting the video item
   would orphan the audio. Generate with *Video Only* on, which is the default.
 - **The connection threshold matters between runs.** It decides which source

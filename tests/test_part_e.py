@@ -128,6 +128,7 @@ fits_in_place = ns["fits_in_place"]
 
 UPDATE_MARKER_PREFIX = ns["UPDATE_MARKER_PREFIX"]
 UPDATE_CHANGE_TOLERANCE = ns["UPDATE_CHANGE_TOLERANCE"]
+UPDATE_SHRINK_TOLERANCE = ns["UPDATE_SHRINK_TOLERANCE"]
 FREE_SPACE_UNBOUNDED = ns["FREE_SPACE_UNBOUNDED"]
 REBUILD_FIT_SLACK = ns["REBUILD_FIT_SLACK"]
 SLIP_TOLERANCE = ns["SLIP_TOLERANCE"]
@@ -363,14 +364,24 @@ check("a non-string customData is tolerated",
 
 print("\n== classify_change ==")
 
-check("tolerance is at least the observed placement slip",
+check("grow tolerance is at least the observed placement slip",
       UPDATE_CHANGE_TOLERANCE >= SLIP_TOLERANCE, True)
+# Missing frames break a pull; surplus frames are just handle. The thresholds are
+# deliberately asymmetric, and shrink must be the forgiving one.
+check("shrink tolerance is the more forgiving of the two",
+      UPDATE_SHRINK_TOLERANCE > UPDATE_CHANGE_TOLERANCE, True)
 
-for delta in (0, 1, 2, 3, -1, -2, -3):
-    check(f"head moved {delta:+d} is within tolerance",
-          classify_change((100 + delta, 200), (100, 200)), "unchanged")
-    check(f"tail moved {delta:+d} is within tolerance",
+for delta in (0, 1, 2, 3):
+    check(f"head grown by {delta} is within tolerance",
+          classify_change((100 - delta, 200), (100, 200)), "unchanged")
+    check(f"tail grown by {delta} is within tolerance",
           classify_change((100, 200 + delta), (100, 200)), "unchanged")
+
+for delta in (0, 4, 8, 12):
+    check(f"head pulled in by {delta} is within shrink tolerance",
+          classify_change((100 + delta, 200), (100, 200)), "unchanged")
+    check(f"tail pulled in by {delta} is within shrink tolerance",
+          classify_change((100, 200 - delta), (100, 200)), "unchanged")
 
 check("head reaching further back is extended",
       classify_change((96, 200), (100, 200)), "extended")
@@ -378,24 +389,36 @@ check("tail reaching further on is extended",
       classify_change((100, 204), (100, 200)), "extended")
 check("both ends reaching out is extended",
       classify_change((96, 204), (100, 200)), "extended")
-check("head pulled in is shortened",
-      classify_change((104, 200), (100, 200)), "shortened")
-check("tail pulled in is shortened",
-      classify_change((100, 196), (100, 200)), "shortened")
-check("both ends pulled in is shortened",
-      classify_change((104, 196), (100, 200)), "shortened")
-check("head out and tail in is both",
-      classify_change((96, 196), (100, 200)), "both")
-check("head in and tail out is both",
-      classify_change((104, 204), (100, 200)), "both")
+check("head pulled well in is shortened",
+      classify_change((113, 200), (100, 200)), "shortened")
+check("tail pulled well in is shortened",
+      classify_change((100, 187), (100, 200)), "shortened")
+check("both ends pulled well in is shortened",
+      classify_change((113, 187), (100, 200)), "shortened")
+check("head out and tail well in is both",
+      classify_change((96, 187), (100, 200)), "both")
+check("head well in and tail out is both",
+      classify_change((113, 204), (100, 200)), "both")
+
+# The asymmetry in action: a 4-frame surplus is left alone, a 4-frame shortfall
+# is not. This is the real case from a live dry run — a reversed clip carrying
+# five frames of extra handle, which is not worth a rebuild.
+check("a 4-frame surplus at the tail is left alone",
+      classify_change((100, 196), (100, 200)), "unchanged")
+check("a 4-frame shortfall at the tail is acted on",
+      classify_change((100, 204), (100, 200)), "extended")
+check("the live case: head -1, tail -4 reads unchanged",
+      classify_change((1505588, 1505637), (1505587, 1505641)), "unchanged")
 
 # The regression that would otherwise churn the whole timeline on every run: the
-# append helper's widening fallback places a clip one frame wider than asked, so
-# a signed comparison would read it as shortened forever.
+# append helper's widening fallback places a clip wider than asked, which is a
+# shrink on both ends and now measured against the forgiving threshold.
 check("a clip widened by 1 on both ends reads unchanged",
       classify_change((100, 200), (99, 201)), "unchanged")
 check("a clip widened by 2 on both ends reads unchanged",
       classify_change((100, 200), (98, 202)), "unchanged")
+check("a clip widened by 10 on both ends still reads unchanged",
+      classify_change((100, 200), (90, 210)), "unchanged")
 
 # The escape hatch for a target that cannot physically be reached.
 check("accepted range matching desired forces unchanged",
@@ -409,8 +432,12 @@ check("a half-written accepted range is ignored",
 check("no accepted range is ignored",
       classify_change((100, 300), (100, 200), None), "extended")
 
-check("an explicit tolerance is honoured",
-      classify_change((110, 200), (100, 200), None, 20), "unchanged")
+check("an explicit grow tolerance is honoured",
+      classify_change((80, 200), (100, 200), None, 20), "unchanged")
+check("an explicit shrink tolerance is honoured",
+      classify_change((100, 150), (100, 200), None, 3, 60), "unchanged")
+check("a tight explicit shrink tolerance bites",
+      classify_change((100, 196), (100, 200), None, 3, 2), "shortened")
 
 
 # ---------------------------------------------------------------------------
