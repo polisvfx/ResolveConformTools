@@ -48,6 +48,7 @@ WANTED = [
     "read_accepted_range", "diff_ranges", "classify_change",
     "plan_rebuild_placement", "compute_free_space", "fits_in_place",
     "build_settings_record", "check_retime_properties", "is_clip_retimed",
+    "build_retime_marker_text",
 ]
 
 
@@ -130,6 +131,8 @@ fits_in_place = ns["fits_in_place"]
 build_settings_record = ns["build_settings_record"]
 check_retime_properties = ns["check_retime_properties"]
 is_clip_retimed = ns["is_clip_retimed"]
+build_retime_marker_text = ns["build_retime_marker_text"]
+EXTREME_RETIME_PERCENT = ns["EXTREME_RETIME_PERCENT"]
 
 UPDATE_MARKER_PREFIX = ns["UPDATE_MARKER_PREFIX"]
 UPDATE_CHANGE_TOLERANCE = ns["UPDATE_CHANGE_TOLERANCE"]
@@ -702,6 +705,71 @@ check("a zero-length timeline item falls back to the property check",
       speed_of(0, 100), (False, None, False))
 check("...and still reads the property when there is one",
       speed_of(0, 100, {"Speed": "50.0"}), (True, 50.0, False))
+
+
+# ---------------------------------------------------------------------------
+# build_retime_marker_text — the extreme-retime branch
+# ---------------------------------------------------------------------------
+#
+# A whip reads as "Speed: 4616.0%", which tells a colourist nothing. Measured on
+# three real commercial conforms: ordinary slow/fast shots land at 200-300%,
+# genuine whips at 800-4616%. Past EXTREME_RETIME_PERCENT the marker reports the
+# source span instead, which is the number worth checking by eye.
+
+print("\n== build_retime_marker_text ==")
+
+
+class FakeClipInfo:
+    """Only the attributes build_retime_marker_text() reads."""
+
+    def __init__(self, pct=None, start=100, end=200, hold=False,
+                 non_linear=False, reversed_=False):
+        self.retime_percentage = pct
+        self.start_frame = start
+        self.end_frame = end
+        self.is_frame_hold = hold
+        self.is_non_linear_retime = non_linear
+        self.is_reversed = reversed_
+
+
+name, note = build_retime_marker_text(FakeClipInfo(pct=200.0))
+check("an ordinary retime keeps the percentage", name, "Retimed Clip")
+check_pct = "Speed: 200.0%" in note
+check("...and states it", check_pct, True)
+
+name, note = build_retime_marker_text(
+    FakeClipInfo(pct=4616.7, start=1000, end=1276))
+check("a whip is labelled as one", name, "Extreme Retime")
+check("it reports the source span, not the percentage",
+      "277 source frames (1000-1276)" in note, True)
+check("and does not lead with a meaningless number",
+      "4616" in note, False)
+
+# The boundary, both sides of it.
+check("exactly at the threshold counts as extreme",
+      build_retime_marker_text(FakeClipInfo(pct=EXTREME_RETIME_PERCENT))[0],
+      "Extreme Retime")
+check("just under it does not",
+      build_retime_marker_text(FakeClipInfo(pct=EXTREME_RETIME_PERCENT - 0.1))[0],
+      "Retimed Clip")
+
+# The earlier branches still win — an extreme percentage must not swallow them.
+check("a frame hold is still a frame hold",
+      build_retime_marker_text(FakeClipInfo(pct=9999.0, hold=True))[0],
+      "Frame Hold")
+check("a known non-linear retime still says so",
+      build_retime_marker_text(FakeClipInfo(pct=9999.0, non_linear=True))[0],
+      "Non-Linear Retime")
+
+# A missing percentage must not blow up the comparison.
+check("an unknown speed falls back to the ordinary marker",
+      build_retime_marker_text(FakeClipInfo(pct=None))[0], "Retimed Clip")
+check("...and says the speed is unknown",
+      "Unknown" in build_retime_marker_text(FakeClipInfo(pct=None))[1], True)
+
+check("a reversed whip is still flagged as reversed",
+      "originally reversed" in build_retime_marker_text(
+          FakeClipInfo(pct=800.0, reversed_=True))[1], True)
 
 
 # ---------------------------------------------------------------------------

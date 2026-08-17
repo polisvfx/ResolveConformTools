@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.5
+Version: 2.6
 
 Two modes.
 
@@ -43,9 +43,15 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.5"
+TOOL_VERSION = "2.6"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
+# Above this speed a clip is a whip or a ramp rather than a plain speed change,
+# and the percentage stops carrying information — the marker reports the source
+# span instead. Measured across three real commercial conform timelines: an
+# ordinary slow/fast shot lands at 200-300%, while genuine whips came back at
+# 800%, 1018%, 2020%, 3066% and 4616%. 400% sits in the empty gap between them.
+EXTREME_RETIME_PERCENT = 400.0
 DEFAULT_CONNECTION_THRESHOLD = 25
 INTER_TIMELINE_GAP = 25  # frames between source-timeline blocks in preserve-layout mode
 # AppendToTimeline can place clips with a small source-frame slip relative to
@@ -1899,6 +1905,23 @@ def build_retime_marker_text(clip_info: ClipInfo) -> tuple:
         marker_text = "Non-Linear Retime"
         marker_note = ("Speed curve/ramp detected. Source range may not "
                        "cover all frames used. Manual check recommended.")
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    elif (clip_info.retime_percentage is not None
+            and clip_info.retime_percentage >= EXTREME_RETIME_PERCENT):
+        # Past this speed the percentage stops being useful: a whip reads as
+        # "4616%", which tells a human nothing. Say what the clip actually
+        # spans instead, which is the number worth checking by eye.
+        span = clip_info.end_frame - clip_info.start_frame + 1
+        marker_text = "Extreme Retime"
+        # ASCII only: marker text round-trips through the scripting bridge and
+        # back out through GetMarkers on every subsequent run.
+        marker_note = (
+            f"Whip or speed ramp - check by hand. {span} source frames "
+            f"({clip_info.start_frame}-{clip_info.end_frame}) played over "
+            f"roughly {max(1, round(span * 100 / clip_info.retime_percentage))} "
+            f"timeline frames."
+        )
         if clip_info.is_reversed:
             marker_note += " (originally reversed)"
     else:

@@ -1,6 +1,6 @@
 --[[
 Timeline Generator with Duplicate Marker
-Version: 1.3
+Version: 1.4
 This script creates a master timeline from selected timelines and optionally marks duplicate clips.
 ]]--
 
@@ -13,6 +13,12 @@ SLIP_TOLERANCE = 2
 -- Max attempts to compensate for AppendToTimeline source-frame slip before
 -- accepting whatever Resolve produced and falling back to widening the request.
 SLIP_RETRY_LIMIT = 2
+-- Above this speed a clip is a whip or a ramp rather than a plain speed change,
+-- and the percentage stops carrying information -- the marker reports the source
+-- span instead. Measured across three real commercial conform timelines: an
+-- ordinary slow/fast shot lands at 200-300%, while genuine whips came back at
+-- 800%, 1018%, 2020%, 3066% and 4616%. 400% sits in the empty gap between them.
+EXTREME_RETIME_PERCENT = 400.0
 
 function print_table(t, indentation)
     if indentation == nil then
@@ -1253,11 +1259,35 @@ function main()
                             -- Use red color for retimed clips
                             local markerText = "Retimed Clip"
                             local speedValue = clip_info.retimePercentage or "Unknown"
-                            
-                            local success = pcall(function() 
-                                return timeline_clip.clip:AddMarker(markerPosition, "Red", markerText, 
-                                                 "Manual check recommended. Speed: " .. tostring(speedValue) .. "%", 1, "")
+                            local markerNote = "Manual check recommended. Speed: " ..
+                                               tostring(speedValue) .. "%"
+
+                            -- Past EXTREME_RETIME_PERCENT the percentage stops
+                            -- being useful -- a whip reads as "4616%", which
+                            -- tells a human nothing. Report what the clip spans
+                            -- instead, which is the number worth eyeballing.
+                            if type(clip_info.retimePercentage) == "number" and
+                               clip_info.retimePercentage >= EXTREME_RETIME_PERCENT then
+                                local lo = math.min(clip_info.startFrame, clip_info.endFrame)
+                                local hi = math.max(clip_info.startFrame, clip_info.endFrame)
+                                local span = hi - lo + 1
+                                markerText = "Extreme Retime"
+                                markerNote = "Whip or speed ramp -- check by hand. " ..
+                                    span .. " source frames (" .. lo .. "-" .. hi ..
+                                    ") played over roughly " ..
+                                    math.max(1, math.floor(span * 100 /
+                                        clip_info.retimePercentage + 0.5)) ..
+                                    " timeline frames."
+                            end
+
+                            -- pcall only reports whether AddMarker RAISED; it
+                            -- returns false on a refused frame without raising.
+                            local added = nil
+                            local no_error = pcall(function()
+                                added = timeline_clip.clip:AddMarker(markerPosition, "Red",
+                                                 markerText, markerNote, 1, "")
                             end)
+                            local success = no_error and added and true or false
                             
                             markerCount = markerCount + 1
                             
