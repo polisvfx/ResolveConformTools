@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.6
+Version: 2.7
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.6"
+TOOL_VERSION = "2.7"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -307,7 +307,24 @@ def parse_time_remap_keyframes(clip_element: ET.Element) -> list[RetimeKeyframe]
     """Extract Time Remap keyframes from a <clipitem> element.
 
     Looks for <effect><name>Time Remap</name> with <parameter> containing
-    <keyframe> entries with <when> and <value>.
+    <keyframe> entries with <when> and <value>. Resolve puts them under the
+    "graphdict" parameter.
+
+    Values are FRACTIONAL and must be parsed as floats. Measured on 21.0.4.5,
+    a hand-authored speed ramp exports as:
+
+        when=0     value=0
+        when=2226  value=7781.12
+        when=5094  value=3819.31
+        when=7009  value=8750.2
+        when=9264  value=3122.6
+
+    int("7781.12") raises ValueError, and the except below used to swallow it,
+    so every keyframe but an all-integer one was silently dropped. That left
+    most curves looking like a single keyframe: compute_source_range_from_
+    keyframes() then saw fewer than three and never reported a speed ramp, so
+    the XML pass reported nothing and expanded nothing. Rounding to whole
+    frames is right — a source frame is what gets pulled.
     """
     keyframes = []
     for effect in clip_element.findall(".//effect"):
@@ -321,8 +338,8 @@ def parse_time_remap_keyframes(clip_element: ET.Element) -> list[RetimeKeyframe]
                 if when_el is not None and value_el is not None:
                     try:
                         keyframes.append(RetimeKeyframe(
-                            when=int(when_el.text),
-                            value=int(value_el.text),
+                            when=int(round(float(when_el.text))),
+                            value=int(round(float(value_el.text))),
                         ))
                     except (ValueError, TypeError):
                         continue

@@ -23,6 +23,7 @@ import os
 import sys
 import types
 import contextlib
+import xml.etree.ElementTree as ET
 
 
 def _repo_root():
@@ -1185,6 +1186,71 @@ if plain is not None:
     check("the unretimed instance is left unmarked", red_markers(plain), [])
 if retimed is not None:
     check("the retimed instance is marked", red_markers(retimed), ["Retimed Clip"])
+
+
+# ---------------------------------------------------------------------------
+# 17. Time Remap keyframes are fractional
+# ---------------------------------------------------------------------------
+#
+# Resolve writes the retime curve into the "graphdict" parameter with
+# FRACTIONAL values. parse_time_remap_keyframes() used int() on them, so
+# int("7781.12") raised ValueError straight into the except that skips a
+# keyframe -- and every curve came back looking like a single keyframe, because
+# only an all-integer pair survived. compute_source_range_from_keyframes() then
+# saw fewer than three and never reported a ramp, so the whole XML pass found
+# nothing and expanded nothing.
+#
+# The keyframes below are copied verbatim from a hand-authored negative speed
+# ramp exported by 21.0.4.5. It runs forward to 7781, back to 3819, forward to
+# 8750, then ends at 3123 -- so the frames it touches reach 5631 past the
+# out-point the API reports, and a pull built from the API range alone would be
+# missing every one of them.
+
+print("\n== fractional Time Remap keyframes ==")
+
+RAMP_XML = """<clipitem>
+  <name>Ramp.mov</name><in>0</in><out>9264</out>
+  <filter><effect>
+    <name>Time Remap</name><effectid>timeremap</effectid>
+    <parameter><parameterid>speed</parameterid><value>94.464</value></parameter>
+    <parameter><parameterid>graphdict</parameterid>
+      <keyframe><when>0</when><value>0</value></keyframe>
+      <keyframe><when>2226</when><value>7781.12</value></keyframe>
+      <keyframe><when>5094</when><value>3819.31</value></keyframe>
+      <keyframe><when>7009</when><value>8750.2</value></keyframe>
+      <keyframe><when>9264</when><value>3122.6</value></keyframe>
+    </parameter>
+  </effect></filter>
+</clipitem>"""
+
+kfs = mod.parse_time_remap_keyframes(ET.fromstring(RAMP_XML))
+check("every keyframe is parsed, not just the integer one", len(kfs), 5)
+check("fractional values round to whole source frames",
+      [k.value for k in kfs], [0, 7781, 3819, 8750, 3123])
+check("and the times come through in order",
+      [k.when for k in kfs], [0, 2226, 5094, 7009, 9264])
+
+src_min, src_max, non_linear = mod.compute_source_range_from_keyframes(kfs)
+check("the curve's reach is found", (src_min, src_max), (0, 8750))
+check("a turning curve is classified non-linear", non_linear, True)
+
+# The frames at stake: the API would report the clip ending at 3119.
+check("the curve reaches past the API out-point", src_max > 3119, True)
+check("by the number of frames that would otherwise be lost",
+      src_max - 3119, 5631)
+
+# Integer-only keyframes must keep working — that is the case that used to be
+# the only one that did.
+INT_XML = RAMP_XML.replace("7781.12", "7781").replace("3819.31", "3819") \
+                  .replace("8750.2", "8750").replace("3122.6", "3123")
+check("integer keyframes still parse",
+      [k.value for k in mod.parse_time_remap_keyframes(ET.fromstring(INT_XML))],
+      [0, 7781, 3819, 8750, 3123])
+
+# Junk must still be skipped rather than raising.
+BAD_XML = RAMP_XML.replace("<value>7781.12</value>", "<value>oops</value>")
+check("an unparseable keyframe is skipped, not fatal",
+      len(mod.parse_time_remap_keyframes(ET.fromstring(BAD_XML))), 4)
 
 
 # ---------------------------------------------------------------------------
