@@ -48,7 +48,7 @@ def check_true(label, got):
     check(label, bool(got), True)
 
 
-def make_tree(scripts, extras=("README.md",)):
+def make_tree(scripts, extras=("README.md", "LICENSE")):
     """A throwaway repo: tools/make_release_zip.py plus the given root files."""
     root = tempfile.mkdtemp(prefix="rct_release_test_")
     os.makedirs(os.path.join(root, "tools"))
@@ -92,10 +92,11 @@ try:
 
     check("everything lands under one folder",
           [n for n in names if not n.startswith("ResolveConformTools/")], [])
-    check("it ships the scripts, the README and the manifest",
+    check("it ships the scripts, the README, the LICENSE and the manifest",
           names,
           ["ResolveConformTools/Alpha.py", "ResolveConformTools/Beta.lua",
-           "ResolveConformTools/README.md", "ResolveConformTools/VERSIONS.txt"])
+           "ResolveConformTools/LICENSE", "ResolveConformTools/README.md",
+           "ResolveConformTools/VERSIONS.txt"])
 
     check_true("the manifest names the release", "ResolveConformTools 1.2.3" in manifest)
     check_true("and records each script's own version", "Alpha.py" in manifest
@@ -121,13 +122,26 @@ finally:
 
 
 # ---------------------------------------------------------------------------
-print("\n== a missing README ==")
+print("\n== a missing README or LICENSE ==")
 
 root = make_tree({"Alpha.py": PY}, extras=())
 try:
     code, out = run(root, "1.2.3", "--out", "dist")
     check("the build fails", code, 1)
     check_true("and names what is missing", "README.md" in out)
+finally:
+    shutil.rmtree(root, ignore_errors=True)
+
+# The GPL requires every copy to carry the licence, and the zip is a copy, so a
+# missing LICENSE has to stop the release rather than quietly ship without it.
+root = make_tree({"Alpha.py": PY}, extras=("README.md",))
+try:
+    code, out = run(root, "1.2.3", "--out", "dist")
+    check("a build with no LICENSE fails too", code, 1)
+    check_true("and says which file is missing", "LICENSE" in out)
+    check_true("and writes no zip",
+               not os.path.isfile(os.path.join(root, "dist",
+                                               "ResolveConformTools-1.2.3.zip")))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 

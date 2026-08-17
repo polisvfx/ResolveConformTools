@@ -2,8 +2,9 @@
 """Build the downloadable zip for a ResolveConformTools release.
 
 Collects the scripts a user actually installs -- every ``*.py`` and ``*.lua`` at
-the repo root, plus the README -- and leaves the test suite, the CI config and
-the repo conventions behind. Everything lands under a single ``ResolveConformTools/``
+the repo root, plus the README and the LICENSE -- and leaves the test suite, the
+CI config and the repo conventions behind. The licence ships because the GPL
+requires every copy to carry it, and the zip is a copy. Everything lands under a single ``ResolveConformTools/``
 folder inside the zip, so extracting it into Resolve's ``Scripts/Utility``
 directory produces exactly the layout a git checkout would.
 
@@ -29,7 +30,7 @@ from pathlib import Path
 
 PACKAGE_NAME = "ResolveConformTools"
 SCRIPT_SUFFIXES = (".py", ".lua")
-EXTRA_FILES = ("README.md",)
+EXTRA_FILES = ("README.md", "LICENSE")
 MANIFEST_NAME = "VERSIONS.txt"
 
 VERSION_HEADER = re.compile(r"Version:\s*(\d+\.\d+)")

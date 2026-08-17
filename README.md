@@ -233,3 +233,17 @@ Searches every timeline in the current project for the selected clip and lists t
 
 ## Future Features
 The nuke integration is in its infancy and I am contemplating making it a bit more robust and useful, maybe creating a script that will generate a project config file that handles all variables like, project resolution, handles and so on. You could theoretically also reference nukescript templates and generate nuke scripts out of Resolve.
+
+## License
+
+Copyright (C) 2026 Maris
+
+Released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+Use it for anything, including paid client work, with no restriction. If you
+distribute a modified version you must ship its source under the same licence,
+which is what stops these scripts being folded into a closed product and sold.
+
+This program comes with ABSOLUTELY NO WARRANTY. It edits timelines in your
+project and some of what it does cannot be undone in one step — read the notes
+on Update Timeline mode before running it on work you care about.
