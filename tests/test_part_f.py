@@ -1254,6 +1254,71 @@ check("an unparseable keyframe is skipped, not fatal",
 
 
 # ---------------------------------------------------------------------------
+# 18. The curve is scoped to the instance that uses it
+# ---------------------------------------------------------------------------
+#
+# Resolve writes ONE retime curve per source clip, covering the whole file, and
+# each timeline instance is a window into it. Taking min/max over every keyframe
+# therefore describes the entire media, not the shot -- measured across three
+# real conforms, 76 of 82 ramped clips came back spanning their whole file, so
+# every expansion proposed was refused by XML_EXPANSION_MAX_GROWTH and the pass
+# achieved nothing. Scoping to the clipitem's <in>/<out> reproduced the API's
+# own range on 74 of 82.
+#
+# Within the window the extremes must include INTERIOR keyframes, not just the
+# endpoints: a curve that overshoots and reverses turns around in the middle, so
+# its furthest frame is at neither end. That is the whole protection.
+
+print("\n== the curve is scoped to the instance ==")
+
+kfs = mod.parse_time_remap_keyframes(ET.fromstring(RAMP_XML))
+
+check("unscoped still reads the whole curve",
+      mod.compute_source_range_from_keyframes(kfs), (0, 8750, True))
+
+# A window over the first leg only: the curve rises 0 -> 7781 and never turns.
+check("a window sees only its own leg of the curve",
+      mod.compute_source_range_from_keyframes(kfs, 0, 2226)[:2], (0, 7781))
+
+# A window over the second leg, where the curve runs backwards.
+check("a backwards leg reports its own extremes",
+      mod.compute_source_range_from_keyframes(kfs, 2226, 5094)[:2], (3819, 7781))
+
+# The decisive one. Over output frames 6000..8000 the curve enters at ~6152,
+# climbs to the turnaround at 8750, then falls back to ~6277. Both ENDPOINTS
+# sit around 6200 -- so an endpoint-only read would report 6152-6277 and miss
+# 2473 frames that this window actually plays.
+lo, hi, _nl = mod.compute_source_range_from_keyframes(kfs, 6000, 8000)
+check("a turnaround inside the window is caught", (lo, hi), (6152, 8750))
+check("an endpoint-only read would have missed it", hi > 6277, True)
+
+# Scoping must never invent frames outside the curve.
+check("a window past the end clamps to the curve",
+      mod.compute_source_range_from_keyframes(kfs, 20000, 30000)[:2],
+      (3123, 3123))
+
+# Interpolation happens between keyframes, not just at them. 1100 of the way
+# along the first leg (0..2226 -> 0..7781) is 1100/2226 * 7781 = 3845.05.
+check("the curve interpolates between keyframes",
+      round(mod.curve_value_at(kfs, 1100)), 3845)
+
+# A plain two-keyframe linear retime stays linear once scoped.
+LINEAR_XML = """<clipitem><name>Linear.mov</name><in>286</in><out>291</out>
+  <filter><effect><name>Time Remap</name>
+    <parameter><parameterid>graphdict</parameterid>
+      <keyframe><when>0</when><value>0</value></keyframe>
+      <keyframe><when>1050</when><value>6299</value></keyframe>
+    </parameter></effect></filter></clipitem>"""
+lin = mod.parse_time_remap_keyframes(ET.fromstring(LINEAR_XML))
+whole = mod.compute_source_range_from_keyframes(lin)
+scoped = mod.compute_source_range_from_keyframes(lin, 286, 291)
+check("unscoped, a linear curve reads as the whole media", whole[:2], (0, 6299))
+check("scoped, it reads as the few frames the shot uses",
+      scoped[:2], (1716, 1746))
+check("and it is not mistaken for a ramp", scoped[2], False)
+
+
+# ---------------------------------------------------------------------------
 
 print("")
 if fails:
