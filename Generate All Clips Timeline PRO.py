@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.4
+Version: 2.5
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.4"
+TOOL_VERSION = "2.5"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 DEFAULT_CONNECTION_THRESHOLD = 25
@@ -727,10 +727,17 @@ def is_clip_retimed(clip: TimelineClipData) -> tuple[bool, Optional[float], bool
     if source_duration <= 0:
         print(f"Warning: Source duration is {source_duration} for clip: {clip.name} (likely frame hold)")
         return (True, 0.0, False)
+    if timeline_duration <= 0:
+        print(f"Warning: Timeline duration is {timeline_duration} for clip: {clip.name}")
+        return check_retime_properties(clip)
 
-    # Calculate differences
+    # Calculate differences. Speed is source frames over timeline frames, which
+    # is the convention Resolve's own "Speed" clip property uses and therefore
+    # what check_retime_properties() returns from the other detection path: a
+    # clip at 50% occupies twice as many timeline frames as it has source
+    # frames. Dividing the other way round reported that clip as 200%.
     frame_diff = abs(timeline_duration - source_duration)
-    retime_percentage = (timeline_duration / source_duration) * 100
+    retime_percentage = (source_duration / timeline_duration) * 100
     percent_diff = abs(retime_percentage - 100)
 
     if frame_diff > MIN_FRAME_DIFF and percent_diff > MIN_PERCENT_DIFF:
@@ -812,6 +819,31 @@ def get_timeline_for_media_pool_item(media_pool_item):
 def utc_now_iso() -> str:
     """Current UTC time as 2026-08-06T12:22:33Z — the manifest's machine clock."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_settings_record(*, connection_threshold, merge_by_source_file,
+                          video_only, allow_disabled_clips, use_xml_retime,
+                          import_clip_names, mark_duplicates,
+                          mark_retimed_clips,
+                          preserve_track_layout=False) -> dict:
+    """The generation settings a manifest records.
+
+    One shape for both workflows: create stamps what it built with, update
+    compares against it and warns about the ones that reshape merged ranges.
+    They have to agree key for key or every first update would report settings
+    that "changed" only because the two lists were written separately.
+    """
+    return {
+        "connection_threshold": connection_threshold,
+        "merge_by_source_file": merge_by_source_file,
+        "video_only": video_only,
+        "allow_disabled_clips": allow_disabled_clips,
+        "use_xml_retime": use_xml_retime,
+        "import_clip_names": import_clip_names,
+        "mark_duplicates": mark_duplicates,
+        "mark_retimed_clips": mark_retimed_clips,
+        "preserve_track_layout": preserve_track_layout,
+    }
 
 
 def build_manifest(timeline_uid, timeline_name, sources, settings, now_iso,
@@ -2379,7 +2411,9 @@ def run_workflow(
                           if preserve_track_layout else None),
             timeline_fps=_timeline_fps,
         )
-        if _status == "error":
+        # "unknown" is an append that raised nothing but gave back no usable
+        # item, which means nothing was placed — a failure, not a success.
+        if _status in ("error", "unknown"):
             append_error_count += 1
         else:
             append_success_count += 1
@@ -2500,7 +2534,12 @@ def run_workflow(
                         else:
                             print(f"  Failed to add retime marker to clip: {timeline_clip.name}")
 
-                        break  # Only mark first match
+                    # Stop at the first match whether or not it was retimed —
+                    # like the duplicate and clip-name passes. Searching on past
+                    # a matching non-retimed ClipInfo would let a later one for
+                    # the same source name, with an overlapping range, put a red
+                    # marker on a clip that is not the one it describes.
+                    break
 
         print(f"Successfully added {success_count} retime markers out of "
               f"{marker_count} attempts.")
@@ -2601,6 +2640,43 @@ def run_workflow(
         print("")
     elif use_xml_retime:
         print("Range Audit: no clips grew significantly beyond API range.")
+
+    # Stamp the manifest. Which source timelines this was built from and with
+    # which settings is not recoverable by looking at the result, so without
+    # this an update on the timeline we just made has nothing to re-read and
+    # has to be adopted by hand. run_counter stays 0 and adopted stays False:
+    # it has had no update runs, and it was not taken over from anyone.
+    _p("Recording sources...", 0, 0)
+    new_timeline_uid = ""
+    _uid_getter = getattr(new_timeline, "GetUniqueId", None)
+    if callable(_uid_getter):
+        try:
+            new_timeline_uid = _uid_getter() or ""
+        except Exception:
+            new_timeline_uid = ""
+
+    manifest = build_manifest(
+        new_timeline_uid,
+        dst_timeline_name,
+        [timeline_source_record(name, tl) for name, tl in source_timelines],
+        build_settings_record(
+            connection_threshold=connection_threshold,
+            merge_by_source_file=merge_by_source_file,
+            video_only=video_only,
+            allow_disabled_clips=allow_disabled_clips,
+            use_xml_retime=use_xml_retime,
+            import_clip_names=import_clip_names,
+            mark_duplicates=mark_duplicates,
+            mark_retimed_clips=mark_retimed_clips,
+            preserve_track_layout=preserve_track_layout,
+        ),
+        utc_now_iso(),
+        TOOL_VERSION,
+    )
+    stored = write_manifest(new_timeline, manifest)
+    if stored["metadata"] or stored["marker"]:
+        print(f"Recorded {len(source_timelines)} source timeline(s) on "
+              f"'{dst_timeline_name}'. Update mode can re-read them.")
 
     _p("Done!", 1, 1)
     print("Done!")
@@ -3137,20 +3213,25 @@ def run_update_workflow(
             target_uid = ""
     print(f"Update target: '{target_name}' (uid {target_uid or '<unavailable>'})")
 
-    current_settings = {
-        "connection_threshold": connection_threshold,
-        "merge_by_source_file": merge_by_source_file,
-        "video_only": video_only,
-        "allow_disabled_clips": allow_disabled_clips,
-        "use_xml_retime": use_xml_retime,
-        "import_clip_names": import_clip_names,
-        "mark_duplicates": mark_duplicates,
-        "mark_retimed_clips": mark_retimed_clips,
-    }
-
     manifest, store = read_manifest(target)
     adopted = manifest is None
     forked = False
+
+    # Preserve Source Track Layout is a create-time layout, so update mode has
+    # no value of its own to record: carry the recorded one forward rather than
+    # stamping this run's False over it and losing the note it drives below.
+    current_settings = build_settings_record(
+        connection_threshold=connection_threshold,
+        merge_by_source_file=merge_by_source_file,
+        video_only=video_only,
+        allow_disabled_clips=allow_disabled_clips,
+        use_xml_retime=use_xml_retime,
+        import_clip_names=import_clip_names,
+        mark_duplicates=mark_duplicates,
+        mark_retimed_clips=mark_retimed_clips,
+        preserve_track_layout=bool(
+            ((manifest or {}).get("settings") or {}).get("preserve_track_layout")),
+    )
 
     if manifest is None:
         print("This timeline carries no All Clips manifest.")

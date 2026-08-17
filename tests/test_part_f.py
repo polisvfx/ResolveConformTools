@@ -1051,6 +1051,143 @@ check("and both sources are recorded",
 
 
 # ---------------------------------------------------------------------------
+# 15. Create mode stamps the manifest
+# ---------------------------------------------------------------------------
+#
+# Create mode used to build the timeline and record nothing, so update mode did
+# not recognise its own output: "Recorded in timeline" found no manifest and
+# refused, and every freshly generated timeline had to be adopted by hand via
+# "Current selection" first. Which sources produced a timeline, and with which
+# settings, cannot be recovered by looking at the result — so if create does not
+# write them down, nothing can.
+
+print("\n== create mode stamps the manifest ==")
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(500, 600)]}, [])
+mod = load(res)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="Stamped",
+        selection_method="Current Selection",
+        sorting_method="Source Name",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=False,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=False,
+        merge_by_source_file=True,
+    )
+
+built = project.timelines[-1]
+manifest, store = mod.read_manifest(built)
+check_true("a created timeline carries a manifest", manifest is not None)
+
+if manifest is not None:
+    check("it records the timeline it was written for",
+          manifest["timeline_uid"], built.GetUniqueId())
+    check("it records the sources the run read",
+          [s["name"] for s in manifest["sources"]], ["SRC_01"])
+    check("with their uids, so a rename does not lose them",
+          [s["uid"] for s in manifest["sources"]], [src.GetUniqueId()])
+    check("it records the settings that shaped the ranges",
+          manifest["settings"]["connection_threshold"], 25)
+    check("including the create-only layout flag update mode reads back",
+          manifest["settings"]["preserve_track_layout"], False)
+    check("no update run has happened yet", manifest["run_counter"], 0)
+    check("and it was not adopted from an unmanaged timeline",
+          manifest["adopted"], False)
+
+# The visible half of the record: a Cream badge on the ruler.
+badge_frame = mod.find_manifest_marker_frame(mod.normalised_markers(built))
+check_true("a manifest badge sits on the timeline", badge_frame is not None)
+if badge_frame is not None:
+    check("the badge is the Cream marker",
+          built.markers[badge_frame]["color"], "Cream")
+
+# The point of all of it: update mode now works on the timeline create made,
+# with no adoption step and with "Recorded" as the source.
+log = run_update(mod, source_selection_mode="Recorded")
+check_true("update mode no longer refuses it",
+           "carries no All Clips manifest" not in log)
+check_true("it re-reads the recorded source", "Reading 1 source timeline" in log)
+check_true("and finds nothing to do, because nothing has changed",
+           "already matches its sources" in log)
+
+# Settings recorded by create and by update have to agree key for key, or the
+# first update would report settings that "changed" only because the two lists
+# were written separately.
+after, _store = mod.read_manifest(built)
+check("create and update record the same settings keys",
+      sorted((after or {}).get("settings") or {}),
+      sorted((manifest or {}).get("settings") or {}))
+
+
+# ---------------------------------------------------------------------------
+# 16. Retime markers stop at the first matching ClipInfo
+# ---------------------------------------------------------------------------
+#
+# The three post-processing passes correlate a placed clip back to the ClipInfo
+# it came from by source name and containing range. The retime pass used to keep
+# searching after a match whose ClipInfo was not retimed, so a later ClipInfo —
+# same name, wider range — could claim the clip and put a red "Retimed Clip"
+# marker on a clip that is not retimed. The duplicate and clip-name passes both
+# stop at the first match; this one now does too.
+
+print("\n== retime markers stop at the first match ==")
+
+res, project, dest, src = build_world({"shot_a": [(100, 200)]}, [])
+
+# A second Media Pool item with the SAME name as the first — one file imported
+# twice, which is routine on round-tripped conform timelines — carrying a wider,
+# retimed instance of the shot. Different file paths, so the two never merge,
+# and the narrow range sits entirely inside the wide one.
+twin_mpi = MPI("shot_a", "mid_shot_a_copy", "/vol/shot_a_copy.mov")
+twin = Item(twin_mpi, 90, 210, 500)
+twin.GetClipProperty = lambda key: "50.0" if key == "Speed" else None
+src.tracks[1].append(twin)
+
+mod = load(res)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="Retime_Match",
+        selection_method="Current Selection",
+        sorting_method="Source Name",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=True,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=False,
+        merge_by_source_file=True,
+    )
+
+built = project.timelines[-1]
+by_range = {(i.source_start, i.source_end): i for i in built.all_items()}
+plain = by_range.get((100, 200))
+retimed = by_range.get((90, 210))
+
+
+def red_markers(item):
+    return [m["name"] for m in item.markers.values() if m["color"] == "Red"]
+
+
+check("both instances were placed", sorted(by_range), [(90, 210), (100, 200)])
+if plain is not None:
+    check("the unretimed instance is left unmarked", red_markers(plain), [])
+if retimed is not None:
+    check("the retimed instance is marked", red_markers(retimed), ["Retimed Clip"])
+
+
+# ---------------------------------------------------------------------------
 
 print("")
 if fails:

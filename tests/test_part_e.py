@@ -47,6 +47,7 @@ WANTED = [
     "trim_manifest_for_marker", "first_free_frame", "find_manifest_marker_frame",
     "read_accepted_range", "diff_ranges", "classify_change",
     "plan_rebuild_placement", "compute_free_space", "fits_in_place",
+    "build_settings_record", "check_retime_properties", "is_clip_retimed",
 ]
 
 
@@ -125,6 +126,10 @@ classify_change = ns["classify_change"]
 plan_rebuild_placement = ns["plan_rebuild_placement"]
 compute_free_space = ns["compute_free_space"]
 fits_in_place = ns["fits_in_place"]
+
+build_settings_record = ns["build_settings_record"]
+check_retime_properties = ns["check_retime_properties"]
+is_clip_retimed = ns["is_clip_retimed"]
 
 UPDATE_MARKER_PREFIX = ns["UPDATE_MARKER_PREFIX"]
 UPDATE_CHANGE_TOLERANCE = ns["UPDATE_CHANGE_TOLERANCE"]
@@ -614,6 +619,120 @@ check("a missing accepted range is ignored",
                                 + '{"v":1,"run":2}'}}), (None, None))
 check("a None marker info is tolerated",
       read_accepted_range({10: None}), (None, None))
+
+
+# ---------------------------------------------------------------------------
+# is_clip_retimed — the reported speed
+# ---------------------------------------------------------------------------
+#
+# Speed is source frames over timeline frames, the convention Resolve's own
+# "Speed" clip property uses. Dividing the other way round reported a 50% clip
+# as 200%, and disagreed with check_retime_properties(), which reads that very
+# property — so the same clip was described two different ways depending on
+# which of the two detection paths happened to fire.
+
+print("\n== is_clip_retimed ==")
+
+
+class RetimeItem:
+    """Stub TimelineItem for the duration and property retime checks."""
+
+    def __init__(self, record_start, record_end, source_start, source_end,
+                 props=None):
+        self._rs, self._re = record_start, record_end
+        self._ss, self._se = source_start, source_end
+        self._props = props or {}
+
+    def GetStart(self):
+        return self._rs
+
+    def GetEnd(self):
+        return self._re
+
+    def GetSourceStartFrame(self):
+        return self._ss
+
+    def GetSourceEndFrame(self):
+        return self._se
+
+    def GetClipProperty(self, key):
+        return self._props.get(key)
+
+
+class RetimeClip:
+    """The TimelineClipData shape is_clip_retimed() reads."""
+
+    def __init__(self, item, name="clip"):
+        self.clip = item
+        self.name = name
+
+
+def speed_of(record_frames, source_frames, props=None):
+    """Report just the speed for a clip of the given timeline/source lengths."""
+    item = RetimeItem(0, record_frames, 0, source_frames, props)
+    return is_clip_retimed(RetimeClip(item))
+
+
+# 100 source frames stretched over 200 timeline frames is half speed.
+check("a clip stretched to twice its length is 50%",
+      speed_of(200, 100), (True, 50.0, False))
+
+# 200 source frames squeezed into 100 timeline frames is double speed.
+check("a clip squeezed to half its length is 200%",
+      speed_of(100, 200), (True, 200.0, False))
+
+# Unretimed: no property set either, so it falls through to a clean False.
+check("an unretimed clip reports no retime", speed_of(100, 100), (False, None, False))
+
+# The two detection paths have to agree. A 50% clip caught by duration and a
+# 50% clip caught by Resolve's own Speed property must report the same number.
+check("the property path reports the same convention",
+      check_retime_properties(RetimeClip(RetimeItem(0, 200, 0, 100,
+                                                    {"Speed": "50.0"}))),
+      (True, 50.0, False))
+
+# Guards. A frame hold has no source length; a zero-length timeline item would
+# have divided by zero once the formula was inverted.
+check("a zero-length source is a frame hold", speed_of(100, 0), (True, 0.0, False))
+check("a zero-length timeline item falls back to the property check",
+      speed_of(0, 100), (False, None, False))
+check("...and still reads the property when there is one",
+      speed_of(0, 100, {"Speed": "50.0"}), (True, 50.0, False))
+
+
+# ---------------------------------------------------------------------------
+# build_settings_record
+# ---------------------------------------------------------------------------
+#
+# Create stamps these onto a new timeline and update compares against them, so
+# the two have to produce the same keys. Written separately, they drifted: create
+# wrote nothing at all, and the keys update warns about could not be checked.
+
+print("\n== build_settings_record ==")
+
+SETTINGS_ARGS = dict(
+    connection_threshold=25, merge_by_source_file=True, video_only=True,
+    allow_disabled_clips=False, use_xml_retime=True, import_clip_names=False,
+    mark_duplicates=True, mark_retimed_clips=True,
+)
+
+record = build_settings_record(**SETTINGS_ARGS)
+check("it records every setting that shapes a run",
+      sorted(record),
+      ["allow_disabled_clips", "connection_threshold", "import_clip_names",
+       "mark_duplicates", "mark_retimed_clips", "merge_by_source_file",
+       "preserve_track_layout", "use_xml_retime", "video_only"])
+check("preserve_track_layout defaults off for a caller that has no layout",
+      record["preserve_track_layout"], False)
+check("and is carried through when a create run had one",
+      build_settings_record(preserve_track_layout=True,
+                            **SETTINGS_ARGS)["preserve_track_layout"], True)
+
+# Every key update mode warns about has to exist, or the comparison reads as
+# "unchanged" for a setting that did change.
+for key in ("connection_threshold", "merge_by_source_file", "use_xml_retime",
+            "allow_disabled_clips"):
+    check(f"update mode can compare {key}", key in record, True)
 
 
 # ---------------------------------------------------------------------------

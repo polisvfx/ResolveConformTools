@@ -43,8 +43,10 @@ A full Python rewrite of the Lua script with improved retime handling and XML-ba
 
 #### Update Timeline mode (2.0+)
 
-Update mode works on All Clips timelines created by **version 2.0 or later**.
-Regenerate anything older before updating it.
+Update mode works on All Clips timelines created by **version 2.5 or later**,
+which record their sources as they are built. Timelines from 2.0–2.4 were built
+before create mode stamped anything, so they carry no record and have to be
+adopted once (see *Where the state lives* below) or simply regenerated.
 
 Open an All Clips timeline, set **Mode** to *Update Existing Timeline*, and the
 script re-reads the source timelines and reconciles what is already there
@@ -107,9 +109,10 @@ Other things to know:
 The source timelines and settings are stamped onto the timeline in two places —
 third-party metadata on the timeline's Media Pool item, and a `Cream` marker at
 the start of the timeline whose custom data holds the same JSON. The marker
-doubles as a visible "this timeline is managed" badge. Which clips are on the
-timeline is deliberately *not* stored: it is re-scanned every run, so anything
-you rearrange between runs is respected rather than overwritten.
+doubles as a visible "this timeline is managed" badge. Both are written by
+create mode as the timeline is built, and refreshed by every update. Which clips
+are on the timeline is deliberately *not* stored: it is re-scanned every run, so
+anything you rearrange between runs is respected rather than overwritten.
 
 A timeline with no such record can be **adopted**: choose *Current selection*
 (or *Recorded + current selection*) as the update source, and the timelines you
