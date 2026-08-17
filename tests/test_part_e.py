@@ -684,8 +684,12 @@ check("a clip squeezed to half its length is 200%",
 # Unretimed: no property set either, so it falls through to a clean False.
 check("an unretimed clip reports no retime", speed_of(100, 100), (False, None, False))
 
-# The two detection paths have to agree. A 50% clip caught by duration and a
-# 50% clip caught by Resolve's own Speed property must report the same number.
+# The two detection paths have to agree on the convention. Note that the
+# property path cannot actually fire on 21.0.4.5 — GetClipProperty is a
+# MediaPoolItem method and TimelineItem does not have it, so every call in
+# check_retime_properties() raises and is swallowed (see its docstring). This
+# stub gives it the method it wants, which keeps the function honest against the
+# day a build provides one.
 check("the property path reports the same convention",
       check_retime_properties(RetimeClip(RetimeItem(0, 200, 0, 100,
                                                     {"Speed": "50.0"}))),

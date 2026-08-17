@@ -384,6 +384,12 @@ end
 function checkRetimeProperties(clip)
     -- Check for retiming property
     local speed = nil
+    -- DEAD ON 21.0.4.5: GetClipProperty is a MediaPoolItem method and
+    -- TimelineItem does not have it, so every call in this function fails and
+    -- is swallowed by its own pcall. TimelineItem exposes GetProperty instead,
+    -- and GetProperty("Speed") returns nil. The duration comparison in
+    -- isClipRetimed() is what actually detects a retime. See the matching note
+    -- in check_retime_properties() in the PRO script.
     local success = pcall(function() speed = tonumber(clip.clip:GetClipProperty("Speed")) end)
     
     -- If speed is not 100% (normal speed), it's retimed

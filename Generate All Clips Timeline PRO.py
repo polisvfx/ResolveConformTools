@@ -670,6 +670,20 @@ def check_retime_properties(clip: TimelineClipData) -> tuple[bool, Optional[floa
     """Check clip properties for retime indicators.
 
     Returns: (is_retimed, retime_percentage, is_non_linear)
+
+    DEAD ON 21.0.4.5, and probably on every build. GetClipProperty is a
+    MediaPoolItem method; TimelineItem does not have it, and the scripting
+    bridge resolves the unknown attribute to None, so every call below raises
+    "'NoneType' object is not callable" and is swallowed by its own except.
+    Measured on 21.0.4.5: TimelineItem exposes GetProperty/SetProperty instead
+    (GetProperty("ZoomX") -> 0.5), and GetProperty("Speed") returns None — the
+    retime speed is not on that surface either.
+
+    So is_clip_retimed()'s duration comparison is in practice the only thing
+    that detects a linear retime, and the XML pass the only thing that detects a
+    speed ramp: the "Retime Curve" branch here has never fired. Left in place
+    rather than deleted because it is harmless and a future build may add the
+    method, but do not read it as working detection.
     """
     # Check Speed property
     speed = None
