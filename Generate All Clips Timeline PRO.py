@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Generate All Clips Timeline PRO
-Version: 2.8
+Version: 2.9
 
 Two modes.
 
@@ -43,7 +43,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.8"
+TOOL_VERSION = "2.9"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -1696,11 +1696,15 @@ def collect_desired_clips(
             if not group:
                 continue
 
-            # a) subtract this timeline's own minimum inpoint
+            # a) subtract this timeline's own minimum inpoint.
+            # The endpoint fallback is resolved BEFORE the inpoint moves: read
+            # afterwards it would derive from the already-rebased inpoint and
+            # then subtract min_ip a second time.
             min_ip = min(ci.timeline_inpoint for ci in group)
             for ci in group:
+                endpoint = ci.timeline_endpoint or (ci.timeline_inpoint + 1)
                 ci.timeline_inpoint -= min_ip
-                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) - min_ip
+                ci.timeline_endpoint = endpoint - min_ip
 
             # b) re-merge by (media_id, track) within this group
             regroup: dict[str, list[ClipInfo]] = {}
@@ -1741,8 +1745,10 @@ def collect_desired_clips(
             )
 
             for ci in unique_group:
+                # Same ordering trap as above: resolve the fallback first.
+                endpoint = ci.timeline_endpoint or (ci.timeline_inpoint + 1)
                 ci.timeline_inpoint += output_cursor
-                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) + output_cursor
+                ci.timeline_endpoint = endpoint + output_cursor
                 rebuilt.append(ci)
 
             output_cursor += block_end + INTER_TIMELINE_GAP
@@ -2450,8 +2456,17 @@ def run_workflow(
 
     print("Adding all clips to new timeline...")
     new_timeline = media_pool.CreateEmptyTimeline(dst_timeline_name)
-    assert project.SetCurrentTimeline(new_timeline), \
-        "Couldn't set current timeline to the new timeline"
+    # Not an assert: `python -O` strips those, and AppendToTimeline always
+    # targets the current timeline, so failing to switch would append every
+    # clip onto whatever the user happened to have open.
+    if new_timeline is None:
+        print(f"ERROR: could not create the timeline '{dst_timeline_name}'. "
+              f"Nothing was changed.")
+        return
+    if not project.SetCurrentTimeline(new_timeline):
+        print(f"ERROR: created '{dst_timeline_name}' but could not make it "
+              f"current. Aborting rather than appending to the wrong timeline.")
+        return
 
     # Capture timeline FPS so per-clip code can warn on FPS mismatches.
     _timeline_fps_str = ""
@@ -2573,158 +2588,137 @@ def run_workflow(
             else:
                 print(f"  WARNING: failed to add marker '{m['name']}' at frame {m['frame']}")
 
-    # Post-processing: mark duplicates (uses pre-computed metadata on ClipInfo)
-    if mark_duplicates and dup_set_count > 0:
-        print(f"Marking {dup_set_count} duplicate set(s) in the new timeline...")
-        _p("Marking duplicates...", 0, 0)
+    # Post-processing: one walk of the new timeline for all three passes.
+    #
+    # These used to be three separate loops, each calling
+    # get_all_timeline_clips() again (three full track walks, each re-printing
+    # every clip's name and file path) and each re-querying
+    # GetSourceStartFrame/GetSourceEndFrame/GetName on the SAME timeline item
+    # once per candidate ClipInfo -- none of which depend on the candidate. On a
+    # 500-clip timeline that is on the order of 10^5 redundant bridge calls per
+    # pass. Now the timeline is walked once, the per-item values are read once,
+    # and candidates are looked up by source name instead of scanned linearly.
+    if mark_duplicates or mark_retimed_clips or import_clip_names:
+        _p("Marking clips...", 0, 0)
         clip_list = get_all_timeline_clips(new_timeline)
-        marker_count = 0
-        success_count = 0
         total_clips = len(clip_list)
 
+        # Candidates bucketed by source name: the first half of the match test
+        # is an equality on it, so only same-named ClipInfos can ever match.
+        by_source_name: dict[str, list[ClipInfo]] = {}
+        for clip_info in all_clip_infos:
+            try:
+                key = clip_info.media_pool_item.GetName()
+            except Exception:
+                continue
+            by_source_name.setdefault(key, []).append(clip_info)
+
+        dup_marker_count = dup_success_count = 0
+        retime_marker_count = retime_success_count = 0
+        name_apply_count = version_apply_count = 0
+
         for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Marking duplicates: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                if clip_info.duplicate_set_index is None:
-                    continue
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
+            _p(f"Marking: {timeline_clip.name}", ci_idx, total_clips)
 
-                    color, marker_text, marker_note = build_duplicate_marker_text(clip_info)
-                    source_start = timeline_clip.clip.GetSourceStartFrame()
-                    clip_duration = timeline_clip.clip.GetDuration()
-                    marker_position = source_start + math.floor(clip_duration * 0.25)
+            # Read once per placed clip, not once per candidate.
+            try:
+                item_name = timeline_clip.media_pool_item.GetName()
+                source_start = timeline_clip.clip.GetSourceStartFrame()
+                source_end = timeline_clip.clip.GetSourceEndFrame()
+                clip_duration = timeline_clip.clip.GetDuration()
+            except Exception:
+                continue
+            if None in (source_start, source_end, clip_duration):
+                continue
 
+            match = None
+            for clip_info in by_source_name.get(item_name, ()):
+                if (source_start >= clip_info.start_frame - SLIP_TOLERANCE
+                        and source_end <= clip_info.end_frame + SLIP_TOLERANCE):
+                    match = clip_info
+                    break
+            if match is None:
+                continue
+
+            if mark_duplicates and match.duplicate_set_index is not None:
+                color, marker_text, marker_note = build_duplicate_marker_text(match)
+                position = source_start + math.floor(clip_duration * 0.25)
+                try:
+                    success = timeline_clip.clip.AddMarker(
+                        position, color, marker_text, marker_note, 1, "")
+                except Exception:
+                    success = False
+                dup_marker_count += 1
+                if success:
+                    dup_success_count += 1
+                    print(f"  Added duplicate marker to: {timeline_clip.name}")
+                else:
+                    print(f"  Failed to add duplicate marker to: {timeline_clip.name}")
+
+            if mark_retimed_clips and match.is_retimed:
+                marker_text, marker_note = build_retime_marker_text(match)
+                position = source_start + math.floor(clip_duration * 0.5)
+                try:
+                    success = timeline_clip.clip.AddMarker(
+                        position, "Red", marker_text, marker_note, 1, "")
+                except Exception:
+                    success = False
+                retime_marker_count += 1
+                if success:
+                    retime_success_count += 1
+                    print(f"  Added retime marker to clip: {timeline_clip.name}")
+                else:
+                    print(f"  Failed to add retime marker to clip: {timeline_clip.name}")
+
+            if import_clip_names:
+                if match.source_name:
+                    ok = False
                     try:
-                        success = timeline_clip.clip.AddMarker(
-                            marker_position, color, marker_text,
-                            marker_note, 1, "",
-                        )
+                        ok = timeline_clip.clip.SetName(match.source_name)
                     except Exception:
-                        success = False
-
-                    marker_count += 1
-                    if success:
-                        success_count += 1
-                        print(f"  Added duplicate marker to: {timeline_clip.name}")
+                        pass
+                    if ok:
+                        print(f"  Renamed clip to: {match.source_name}")
+                        name_apply_count += 1
                     else:
-                        print(f"  Failed to add duplicate marker to: {timeline_clip.name}")
-                    break
+                        print(f"  WARNING: SetName failed for: {timeline_clip.name}")
 
-        print(f"Successfully added {success_count} duplicate markers out of "
-              f"{marker_count} attempts.")
-    elif mark_duplicates:
-        print("No duplicate clips were found.")
-
-    # Post-processing: mark retimed clips
-    if mark_retimed_clips:
-        print("Marking retimed clips in the new timeline...")
-        _p("Marking retimed clips...", 0, 0)
-        clip_list = get_all_timeline_clips(new_timeline)
-        marker_count = 0
-        success_count = 0
-        total_clips = len(clip_list)
-
-        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Marking retimes: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                # Match by name and source frame range
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
-
-                    if clip_info.is_retimed:
-                        source_start = timeline_clip.clip.GetSourceStartFrame()
-                        clip_duration = timeline_clip.clip.GetDuration()
-                        marker_position = source_start + math.floor(clip_duration * 0.5)
-
-                        # Distinguish marker types
-                        marker_text, marker_note = build_retime_marker_text(clip_info)
-
+                vnames = match.version_names or []
+                if vnames:
+                    for vname in vnames:
                         try:
-                            success = timeline_clip.clip.AddMarker(
-                                marker_position, "Red", marker_text,
-                                marker_note, 1, "",
-                            )
-                        except Exception:
-                            success = False
-
-                        marker_count += 1
-                        if success:
-                            success_count += 1
-                            print(f"  Added retime marker to clip: {timeline_clip.name}")
-                        else:
-                            print(f"  Failed to add retime marker to clip: {timeline_clip.name}")
-
-                    # Stop at the first match whether or not it was retimed —
-                    # like the duplicate and clip-name passes. Searching on past
-                    # a matching non-retimed ClipInfo would let a later one for
-                    # the same source name, with an overlapping range, put a red
-                    # marker on a clip that is not the one it describes.
-                    break
-
-        print(f"Successfully added {success_count} retime markers out of "
-              f"{marker_count} attempts.")
-
-    # Post-processing: apply source clip names + color version names
-    if import_clip_names:
-        print("Applying source clip names and color version names to new timeline...")
-        _p("Applying clip names...", 0, 0)
-        clip_list = get_all_timeline_clips(new_timeline)
-        name_apply_count = 0
-        version_apply_count = 0
-        total_clips = len(clip_list)
-
-        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Applying names: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
-
-                    # Set clip name from source
-                    if clip_info.source_name:
-                        ok = False
-                        try:
-                            ok = timeline_clip.clip.SetName(clip_info.source_name)
+                            timeline_clip.clip.AddVersion(vname, 0)
                         except Exception:
                             pass
-                        if ok:
-                            print(f"  Renamed clip to: {clip_info.source_name}")
-                            name_apply_count += 1
+                    if match.current_version_name:
+                        set_ok = False
+                        try:
+                            set_ok = timeline_clip.clip.SetCurrentVersion(
+                                match.current_version_name, 0)
+                        except Exception:
+                            pass
+                        if set_ok:
+                            print(f"  Set active version "
+                                  f"'{match.current_version_name}' on: "
+                                  f"{timeline_clip.name}")
                         else:
-                            print(f"  WARNING: SetName failed for: {timeline_clip.name}")
+                            print(f"  WARNING: SetCurrentVersion failed for: "
+                                  f"{timeline_clip.name}")
+                    version_apply_count += 1
 
-                    # Recreate color versions
-                    vnames = clip_info.version_names or []
-                    if vnames:
-                        for vname in vnames:
-                            try:
-                                timeline_clip.clip.AddVersion(vname, 0)
-                            except Exception:
-                                pass
-                        if clip_info.current_version_name:
-                            set_ok = False
-                            try:
-                                set_ok = timeline_clip.clip.SetCurrentVersion(
-                                    clip_info.current_version_name, 0,
-                                )
-                            except Exception:
-                                pass
-                            if set_ok:
-                                print(f"  Set active version "
-                                      f"'{clip_info.current_version_name}' on: "
-                                      f"{timeline_clip.name}")
-                            else:
-                                print(f"  WARNING: SetCurrentVersion failed for: "
-                                      f"{timeline_clip.name}")
-                        version_apply_count += 1
+        if mark_duplicates:
+            if dup_set_count > 0:
+                print(f"Successfully added {dup_success_count} duplicate markers "
+                      f"out of {dup_marker_count} attempts.")
+            else:
+                print("No duplicate clips were found.")
+        if mark_retimed_clips:
+            print(f"Successfully added {retime_success_count} retime markers out "
+                  f"of {retime_marker_count} attempts.")
+        if import_clip_names:
+            print(f"Clip names applied to {name_apply_count} clips.")
+            print(f"Color version names applied to {version_apply_count} clips.")
 
-                    break
-
-        print(f"Clip names applied to {name_apply_count} clips.")
-        print(f"Color version names applied to {version_apply_count} clips.")
 
     # Range Audit: flag any clip whose final source range on the new timeline
     # grew significantly versus the raw API-reported range. The only thing in

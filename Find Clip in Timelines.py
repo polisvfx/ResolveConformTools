@@ -1,7 +1,7 @@
 """
 Find Clip in Timelines.py
 ─────────────────────────
-Version: 1.2
+Version: 1.3
 
 Searches all timelines in the current project for the selected clip and
 shows a popup listing the timelines that contain it.
@@ -190,6 +190,11 @@ def find_timelines_for_clip(project, target_id):
 
     for i in range(1, tl_count + 1):
         tl = project.GetTimelineByIndex(i)
+        # A missing index would otherwise take the whole scan down on the
+        # first GetTrackCount call. Every other GetTimelineByIndex loop in the
+        # repo guards this; this one did not.
+        if tl is None:
+            continue
         hits = []
 
         for track_type in ("video", "audio"):
