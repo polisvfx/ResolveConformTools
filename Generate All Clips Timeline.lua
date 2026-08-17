@@ -1,6 +1,6 @@
 --[[
 Timeline Generator with Duplicate Marker
-Version: 1.2
+Version: 1.3
 This script creates a master timeline from selected timelines and optionally marks duplicate clips.
 ]]--
 
@@ -432,15 +432,19 @@ function isClipRetimed(clip)
         sourceDuration = clip.clip:GetSourceEndFrame() - clip.clip:GetSourceStartFrame()
     end)
     
-    if not success or sourceDuration == 0 then
+    if not success or sourceDuration == 0 or timelineDuration == 0 then
         print("Warning: Could not calculate durations for clip: " .. clip.name)
         -- Fall back to checking properties
         return checkRetimeProperties(clip)
     end
-    
-    -- Calculate differences
+
+    -- Calculate differences. Speed is source frames over timeline frames, which
+    -- is the convention Resolve's own "Speed" clip property uses and therefore
+    -- what checkRetimeProperties() returns from the other detection path: a clip
+    -- at 50% occupies twice as many timeline frames as it has source frames.
+    -- Dividing the other way round reported that clip as 200%.
     local frameDiff = math.abs(timelineDuration - sourceDuration)
-    retimePercentage = (timelineDuration / sourceDuration) * 100
+    retimePercentage = (sourceDuration / timelineDuration) * 100
     local percentDiff = math.abs(retimePercentage - 100)
     
     -- Check if significant mismatch exists
@@ -757,30 +761,38 @@ function main()
                                 goto continue_item
                             end
                             
-                            -- Get source frame range
-                            -- GetSourceEndFrame() is inclusive in the Resolve API, and
-                            -- AppendToTimeline.endFrame is inclusive too — pass end_frame
-                            -- through unchanged. (The old `- 1` chopped the last source
-                            -- frame off every placed clip.)
+                            -- Get source frame range.
+                            -- GetSourceEndFrame() on a source clip is the inclusive last
+                            -- frame, so end_frame is stored inclusive and every range in
+                            -- this script is inclusive. AppendToTimeline.endFrame is
+                            -- EXCLUSIVE, which is not the same convention -- the append
+                            -- code below does that conversion, once, at the API call.
                             local start_frame, end_frame
                             local frame_success = pcall(function()
                                 start_frame = track_item:GetSourceStartFrame()
                                 end_frame = track_item:GetSourceEndFrame()
                             end)
-                            
+
                             if not frame_success or not start_frame or not end_frame then
                                 print("  Could not retrieve frame range for clip: " .. item_name)
                                 goto continue_item
                             end
-                            
+
                             -- Check if reversed
                             local is_reversed = start_frame > end_frame
-                            
+
                             -- Always create clip info regardless of reversed status
                             if is_reversed then
                                 print("  FOUND REVERSED CLIP: " .. item_name)
-                                print("  Source frames: " .. start_frame .. " to " .. end_frame)
+                                print("  Source frames (raw): " .. start_frame .. " to " .. end_frame)
                             end
+
+                            -- Normalize: always start <= end. A reversed clip is placed
+                            -- forward-playing and flagged, so one append path serves every
+                            -- clip type. is_reversed is kept for the status line.
+                            start_frame, end_frame =
+                                math.min(start_frame, end_frame),
+                                math.max(start_frame, end_frame)
                             
                             if not clips[id] then
                                 clips[id] = {}
@@ -993,73 +1005,22 @@ function main()
                       ", timeline=" .. tostring(timeline_fps) .. ")")
             end
 
-            -- For reversed clips, create a normalized version
-            if clip_info.isReversed then
-                print("  Using special handling for reversed clip")
-                
-                -- Create a new timeline item with the clip playing in reverse
-                local success = false
-                
-                -- Try different approaches
-                -- 1. First try: Swap start/end frames and preserve speed direction
-                local swap_approach = {
-                    mediaPoolItem = clip_info.mediaPoolItem,
-                    startFrame = clip_info.endFrame,  -- Swap start/end for reversed clip
-                    endFrame = clip_info.startFrame,
-                    importVideo = true,
-                    importAudio = true
-                }
-                
-                print("  Trying approach 1: Swapped start/end frames")
-                success = pcall(function() media_pool:AppendToTimeline({swap_approach}) end)
-                
-                -- 2. Second try: Use normalized frame range and apply speed change after
-                if not success then
-                    print("  Approach 1 failed, trying approach 2: Add normalized and modify speed")
-                    
-                    local normalized_info = {
-                        mediaPoolItem = clip_info.mediaPoolItem,
-                        startFrame = math.min(clip_info.startFrame, clip_info.endFrame),
-                        endFrame = math.max(clip_info.startFrame, clip_info.endFrame)
-                    }
-                    
-                    -- Add to timeline
-                    success = pcall(function() 
-                        media_pool:AppendToTimeline({normalized_info})
-                        
-                        -- Try to get the added clip and modify its speed
-                        local new_timeline = project:GetCurrentTimeline()
-                        if new_timeline then
-                            local tracks = new_timeline:GetTrackCount("video")
-                            if tracks > 0 then
-                                local items = new_timeline:GetItemListInTrack("video", 1)
-                                if items and #items > 0 then
-                                    local latest_item = items[#items] -- Get most recently added item
-                                    if latest_item then
-                                        -- Try to set speed to negative to play in reverse
-                                        latest_item:SetClipProperty("Speed", "-100")
-                                    end
-                                end
-                            end
-                        end
-                    end)
-                end
-                
-                -- 3. Last resort: Try with original values
-                if not success then
-                    print("  Approach 2 failed, trying original values as last resort")
-                    success = pcall(function() media_pool:AppendToTimeline({clip_info}) end)
-                end
-                
-                if success then
-                    print("  Successfully added reversed clip")
-                    append_success_count = append_success_count + 1
-                else
-                    print("  Failed to add reversed clip after all attempts")
-                    append_error_count = append_error_count + 1
-                end
-            else
-                -- For normal clips, use standard approach with slip compensation.
+            do
+                -- One append path for every clip type, reversed included: ranges
+                -- were normalized at collection, so a reversed clip is placed
+                -- forward-playing and marked, exactly as the PRO script does.
+                --
+                -- The three "approaches" that used to sit here for reversed clips
+                -- could never run. Each tested `pcall(function() Append(...) end)`,
+                -- which is true whenever nothing was RAISED -- and an append that
+                -- places nothing returns nil without raising. So approach 1 always
+                -- reported success, approaches 2 and 3 were unreachable, and every
+                -- reversed clip counted as appended whether or not it was. Approach
+                -- 1 also swapped start and end blind, which asks for a start after
+                -- its end on any clip a merge had already normalised; approach 3
+                -- passed the whole clip_info (isReversed, retimePercentage and all)
+                -- as the API dict; and none of them got slip compensation.
+                --
                 -- AppendToTimeline sometimes places clips with their source in/out
                 -- shifted by +/-1 frame (codec/internal anchor quirks). After the
                 -- append we re-query the placed clip's source range; if it differs
@@ -1068,20 +1029,34 @@ function main()
                 -- SLIP_RETRY_LIMIT retries; if still off we fall back to widening
                 -- the request by +/-1 so the target range is fully contained in
                 -- the placed range (extra handle frames acceptable; missing not).
+                --
+                -- endFrame is EXCLUSIVE: asking for endFrame=E places source
+                -- frames start..E-1. clip_info ranges are inclusive, so the
+                -- request is end + 1. Measured on 21.0.4.5 against a 158-frame
+                -- clip: endFrame=157 gave duration 157, endFrame=158 gave 158,
+                -- and startFrame=endFrame was refused outright as zero-length.
+                -- Without the +1 every clip lost its last frame, and a frame
+                -- hold -- where start == end -- asked for a zero-length clip and
+                -- so never reached the timeline at all.
                 local api_dict = {
                     mediaPoolItem = clip_info.mediaPoolItem,
                     startFrame = clip_info.startFrame,
-                    endFrame = clip_info.endFrame
+                    endFrame = clip_info.endFrame + 1
                 }
                 local target_start = api_dict.startFrame
                 local target_end = api_dict.endFrame
                 local placed_items = nil
-                local success = pcall(function()
+                -- pcall only reports whether the call RAISED. An append that
+                -- places nothing returns nil quietly, so check the result too.
+                local no_error = pcall(function()
                     placed_items = media_pool:AppendToTimeline({api_dict})
                 end)
+                local success = no_error and type(placed_items) == "table"
+                                and #placed_items > 0
 
                 if not success then
-                    print("  Failed to add normal clip: " .. clip_info.mediaPoolItem:GetName())
+                    print("  Failed to add clip: " .. clip_info.mediaPoolItem:GetName())
+                    print("  Frame range attempted: " .. target_start .. " to " .. target_end)
                     append_error_count = append_error_count + 1
                 else
                     append_success_count = append_success_count + 1
@@ -1133,7 +1108,10 @@ function main()
                                 end
                             end)
                             if media_end ~= nil then
-                                wide_end = math.min(wide_end, media_end)
+                                -- GetClipProperty("End") is the inclusive last
+                                -- frame of the media; endFrame is exclusive, so
+                                -- the largest legal request is one past it.
+                                wide_end = math.min(wide_end, media_end + 1)
                             end
                             api_dict.startFrame = wide_start
                             api_dict.endFrame = wide_end
@@ -1161,6 +1139,16 @@ function main()
                                       "-" .. tostring(w_end) ..
                                       " -- target frames preserved with handles")
                                 slip_widened_count = slip_widened_count + 1
+                            elseif w_start == nil then
+                                -- The widening append deleted the slipped clip and
+                                -- put nothing back, so this clip is gone entirely.
+                                print("  ERROR: '" .. mpi:GetName() ..
+                                      "' widening append placed nothing; clip is no " ..
+                                      "longer on the timeline (target " .. target_start ..
+                                      "-" .. target_end .. ")")
+                                append_success_count = append_success_count - 1
+                                append_error_count = append_error_count + 1
+                                slip_unfixed_count = slip_unfixed_count + 1
                             else
                                 print("  ERROR: '" .. mpi:GetName() ..
                                       "' slip unfixable; widened to " .. tostring(w_start) ..
@@ -1190,6 +1178,18 @@ function main()
                         pcall(function()
                             placed_items = media_pool:AppendToTimeline({api_dict})
                         end)
+                        if type(placed_items) ~= "table" or #placed_items == 0 then
+                            -- The retry deleted the slipped clip and put nothing
+                            -- back, so this clip is no longer on the timeline.
+                            print("  ERROR: '" .. mpi:GetName() ..
+                                  "' retry append placed nothing; clip is no longer " ..
+                                  "on the timeline (target " .. target_start .. "-" ..
+                                  target_end .. ")")
+                            append_success_count = append_success_count - 1
+                            append_error_count = append_error_count + 1
+                            slip_unfixed_count = slip_unfixed_count + 1
+                            break
+                        end
                         retry_count = retry_count + 1
                     end
                 end
