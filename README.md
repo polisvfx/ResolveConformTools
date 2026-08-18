@@ -236,7 +236,7 @@ The nuke integration is in its infancy and I am contemplating making it a bit mo
 
 ## License
 
-Copyright (C) 2026 Maris
+Copyright (C) 2026 Maris Polis - marispolis.com
 
 Released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
 # DCTL Report - part of ResolveConformTools
-# Copyright (C) 2026 Maris
+# Copyright (C) 2026 Maris Polis - marispolis.com
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
