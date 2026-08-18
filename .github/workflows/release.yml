@@ -33,7 +33,7 @@ jobs:
       # here -- run those locally before tagging (see tests/README.md).
       - name: Run offline tests
         run: |
-          for t in test_part_a test_part_b test_part_e test_part_f; do
+          for t in test_part_a test_part_b test_part_e test_part_f test_part_g; do
             echo "::group::$t"
             python "tests/$t.py"
             echo "::endgroup::"
@@ -61,11 +61,23 @@ jobs:
           cat dist/changelog.md >> dist/notes.md
           cat dist/notes.md
 
+      # workflow_dispatch exists to re-run a tag whose release failed part way,
+      # but `gh release create` fails outright when the release already exists —
+      # which is exactly the state a partial run leaves behind. Update in place
+      # when it is already there, create it when it is not.
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            "dist/ResolveConformTools-${VERSION}.zip" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file dist/notes.md
+          ZIP="dist/ResolveConformTools-${VERSION}.zip"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists — updating it."
+            gh release upload "${GITHUB_REF_NAME}" "$ZIP" --clobber
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file dist/notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" "$ZIP" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file dist/notes.md
+          fi

@@ -23,6 +23,7 @@ import os
 import sys
 import types
 import contextlib
+import xml.etree.ElementTree as ET
 
 
 def _repo_root():
@@ -1048,6 +1049,273 @@ check("so the shot from the old version is untouched",
 manifest, _store = mod.read_manifest(dest)
 check("and both sources are recorded",
       sorted(s["name"] for s in manifest["sources"]), ["SRC_01", "SRC_01_V2"])
+
+
+# ---------------------------------------------------------------------------
+# 15. Create mode stamps the manifest
+# ---------------------------------------------------------------------------
+#
+# Create mode used to build the timeline and record nothing, so update mode did
+# not recognise its own output: "Recorded in timeline" found no manifest and
+# refused, and every freshly generated timeline had to be adopted by hand via
+# "Current selection" first. Which sources produced a timeline, and with which
+# settings, cannot be recovered by looking at the result — so if create does not
+# write them down, nothing can.
+
+print("\n== create mode stamps the manifest ==")
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(500, 600)]}, [])
+mod = load(res)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="Stamped",
+        selection_method="Current Selection",
+        sorting_method="Source Name",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=False,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=False,
+        merge_by_source_file=True,
+    )
+
+built = project.timelines[-1]
+manifest, store = mod.read_manifest(built)
+check_true("a created timeline carries a manifest", manifest is not None)
+
+if manifest is not None:
+    check("it records the timeline it was written for",
+          manifest["timeline_uid"], built.GetUniqueId())
+    check("it records the sources the run read",
+          [s["name"] for s in manifest["sources"]], ["SRC_01"])
+    check("with their uids, so a rename does not lose them",
+          [s["uid"] for s in manifest["sources"]], [src.GetUniqueId()])
+    check("it records the settings that shaped the ranges",
+          manifest["settings"]["connection_threshold"], 25)
+    check("including the create-only layout flag update mode reads back",
+          manifest["settings"]["preserve_track_layout"], False)
+    check("no update run has happened yet", manifest["run_counter"], 0)
+    check("and it was not adopted from an unmanaged timeline",
+          manifest["adopted"], False)
+
+# The visible half of the record: a Cream badge on the ruler.
+badge_frame = mod.find_manifest_marker_frame(mod.normalised_markers(built))
+check_true("a manifest badge sits on the timeline", badge_frame is not None)
+if badge_frame is not None:
+    check("the badge is the Cream marker",
+          built.markers[badge_frame]["color"], "Cream")
+
+# The point of all of it: update mode now works on the timeline create made,
+# with no adoption step and with "Recorded" as the source.
+log = run_update(mod, source_selection_mode="Recorded")
+check_true("update mode no longer refuses it",
+           "carries no All Clips manifest" not in log)
+check_true("it re-reads the recorded source", "Reading 1 source timeline" in log)
+check_true("and finds nothing to do, because nothing has changed",
+           "already matches its sources" in log)
+
+# Settings recorded by create and by update have to agree key for key, or the
+# first update would report settings that "changed" only because the two lists
+# were written separately.
+after, _store = mod.read_manifest(built)
+check("create and update record the same settings keys",
+      sorted((after or {}).get("settings") or {}),
+      sorted((manifest or {}).get("settings") or {}))
+
+
+# ---------------------------------------------------------------------------
+# 16. Retime markers stop at the first matching ClipInfo
+# ---------------------------------------------------------------------------
+#
+# The three post-processing passes correlate a placed clip back to the ClipInfo
+# it came from by source name and containing range. The retime pass used to keep
+# searching after a match whose ClipInfo was not retimed, so a later ClipInfo —
+# same name, wider range — could claim the clip and put a red "Retimed Clip"
+# marker on a clip that is not retimed. The duplicate and clip-name passes both
+# stop at the first match; this one now does too.
+
+print("\n== retime markers stop at the first match ==")
+
+res, project, dest, src = build_world({"shot_a": [(100, 200)]}, [])
+
+# A second Media Pool item with the SAME name as the first — one file imported
+# twice, which is routine on round-tripped conform timelines — carrying a wider,
+# retimed instance of the shot. Different file paths, so the two never merge,
+# and the narrow range sits entirely inside the wide one.
+twin_mpi = MPI("shot_a", "mid_shot_a_copy", "/vol/shot_a_copy.mov")
+twin = Item(twin_mpi, 90, 210, 500)
+twin.GetClipProperty = lambda key: "50.0" if key == "Speed" else None
+src.tracks[1].append(twin)
+
+mod = load(res)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    mod.run_workflow(
+        dst_timeline_name="Retime_Match",
+        selection_method="Current Selection",
+        sorting_method="Source Name",
+        connection_threshold=25,
+        allow_disabled_clips=False,
+        video_only=True,
+        mark_duplicates=False,
+        mark_retimed_clips=True,
+        use_xml_retime=False,
+        import_clip_names=False,
+        preserve_track_layout=False,
+        merge_by_source_file=True,
+    )
+
+built = project.timelines[-1]
+by_range = {(i.source_start, i.source_end): i for i in built.all_items()}
+plain = by_range.get((100, 200))
+retimed = by_range.get((90, 210))
+
+
+def red_markers(item):
+    return [m["name"] for m in item.markers.values() if m["color"] == "Red"]
+
+
+check("both instances were placed", sorted(by_range), [(90, 210), (100, 200)])
+if plain is not None:
+    check("the unretimed instance is left unmarked", red_markers(plain), [])
+if retimed is not None:
+    check("the retimed instance is marked", red_markers(retimed), ["Retimed Clip"])
+
+
+# ---------------------------------------------------------------------------
+# 17. Time Remap keyframes are fractional
+# ---------------------------------------------------------------------------
+#
+# Resolve writes the retime curve into the "graphdict" parameter with
+# FRACTIONAL values. parse_time_remap_keyframes() used int() on them, so
+# int("7781.12") raised ValueError straight into the except that skips a
+# keyframe -- and every curve came back looking like a single keyframe, because
+# only an all-integer pair survived. compute_source_range_from_keyframes() then
+# saw fewer than three and never reported a ramp, so the whole XML pass found
+# nothing and expanded nothing.
+#
+# The keyframes below are copied verbatim from a hand-authored negative speed
+# ramp exported by 21.0.4.5. It runs forward to 7781, back to 3819, forward to
+# 8750, then ends at 3123 -- so the frames it touches reach 5631 past the
+# out-point the API reports, and a pull built from the API range alone would be
+# missing every one of them.
+
+print("\n== fractional Time Remap keyframes ==")
+
+RAMP_XML = """<clipitem>
+  <name>Ramp.mov</name><in>0</in><out>9264</out>
+  <filter><effect>
+    <name>Time Remap</name><effectid>timeremap</effectid>
+    <parameter><parameterid>speed</parameterid><value>94.464</value></parameter>
+    <parameter><parameterid>graphdict</parameterid>
+      <keyframe><when>0</when><value>0</value></keyframe>
+      <keyframe><when>2226</when><value>7781.12</value></keyframe>
+      <keyframe><when>5094</when><value>3819.31</value></keyframe>
+      <keyframe><when>7009</when><value>8750.2</value></keyframe>
+      <keyframe><when>9264</when><value>3122.6</value></keyframe>
+    </parameter>
+  </effect></filter>
+</clipitem>"""
+
+kfs = mod.parse_time_remap_keyframes(ET.fromstring(RAMP_XML))
+check("every keyframe is parsed, not just the integer one", len(kfs), 5)
+check("fractional values round to whole source frames",
+      [k.value for k in kfs], [0, 7781, 3819, 8750, 3123])
+check("and the times come through in order",
+      [k.when for k in kfs], [0, 2226, 5094, 7009, 9264])
+
+src_min, src_max, non_linear = mod.compute_source_range_from_keyframes(kfs)
+check("the curve's reach is found", (src_min, src_max), (0, 8750))
+check("a turning curve is classified non-linear", non_linear, True)
+
+# The frames at stake: the API would report the clip ending at 3119.
+check("the curve reaches past the API out-point", src_max > 3119, True)
+check("by the number of frames that would otherwise be lost",
+      src_max - 3119, 5631)
+
+# Integer-only keyframes must keep working — that is the case that used to be
+# the only one that did.
+INT_XML = RAMP_XML.replace("7781.12", "7781").replace("3819.31", "3819") \
+                  .replace("8750.2", "8750").replace("3122.6", "3123")
+check("integer keyframes still parse",
+      [k.value for k in mod.parse_time_remap_keyframes(ET.fromstring(INT_XML))],
+      [0, 7781, 3819, 8750, 3123])
+
+# Junk must still be skipped rather than raising.
+BAD_XML = RAMP_XML.replace("<value>7781.12</value>", "<value>oops</value>")
+check("an unparseable keyframe is skipped, not fatal",
+      len(mod.parse_time_remap_keyframes(ET.fromstring(BAD_XML))), 4)
+
+
+# ---------------------------------------------------------------------------
+# 18. The curve is scoped to the instance that uses it
+# ---------------------------------------------------------------------------
+#
+# Resolve writes ONE retime curve per source clip, covering the whole file, and
+# each timeline instance is a window into it. Taking min/max over every keyframe
+# therefore describes the entire media, not the shot -- measured across three
+# real conforms, 76 of 82 ramped clips came back spanning their whole file, so
+# every expansion proposed was refused by XML_EXPANSION_MAX_GROWTH and the pass
+# achieved nothing. Scoping to the clipitem's <in>/<out> reproduced the API's
+# own range on 74 of 82.
+#
+# Within the window the extremes must include INTERIOR keyframes, not just the
+# endpoints: a curve that overshoots and reverses turns around in the middle, so
+# its furthest frame is at neither end. That is the whole protection.
+
+print("\n== the curve is scoped to the instance ==")
+
+kfs = mod.parse_time_remap_keyframes(ET.fromstring(RAMP_XML))
+
+check("unscoped still reads the whole curve",
+      mod.compute_source_range_from_keyframes(kfs), (0, 8750, True))
+
+# A window over the first leg only: the curve rises 0 -> 7781 and never turns.
+check("a window sees only its own leg of the curve",
+      mod.compute_source_range_from_keyframes(kfs, 0, 2226)[:2], (0, 7781))
+
+# A window over the second leg, where the curve runs backwards.
+check("a backwards leg reports its own extremes",
+      mod.compute_source_range_from_keyframes(kfs, 2226, 5094)[:2], (3819, 7781))
+
+# The decisive one. Over output frames 6000..8000 the curve enters at ~6152,
+# climbs to the turnaround at 8750, then falls back to ~6277. Both ENDPOINTS
+# sit around 6200 -- so an endpoint-only read would report 6152-6277 and miss
+# 2473 frames that this window actually plays.
+lo, hi, _nl = mod.compute_source_range_from_keyframes(kfs, 6000, 8000)
+check("a turnaround inside the window is caught", (lo, hi), (6152, 8750))
+check("an endpoint-only read would have missed it", hi > 6277, True)
+
+# Scoping must never invent frames outside the curve.
+check("a window past the end clamps to the curve",
+      mod.compute_source_range_from_keyframes(kfs, 20000, 30000)[:2],
+      (3123, 3123))
+
+# Interpolation happens between keyframes, not just at them. 1100 of the way
+# along the first leg (0..2226 -> 0..7781) is 1100/2226 * 7781 = 3845.05.
+check("the curve interpolates between keyframes",
+      round(mod.curve_value_at(kfs, 1100)), 3845)
+
+# A plain two-keyframe linear retime stays linear once scoped.
+LINEAR_XML = """<clipitem><name>Linear.mov</name><in>286</in><out>291</out>
+  <filter><effect><name>Time Remap</name>
+    <parameter><parameterid>graphdict</parameterid>
+      <keyframe><when>0</when><value>0</value></keyframe>
+      <keyframe><when>1050</when><value>6299</value></keyframe>
+    </parameter></effect></filter></clipitem>"""
+lin = mod.parse_time_remap_keyframes(ET.fromstring(LINEAR_XML))
+whole = mod.compute_source_range_from_keyframes(lin)
+scoped = mod.compute_source_range_from_keyframes(lin, 286, 291)
+check("unscoped, a linear curve reads as the whole media", whole[:2], (0, 6299))
+check("scoped, it reads as the few frames the shot uses",
+      scoped[:2], (1716, 1746))
+check("and it is not mistaken for a ramp", scoped[2], False)
 
 
 # ---------------------------------------------------------------------------

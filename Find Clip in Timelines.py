@@ -1,7 +1,26 @@
+#
+# Find Clip in Timelines - part of ResolveConformTools
+# Copyright (C) 2026 Maris Polis - marispolis.com
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 """
 Find Clip in Timelines.py
 ─────────────────────────
-Version: 1.2
+Version: 1.3
 
 Searches all timelines in the current project for the selected clip and
 shows a popup listing the timelines that contain it.
@@ -190,6 +209,11 @@ def find_timelines_for_clip(project, target_id):
 
     for i in range(1, tl_count + 1):
         tl = project.GetTimelineByIndex(i)
+        # A missing index would otherwise take the whole scan down on the
+        # first GetTrackCount call. Every other GetTimelineByIndex loop in the
+        # repo guards this; this one did not.
+        if tl is None:
+            continue
         hits = []
 
         for track_type in ("video", "audio"):

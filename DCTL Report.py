@@ -1,8 +1,27 @@
 #!/usr/bin/env python
+#
+# DCTL Report - part of ResolveConformTools
+# Copyright (C) 2026 Maris Polis - marispolis.com
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 """
 DCTL Report  (DRP-only variant)
 ================================
-Version: 1.0
+Version: 1.1
 
 Scans the currently-open DaVinci Resolve project for every LUT and DCTL
 reference it uses, resolves each reference against the standard Resolve
@@ -504,8 +523,28 @@ def _scan_decompressed(data: bytes, source: str) -> list:
     return out
 
 
+def discard_work_dir(work_dir) -> None:
+    """Delete a temp export directory. Never fatal — it is only scratch.
+
+    A .drp is a full project export and a .drt one per timeline, so leaving
+    these behind puts real volume in the user's temp directory on every scan.
+    Everything downstream reads the files during the scan and keeps only the
+    extracted references, so nothing needs them once scanning has finished.
+    """
+    if not work_dir:
+        return
+    try:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"Could not remove temp export directory {work_dir}: {e}")
+
+
 def export_project_drp(project_manager, project) -> Optional[str]:
-    """Export current project to a temp .drp and return the path."""
+    """Export current project to a temp .drp and return the path.
+
+    The caller owns the returned file's directory and must hand it to
+    discard_work_dir() once the scan is done.
+    """
     try:
         name = project.GetName()
     except Exception:
@@ -518,10 +557,12 @@ def export_project_drp(project_manager, project) -> Optional[str]:
         ok = project_manager.ExportProject(name, drp_path, False)
     except Exception as e:
         print(f"ExportProject raised: {e}")
+        discard_work_dir(work_dir)
         return None
     if not ok or not os.path.isfile(drp_path):
         print(f"ExportProject returned {ok!r}, file exists: "
               f"{os.path.isfile(drp_path)}")
+        discard_work_dir(work_dir)
         return None
     return drp_path
 
@@ -1105,6 +1146,10 @@ class ReportDialog(QDialog):
 
         drp_path = ""
         raw_refs = []
+        # The temp directory holding this scan's exports. Kept so it can be
+        # deleted once scanning is done; drp_path outlives it as provenance for
+        # the report, which quotes the path but never re-reads the file.
+        work_dir = ""
 
         if self.mode_all.isChecked():
             # All mode: one DRP export covers every timeline.
@@ -1130,6 +1175,7 @@ class ReportDialog(QDialog):
                 self.summary.setText("Export failed.")
                 return
 
+            work_dir = os.path.dirname(drp_path)
             self.summary.setText(
                 f"Scanning DRP ({os.path.basename(drp_path)})...")
             self.progress.setValue(55)
@@ -1155,6 +1201,10 @@ class ReportDialog(QDialog):
                 raw_refs.extend(
                     scan_drt(drt_path, name, self.zstd_module))
             drp_path = work_dir
+
+        # Every reference has been extracted into raw_refs by now, so the
+        # exports themselves are no longer needed.
+        discard_work_dir(work_dir)
 
         self.progress.setValue(85)
         QApplication.processEvents()

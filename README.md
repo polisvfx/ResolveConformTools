@@ -35,16 +35,18 @@ This script builds upon work done by [Thatcher Freeman](https://github.com/thatc
 ### Python Version (Generate All Clips Timeline PRO.py)
 A full Python rewrite of the Lua script with improved retime handling and XML-based source range analysis.
 - **Retime handling**: Correctly detects and handles retimed clips, reversed clips, and frame holds (freeze frames). All clips are normalized to forward-playing source ranges on the master timeline.
-- **XML retime analysis**: Optionally exports the source timeline to FCP 7 XML and parses Time Remap keyframes to compute precise source frame ranges — particularly useful for speed ramps and non-linear retimes where the API-reported range may be inaccurate.
-- **Distinct retime markers**: Red markers distinguish between "Frame Hold", "Non-Linear Retime", and "Retimed Clip" (with speed percentage), with a note when the source was originally reversed.
+- **XML retime analysis (2.8+)**: Optionally exports the source timeline to FCP 7 XML and reads the Time Remap curve, then widens each clip's source range to every frame its ramp actually touches. This matters because `GetSourceStartFrame`/`GetSourceEndFrame` can only express an in and an out, so a **negative speed ramp — one that runs past its out-point and reverses back — is under-reported by the API**, and those frames would be silently missing from a pull. Measured on a real ramp: the API reported source 0-3119 while the curve reached 8750, so 5631 frames were recovered. The range is scoped to the clip's own window into the curve and unioned with the API range, so it only ever widens. Before 2.8 this pass detected nothing at all — see the release notes for that history.
+- **Distinct retime markers**: Red markers distinguish between "Frame Hold", "Non-Linear Retime", "Retimed Clip" (with speed percentage) and "Extreme Retime", with a note when the source was originally reversed. A whip past 400% gets the last of those: the percentage stops meaning anything at that speed, so the marker reports the source span instead (`31 source frames (1717-1747) played over roughly 5 timeline frames`).
 - **Clean API calls**: Only API-recognized fields are passed to `AppendToTimeline`, preventing silent failures caused by extra metadata.
 - **Complete source ranges (2.3+)**: `AppendToTimeline`'s `endFrame` is *exclusive* — asking for `endFrame=E` places frames up to `E-1`. Every clip is now requested one frame past its last frame, so the range that lands is the range that was asked for, and freeze frames (a one-frame range, previously refused as zero-length) place correctly.
 - All features from the Lua version (sorting, merging, duplicate marking, audio removal) are fully preserved.
 
 #### Update Timeline mode (2.0+)
 
-Update mode works on All Clips timelines created by **version 2.0 or later**.
-Regenerate anything older before updating it.
+Update mode works on All Clips timelines created by **version 2.5 or later**,
+which record their sources as they are built. Timelines from 2.0–2.4 were built
+before create mode stamped anything, so they carry no record and have to be
+adopted once (see *Where the state lives* below) or simply regenerated.
 
 Open an All Clips timeline, set **Mode** to *Update Existing Timeline*, and the
 script re-reads the source timelines and reconciles what is already there
@@ -107,9 +109,10 @@ Other things to know:
 The source timelines and settings are stamped onto the timeline in two places —
 third-party metadata on the timeline's Media Pool item, and a `Cream` marker at
 the start of the timeline whose custom data holds the same JSON. The marker
-doubles as a visible "this timeline is managed" badge. Which clips are on the
-timeline is deliberately *not* stored: it is re-scanned every run, so anything
-you rearrange between runs is respected rather than overwritten.
+doubles as a visible "this timeline is managed" badge. Both are written by
+create mode as the timeline is built, and refreshed by every update. Which clips
+are on the timeline is deliberately *not* stored: it is re-scanned every run, so
+anything you rearrange between runs is respected rather than overwritten.
 
 A timeline with no such record can be **adopted**: choose *Current selection*
 (or *Recorded + current selection*) as the update source, and the timelines you
@@ -230,3 +233,17 @@ Searches every timeline in the current project for the selected clip and lists t
 
 ## Future Features
 The nuke integration is in its infancy and I am contemplating making it a bit more robust and useful, maybe creating a script that will generate a project config file that handles all variables like, project resolution, handles and so on. You could theoretically also reference nukescript templates and generate nuke scripts out of Resolve.
+
+## License
+
+Copyright (C) 2026 Maris Polis - marispolis.com
+
+Released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+Use it for anything, including paid client work, with no restriction. If you
+distribute a modified version you must ship its source under the same licence,
+which is what stops these scripts being folded into a closed product and sold.
+
+This program comes with ABSOLUTELY NO WARRANTY. It edits timelines in your
+project and some of what it does cannot be undone in one step — read the notes
+on Update Timeline mode before running it on work you care about.

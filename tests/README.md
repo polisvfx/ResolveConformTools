@@ -32,8 +32,9 @@ fuscript.exe -l lua tests/test_shot_numbering_clipname.lua
 # Python logic tests (no Resolve needed; live sections self-skip)
 python tests/test_part_a.py     # Copy Clip to Nuke clip selection
 python tests/test_part_b.py     # Find Clip in Timelines source tiers
-python tests/test_part_e.py     # Generate All Clips PRO update decisions
-python tests/test_part_f.py     # Generate All Clips PRO update mode, end to end
+python tests/test_part_e.py     # Generate All Clips PRO decision functions
+python tests/test_part_f.py     # Generate All Clips PRO create + update, end to end
+python tests/test_part_g.py     # tools/make_release_zip.py, the release gate
 
 # Live tests (Resolve must be running with a project open)
 python tests/test_part_d.py     # Generate All Clips timeline resolution

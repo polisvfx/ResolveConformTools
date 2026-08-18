@@ -1,7 +1,26 @@
 #!/usr/bin/env python
+#
+# Copy Clip to Nuke - part of ResolveConformTools
+# Copyright (C) 2026 Maris Polis - marispolis.com
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 """
 Copy Clip to Nuke
-Version: 1.2
+Version: 1.3
 
 Copies the selected DaVinci Resolve timeline clip's file path, editorial data,
 and metadata into a Nuke-ready format on the clipboard.
@@ -109,37 +128,45 @@ def format_timecode(frames: int, fps: float) -> str:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Copy text to the system clipboard. Returns True on success."""
-    try:
-        fd, tmp_path = tempfile.mkstemp(suffix=".txt")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
+    """Copy text to the system clipboard. Returns True on success.
 
-            if os.name == "nt":
-                subprocess.run(
-                    f'type "{tmp_path}" | clip',
-                    shell=True,
-                    check=True,
-                )
-            elif sys.platform == "darwin":
-                subprocess.run(
-                    f'cat "{tmp_path}" | pbcopy',
-                    shell=True,
-                    check=True,
-                )
-            else:
-                subprocess.run(
-                    f'cat "{tmp_path}" | xclip -selection clipboard',
-                    shell=True,
-                    check=True,
-                )
-            return True
-        finally:
+    The payload is piped in as UTF-8 bytes on stdin rather than shelled out
+    through a temp file. `type "file" | clip` re-read the UTF-8 file in the
+    console codepage, so any non-ASCII in a clip or reel name arrived in Nuke
+    mangled; and building a shell command line out of a path is a quoting
+    hazard for no benefit. Windows has no encoding-safe stdin route to
+    clip.exe, so it goes through PowerShell's Set-Clipboard, which takes the
+    encoding explicitly.
+    """
+    payload = text.encode("utf-8")
+    try:
+        if os.name == "nt":
+            fd, tmp_path = tempfile.mkstemp(suffix=".txt")
             try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                # Single quotes are the PowerShell literal string delimiter;
+                # doubling escapes one. mkstemp never produces them, but the
+                # command is built from a path either way.
+                quoted = tmp_path.replace("'", "''")
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     f"Get-Content -Raw -Encoding UTF8 -LiteralPath '{quoted}'"
+                     f" | Set-Clipboard"],
+                    check=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        elif sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=payload, check=True)
+        else:
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=payload, check=True)
+        return True
     except Exception as e:
         print(f"Error copying to clipboard: {e}")
         return False

@@ -1,7 +1,26 @@
 #!/usr/bin/env python
+#
+# Generate All Clips Timeline PRO - part of ResolveConformTools
+# Copyright (C) 2026 Maris Polis - marispolis.com
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 """
 Generate All Clips Timeline PRO
-Version: 2.4
+Version: 2.9
 
 Two modes.
 
@@ -43,9 +62,15 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.4"
+TOOL_VERSION = "2.9"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
+# Above this speed a clip is a whip or a ramp rather than a plain speed change,
+# and the percentage stops carrying information — the marker reports the source
+# span instead. Measured across three real commercial conform timelines: an
+# ordinary slow/fast shot lands at 200-300%, while genuine whips came back at
+# 800%, 1018%, 2020%, 3066% and 4616%. 400% sits in the empty gap between them.
+EXTREME_RETIME_PERCENT = 400.0
 DEFAULT_CONNECTION_THRESHOLD = 25
 INTER_TIMELINE_GAP = 25  # frames between source-timeline blocks in preserve-layout mode
 # AppendToTimeline can place clips with a small source-frame slip relative to
@@ -301,7 +326,24 @@ def parse_time_remap_keyframes(clip_element: ET.Element) -> list[RetimeKeyframe]
     """Extract Time Remap keyframes from a <clipitem> element.
 
     Looks for <effect><name>Time Remap</name> with <parameter> containing
-    <keyframe> entries with <when> and <value>.
+    <keyframe> entries with <when> and <value>. Resolve puts them under the
+    "graphdict" parameter.
+
+    Values are FRACTIONAL and must be parsed as floats. Measured on 21.0.4.5,
+    a hand-authored speed ramp exports as:
+
+        when=0     value=0
+        when=2226  value=7781.12
+        when=5094  value=3819.31
+        when=7009  value=8750.2
+        when=9264  value=3122.6
+
+    int("7781.12") raises ValueError, and the except below used to swallow it,
+    so every keyframe but an all-integer one was silently dropped. That left
+    most curves looking like a single keyframe: compute_source_range_from_
+    keyframes() then saw fewer than three and never reported a speed ramp, so
+    the XML pass reported nothing and expanded nothing. Rounding to whole
+    frames is right — a source frame is what gets pulled.
     """
     keyframes = []
     for effect in clip_element.findall(".//effect"):
@@ -315,35 +357,81 @@ def parse_time_remap_keyframes(clip_element: ET.Element) -> list[RetimeKeyframe]
                 if when_el is not None and value_el is not None:
                     try:
                         keyframes.append(RetimeKeyframe(
-                            when=int(when_el.text),
-                            value=int(value_el.text),
+                            when=int(round(float(when_el.text))),
+                            value=int(round(float(value_el.text))),
                         ))
                     except (ValueError, TypeError):
                         continue
     return keyframes
 
 
+def curve_value_at(keyframes: list[RetimeKeyframe], when: float) -> float:
+    """The retime curve's source frame at output frame `when`, interpolated.
+
+    The curve is piecewise linear between keyframes and flat outside them.
+    """
+    points = sorted(keyframes, key=lambda kf: kf.when)
+    if when <= points[0].when:
+        return float(points[0].value)
+    if when >= points[-1].when:
+        return float(points[-1].value)
+    for first, second in zip(points, points[1:]):
+        if first.when <= when <= second.when:
+            if second.when == first.when:
+                return float(second.value)
+            progress = (when - first.when) / (second.when - first.when)
+            return first.value + progress * (second.value - first.value)
+    return float(points[-1].value)
+
+
 def compute_source_range_from_keyframes(
     keyframes: list[RetimeKeyframe],
+    when_start: Optional[int] = None,
+    when_end: Optional[int] = None,
 ) -> tuple[int, int, bool]:
     """From retime keyframes, compute (min_source_frame, max_source_frame, is_non_linear).
 
     is_non_linear is True if the speed varies between keyframe segments.
+
+    `when_start`/`when_end` scope the answer to one timeline instance, and are
+    the clipitem's own <in>/<out>. Resolve writes ONE curve per source clip,
+    covering the whole file, and each instance is a window into it -- so
+    min/max over every keyframe describes the entire media, not this shot.
+    Measured across three real conform timelines: unscoped, 76 of 82 ramped
+    clips came back spanning >500 source frames (their whole file), while
+    scoping reproduced the API's own range exactly on 74 of 82.
+
+    Within the window the extremes are taken over the endpoints AND every
+    keyframe inside it, which is what catches an overshoot: a curve that runs
+    past its out-point and reverses back turns around at an interior keyframe,
+    so its furthest frame is never at either end.
     """
     if not keyframes:
         return (0, 0, False)
 
-    values = [kf.value for kf in keyframes]
-    src_min = min(values)
-    src_max = max(values)
+    if when_start is None or when_end is None:
+        values = [kf.value for kf in keyframes]
+        scoped = list(keyframes)
+    else:
+        low, high = min(when_start, when_end), max(when_start, when_end)
+        values = [curve_value_at(keyframes, low), curve_value_at(keyframes, high)]
+        scoped = [kf for kf in keyframes if low < kf.when < high]
+        values.extend(kf.value for kf in scoped)
+        # Endpoints act as the segment bounds for the linearity test below.
+        scoped = ([RetimeKeyframe(when=low, value=round(values[0]))]
+                  + scoped
+                  + [RetimeKeyframe(when=high, value=round(values[1]))])
+
+    src_min = int(round(min(values)))
+    src_max = int(round(max(values)))
 
     # Check for non-linear speed: compare speed ratios between consecutive segments
     is_non_linear = False
-    if len(keyframes) >= 3:
+    if len(scoped) >= 3:
         speeds = []
-        for i in range(len(keyframes) - 1):
-            dt = keyframes[i + 1].when - keyframes[i].when
-            dv = keyframes[i + 1].value - keyframes[i].value
+        for i in range(len(scoped) - 1):
+            dt = scoped[i + 1].when - scoped[i].when
+            dv = scoped[i + 1].value - scoped[i].value
             if dt != 0:
                 speeds.append(dv / dt)
         if speeds:
@@ -388,7 +476,22 @@ def build_xml_clip_lookup(xml_path: str) -> dict[str, list[dict]]:
         if not clip_name:
             continue
 
-        src_min, src_max, is_non_linear = compute_source_range_from_keyframes(keyframes)
+        # <in>/<out> are this instance's window into the clip's retime curve,
+        # in the same frame domain as the keyframes' <when>. Without them the
+        # range below is the whole media (see compute_source_range_from_
+        # keyframes) and every expansion it proposes is refused by the growth
+        # cap, which is why the XML pass used to change nothing.
+        when_start = when_end = None
+        try:
+            in_el, out_el = clip_item.find("in"), clip_item.find("out")
+            if in_el is not None and out_el is not None:
+                when_start = int(round(float(in_el.text)))
+                when_end = int(round(float(out_el.text)))
+        except (TypeError, ValueError):
+            when_start = when_end = None
+
+        src_min, src_max, is_non_linear = compute_source_range_from_keyframes(
+            keyframes, when_start, when_end)
         lookup.setdefault(clip_name, []).append({
             "source_min": src_min,
             "source_max": src_max,
@@ -670,6 +773,20 @@ def check_retime_properties(clip: TimelineClipData) -> tuple[bool, Optional[floa
     """Check clip properties for retime indicators.
 
     Returns: (is_retimed, retime_percentage, is_non_linear)
+
+    DEAD ON 21.0.4.5, and probably on every build. GetClipProperty is a
+    MediaPoolItem method; TimelineItem does not have it, and the scripting
+    bridge resolves the unknown attribute to None, so every call below raises
+    "'NoneType' object is not callable" and is swallowed by its own except.
+    Measured on 21.0.4.5: TimelineItem exposes GetProperty/SetProperty instead
+    (GetProperty("ZoomX") -> 0.5), and GetProperty("Speed") returns None — the
+    retime speed is not on that surface either.
+
+    So is_clip_retimed()'s duration comparison is in practice the only thing
+    that detects a linear retime, and the XML pass the only thing that detects a
+    speed ramp: the "Retime Curve" branch here has never fired. Left in place
+    rather than deleted because it is harmless and a future build may add the
+    method, but do not read it as working detection.
     """
     # Check Speed property
     speed = None
@@ -727,10 +844,17 @@ def is_clip_retimed(clip: TimelineClipData) -> tuple[bool, Optional[float], bool
     if source_duration <= 0:
         print(f"Warning: Source duration is {source_duration} for clip: {clip.name} (likely frame hold)")
         return (True, 0.0, False)
+    if timeline_duration <= 0:
+        print(f"Warning: Timeline duration is {timeline_duration} for clip: {clip.name}")
+        return check_retime_properties(clip)
 
-    # Calculate differences
+    # Calculate differences. Speed is source frames over timeline frames, which
+    # is the convention Resolve's own "Speed" clip property uses and therefore
+    # what check_retime_properties() returns from the other detection path: a
+    # clip at 50% occupies twice as many timeline frames as it has source
+    # frames. Dividing the other way round reported that clip as 200%.
     frame_diff = abs(timeline_duration - source_duration)
-    retime_percentage = (timeline_duration / source_duration) * 100
+    retime_percentage = (source_duration / timeline_duration) * 100
     percent_diff = abs(retime_percentage - 100)
 
     if frame_diff > MIN_FRAME_DIFF and percent_diff > MIN_PERCENT_DIFF:
@@ -812,6 +936,31 @@ def get_timeline_for_media_pool_item(media_pool_item):
 def utc_now_iso() -> str:
     """Current UTC time as 2026-08-06T12:22:33Z — the manifest's machine clock."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_settings_record(*, connection_threshold, merge_by_source_file,
+                          video_only, allow_disabled_clips, use_xml_retime,
+                          import_clip_names, mark_duplicates,
+                          mark_retimed_clips,
+                          preserve_track_layout=False) -> dict:
+    """The generation settings a manifest records.
+
+    One shape for both workflows: create stamps what it built with, update
+    compares against it and warns about the ones that reshape merged ranges.
+    They have to agree key for key or every first update would report settings
+    that "changed" only because the two lists were written separately.
+    """
+    return {
+        "connection_threshold": connection_threshold,
+        "merge_by_source_file": merge_by_source_file,
+        "video_only": video_only,
+        "allow_disabled_clips": allow_disabled_clips,
+        "use_xml_retime": use_xml_retime,
+        "import_clip_names": import_clip_names,
+        "mark_duplicates": mark_duplicates,
+        "mark_retimed_clips": mark_retimed_clips,
+        "preserve_track_layout": preserve_track_layout,
+    }
 
 
 def build_manifest(timeline_uid, timeline_name, sources, settings, now_iso,
@@ -1333,31 +1482,39 @@ def collect_desired_clips(
                         if is_non_lin:
                             is_non_linear = True
                             is_retimed = True
-                            # For non-linear retimes (speed ramps) the Resolve API source
-                            # in/out may not reflect the full frame range the ramp accesses.
-                            # Only in this case do we expand using the XML-derived range.
-                            if not is_frame_hold:
-                                proposed_start = min(norm_start, xml_min)
-                                proposed_end = max(norm_end, xml_max)
-                                old_duration = max(1, norm_end - norm_start + 1)
-                                new_duration = max(1, proposed_end - proposed_start + 1)
-                                growth = new_duration / old_duration
-                                if (proposed_start, proposed_end) == (norm_start, norm_end):
-                                    pass  # XML didn't actually expand
-                                elif growth > XML_EXPANSION_MAX_GROWTH:
-                                    print(f"  XML EXPANSION SKIPPED: would grow "
-                                          f"{old_duration}f -> {new_duration}f "
-                                          f"({growth:.1f}x, cap is "
-                                          f"{XML_EXPANSION_MAX_GROWTH:.0f}x). "
-                                          f"Keeping API range {norm_start}-{norm_end}.")
-                                else:
-                                    added = new_duration - old_duration
-                                    print(f"  XML EXPANDED range: "
-                                          f"{norm_start}-{norm_end} ({old_duration}f) -> "
-                                          f"{proposed_start}-{proposed_end} "
-                                          f"({new_duration}f, +{added}f, {growth:.2f}x)")
-                                    norm_start = proposed_start
-                                    norm_end = proposed_end
+                        # Union with the API range, for every clip the XML
+                        # matched rather than only the ones that read as
+                        # non-linear. The range is now scoped to this instance's
+                        # own window into the curve, so it agrees with the API
+                        # to within a frame or two on an ordinary retime and
+                        # only widens where the curve genuinely reaches further.
+                        #
+                        # Widening is the safe direction: surplus frames are
+                        # handle, missing frames break a pull. Gating this on
+                        # is_non_linear meant a ramp Resolve exports with two
+                        # keyframes -- most of them -- was never checked at all.
+                        if not is_frame_hold:
+                            proposed_start = min(norm_start, xml_min)
+                            proposed_end = max(norm_end, xml_max)
+                            old_duration = max(1, norm_end - norm_start + 1)
+                            new_duration = max(1, proposed_end - proposed_start + 1)
+                            growth = new_duration / old_duration
+                            if (proposed_start, proposed_end) == (norm_start, norm_end):
+                                pass  # XML didn't actually expand
+                            elif growth > XML_EXPANSION_MAX_GROWTH:
+                                print(f"  XML EXPANSION SKIPPED: would grow "
+                                      f"{old_duration}f -> {new_duration}f "
+                                      f"({growth:.1f}x, cap is "
+                                      f"{XML_EXPANSION_MAX_GROWTH:.0f}x). "
+                                      f"Keeping API range {norm_start}-{norm_end}.")
+                            else:
+                                added = new_duration - old_duration
+                                print(f"  XML EXPANDED range: "
+                                      f"{norm_start}-{norm_end} ({old_duration}f) -> "
+                                      f"{proposed_start}-{proposed_end} "
+                                      f"({new_duration}f, +{added}f, {growth:.2f}x)")
+                                norm_start = proposed_start
+                                norm_end = proposed_end
 
                 # Capture source clip name + color version names if option is on
                 source_clip_name: Optional[str] = None
@@ -1558,11 +1715,15 @@ def collect_desired_clips(
             if not group:
                 continue
 
-            # a) subtract this timeline's own minimum inpoint
+            # a) subtract this timeline's own minimum inpoint.
+            # The endpoint fallback is resolved BEFORE the inpoint moves: read
+            # afterwards it would derive from the already-rebased inpoint and
+            # then subtract min_ip a second time.
             min_ip = min(ci.timeline_inpoint for ci in group)
             for ci in group:
+                endpoint = ci.timeline_endpoint or (ci.timeline_inpoint + 1)
                 ci.timeline_inpoint -= min_ip
-                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) - min_ip
+                ci.timeline_endpoint = endpoint - min_ip
 
             # b) re-merge by (media_id, track) within this group
             regroup: dict[str, list[ClipInfo]] = {}
@@ -1603,8 +1764,10 @@ def collect_desired_clips(
             )
 
             for ci in unique_group:
+                # Same ordering trap as above: resolve the fallback first.
+                endpoint = ci.timeline_endpoint or (ci.timeline_inpoint + 1)
                 ci.timeline_inpoint += output_cursor
-                ci.timeline_endpoint = (ci.timeline_endpoint or (ci.timeline_inpoint + 1)) + output_cursor
+                ci.timeline_endpoint = endpoint + output_cursor
                 rebuilt.append(ci)
 
             output_cursor += block_end + INTER_TIMELINE_GAP
@@ -1853,6 +2016,23 @@ def build_retime_marker_text(clip_info: ClipInfo) -> tuple:
         marker_text = "Non-Linear Retime"
         marker_note = ("Speed curve/ramp detected. Source range may not "
                        "cover all frames used. Manual check recommended.")
+        if clip_info.is_reversed:
+            marker_note += " (originally reversed)"
+    elif (clip_info.retime_percentage is not None
+            and clip_info.retime_percentage >= EXTREME_RETIME_PERCENT):
+        # Past this speed the percentage stops being useful: a whip reads as
+        # "4616%", which tells a human nothing. Say what the clip actually
+        # spans instead, which is the number worth checking by eye.
+        span = clip_info.end_frame - clip_info.start_frame + 1
+        marker_text = "Extreme Retime"
+        # ASCII only: marker text round-trips through the scripting bridge and
+        # back out through GetMarkers on every subsequent run.
+        marker_note = (
+            f"Whip or speed ramp - check by hand. {span} source frames "
+            f"({clip_info.start_frame}-{clip_info.end_frame}) played over "
+            f"roughly {max(1, round(span * 100 / clip_info.retime_percentage))} "
+            f"timeline frames."
+        )
         if clip_info.is_reversed:
             marker_note += " (originally reversed)"
     else:
@@ -2295,8 +2475,17 @@ def run_workflow(
 
     print("Adding all clips to new timeline...")
     new_timeline = media_pool.CreateEmptyTimeline(dst_timeline_name)
-    assert project.SetCurrentTimeline(new_timeline), \
-        "Couldn't set current timeline to the new timeline"
+    # Not an assert: `python -O` strips those, and AppendToTimeline always
+    # targets the current timeline, so failing to switch would append every
+    # clip onto whatever the user happened to have open.
+    if new_timeline is None:
+        print(f"ERROR: could not create the timeline '{dst_timeline_name}'. "
+              f"Nothing was changed.")
+        return
+    if not project.SetCurrentTimeline(new_timeline):
+        print(f"ERROR: created '{dst_timeline_name}' but could not make it "
+              f"current. Aborting rather than appending to the wrong timeline.")
+        return
 
     # Capture timeline FPS so per-clip code can warn on FPS mismatches.
     _timeline_fps_str = ""
@@ -2379,7 +2568,9 @@ def run_workflow(
                           if preserve_track_layout else None),
             timeline_fps=_timeline_fps,
         )
-        if _status == "error":
+        # "unknown" is an append that raised nothing but gave back no usable
+        # item, which means nothing was placed — a failure, not a success.
+        if _status in ("error", "unknown"):
             append_error_count += 1
         else:
             append_success_count += 1
@@ -2416,153 +2607,137 @@ def run_workflow(
             else:
                 print(f"  WARNING: failed to add marker '{m['name']}' at frame {m['frame']}")
 
-    # Post-processing: mark duplicates (uses pre-computed metadata on ClipInfo)
-    if mark_duplicates and dup_set_count > 0:
-        print(f"Marking {dup_set_count} duplicate set(s) in the new timeline...")
-        _p("Marking duplicates...", 0, 0)
+    # Post-processing: one walk of the new timeline for all three passes.
+    #
+    # These used to be three separate loops, each calling
+    # get_all_timeline_clips() again (three full track walks, each re-printing
+    # every clip's name and file path) and each re-querying
+    # GetSourceStartFrame/GetSourceEndFrame/GetName on the SAME timeline item
+    # once per candidate ClipInfo -- none of which depend on the candidate. On a
+    # 500-clip timeline that is on the order of 10^5 redundant bridge calls per
+    # pass. Now the timeline is walked once, the per-item values are read once,
+    # and candidates are looked up by source name instead of scanned linearly.
+    if mark_duplicates or mark_retimed_clips or import_clip_names:
+        _p("Marking clips...", 0, 0)
         clip_list = get_all_timeline_clips(new_timeline)
-        marker_count = 0
-        success_count = 0
         total_clips = len(clip_list)
 
+        # Candidates bucketed by source name: the first half of the match test
+        # is an equality on it, so only same-named ClipInfos can ever match.
+        by_source_name: dict[str, list[ClipInfo]] = {}
+        for clip_info in all_clip_infos:
+            try:
+                key = clip_info.media_pool_item.GetName()
+            except Exception:
+                continue
+            by_source_name.setdefault(key, []).append(clip_info)
+
+        dup_marker_count = dup_success_count = 0
+        retime_marker_count = retime_success_count = 0
+        name_apply_count = version_apply_count = 0
+
         for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Marking duplicates: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                if clip_info.duplicate_set_index is None:
-                    continue
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
+            _p(f"Marking: {timeline_clip.name}", ci_idx, total_clips)
 
-                    color, marker_text, marker_note = build_duplicate_marker_text(clip_info)
-                    source_start = timeline_clip.clip.GetSourceStartFrame()
-                    clip_duration = timeline_clip.clip.GetDuration()
-                    marker_position = source_start + math.floor(clip_duration * 0.25)
+            # Read once per placed clip, not once per candidate.
+            try:
+                item_name = timeline_clip.media_pool_item.GetName()
+                source_start = timeline_clip.clip.GetSourceStartFrame()
+                source_end = timeline_clip.clip.GetSourceEndFrame()
+                clip_duration = timeline_clip.clip.GetDuration()
+            except Exception:
+                continue
+            if None in (source_start, source_end, clip_duration):
+                continue
 
-                    try:
-                        success = timeline_clip.clip.AddMarker(
-                            marker_position, color, marker_text,
-                            marker_note, 1, "",
-                        )
-                    except Exception:
-                        success = False
-
-                    marker_count += 1
-                    if success:
-                        success_count += 1
-                        print(f"  Added duplicate marker to: {timeline_clip.name}")
-                    else:
-                        print(f"  Failed to add duplicate marker to: {timeline_clip.name}")
+            match = None
+            for clip_info in by_source_name.get(item_name, ()):
+                if (source_start >= clip_info.start_frame - SLIP_TOLERANCE
+                        and source_end <= clip_info.end_frame + SLIP_TOLERANCE):
+                    match = clip_info
                     break
+            if match is None:
+                continue
 
-        print(f"Successfully added {success_count} duplicate markers out of "
-              f"{marker_count} attempts.")
-    elif mark_duplicates:
-        print("No duplicate clips were found.")
+            if mark_duplicates and match.duplicate_set_index is not None:
+                color, marker_text, marker_note = build_duplicate_marker_text(match)
+                position = source_start + math.floor(clip_duration * 0.25)
+                try:
+                    success = timeline_clip.clip.AddMarker(
+                        position, color, marker_text, marker_note, 1, "")
+                except Exception:
+                    success = False
+                dup_marker_count += 1
+                if success:
+                    dup_success_count += 1
+                    print(f"  Added duplicate marker to: {timeline_clip.name}")
+                else:
+                    print(f"  Failed to add duplicate marker to: {timeline_clip.name}")
 
-    # Post-processing: mark retimed clips
-    if mark_retimed_clips:
-        print("Marking retimed clips in the new timeline...")
-        _p("Marking retimed clips...", 0, 0)
-        clip_list = get_all_timeline_clips(new_timeline)
-        marker_count = 0
-        success_count = 0
-        total_clips = len(clip_list)
+            if mark_retimed_clips and match.is_retimed:
+                marker_text, marker_note = build_retime_marker_text(match)
+                position = source_start + math.floor(clip_duration * 0.5)
+                try:
+                    success = timeline_clip.clip.AddMarker(
+                        position, "Red", marker_text, marker_note, 1, "")
+                except Exception:
+                    success = False
+                retime_marker_count += 1
+                if success:
+                    retime_success_count += 1
+                    print(f"  Added retime marker to clip: {timeline_clip.name}")
+                else:
+                    print(f"  Failed to add retime marker to clip: {timeline_clip.name}")
 
-        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Marking retimes: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                # Match by name and source frame range
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
+            if import_clip_names:
+                if match.source_name:
+                    ok = False
+                    try:
+                        ok = timeline_clip.clip.SetName(match.source_name)
+                    except Exception:
+                        pass
+                    if ok:
+                        print(f"  Renamed clip to: {match.source_name}")
+                        name_apply_count += 1
+                    else:
+                        print(f"  WARNING: SetName failed for: {timeline_clip.name}")
 
-                    if clip_info.is_retimed:
-                        source_start = timeline_clip.clip.GetSourceStartFrame()
-                        clip_duration = timeline_clip.clip.GetDuration()
-                        marker_position = source_start + math.floor(clip_duration * 0.5)
-
-                        # Distinguish marker types
-                        marker_text, marker_note = build_retime_marker_text(clip_info)
-
+                vnames = match.version_names or []
+                if vnames:
+                    for vname in vnames:
                         try:
-                            success = timeline_clip.clip.AddMarker(
-                                marker_position, "Red", marker_text,
-                                marker_note, 1, "",
-                            )
-                        except Exception:
-                            success = False
-
-                        marker_count += 1
-                        if success:
-                            success_count += 1
-                            print(f"  Added retime marker to clip: {timeline_clip.name}")
-                        else:
-                            print(f"  Failed to add retime marker to clip: {timeline_clip.name}")
-
-                        break  # Only mark first match
-
-        print(f"Successfully added {success_count} retime markers out of "
-              f"{marker_count} attempts.")
-
-    # Post-processing: apply source clip names + color version names
-    if import_clip_names:
-        print("Applying source clip names and color version names to new timeline...")
-        _p("Applying clip names...", 0, 0)
-        clip_list = get_all_timeline_clips(new_timeline)
-        name_apply_count = 0
-        version_apply_count = 0
-        total_clips = len(clip_list)
-
-        for ci_idx, timeline_clip in enumerate(clip_list, start=1):
-            _p(f"Applying names: {timeline_clip.name}", ci_idx, total_clips)
-            for clip_info in all_clip_infos:
-                if (timeline_clip.media_pool_item.GetName() == clip_info.media_pool_item.GetName()
-                        and timeline_clip.clip.GetSourceStartFrame() >= clip_info.start_frame - SLIP_TOLERANCE
-                        and timeline_clip.clip.GetSourceEndFrame() <= clip_info.end_frame + SLIP_TOLERANCE):
-
-                    # Set clip name from source
-                    if clip_info.source_name:
-                        ok = False
-                        try:
-                            ok = timeline_clip.clip.SetName(clip_info.source_name)
+                            timeline_clip.clip.AddVersion(vname, 0)
                         except Exception:
                             pass
-                        if ok:
-                            print(f"  Renamed clip to: {clip_info.source_name}")
-                            name_apply_count += 1
+                    if match.current_version_name:
+                        set_ok = False
+                        try:
+                            set_ok = timeline_clip.clip.SetCurrentVersion(
+                                match.current_version_name, 0)
+                        except Exception:
+                            pass
+                        if set_ok:
+                            print(f"  Set active version "
+                                  f"'{match.current_version_name}' on: "
+                                  f"{timeline_clip.name}")
                         else:
-                            print(f"  WARNING: SetName failed for: {timeline_clip.name}")
+                            print(f"  WARNING: SetCurrentVersion failed for: "
+                                  f"{timeline_clip.name}")
+                    version_apply_count += 1
 
-                    # Recreate color versions
-                    vnames = clip_info.version_names or []
-                    if vnames:
-                        for vname in vnames:
-                            try:
-                                timeline_clip.clip.AddVersion(vname, 0)
-                            except Exception:
-                                pass
-                        if clip_info.current_version_name:
-                            set_ok = False
-                            try:
-                                set_ok = timeline_clip.clip.SetCurrentVersion(
-                                    clip_info.current_version_name, 0,
-                                )
-                            except Exception:
-                                pass
-                            if set_ok:
-                                print(f"  Set active version "
-                                      f"'{clip_info.current_version_name}' on: "
-                                      f"{timeline_clip.name}")
-                            else:
-                                print(f"  WARNING: SetCurrentVersion failed for: "
-                                      f"{timeline_clip.name}")
-                        version_apply_count += 1
+        if mark_duplicates:
+            if dup_set_count > 0:
+                print(f"Successfully added {dup_success_count} duplicate markers "
+                      f"out of {dup_marker_count} attempts.")
+            else:
+                print("No duplicate clips were found.")
+        if mark_retimed_clips:
+            print(f"Successfully added {retime_success_count} retime markers out "
+                  f"of {retime_marker_count} attempts.")
+        if import_clip_names:
+            print(f"Clip names applied to {name_apply_count} clips.")
+            print(f"Color version names applied to {version_apply_count} clips.")
 
-                    break
-
-        print(f"Clip names applied to {name_apply_count} clips.")
-        print(f"Color version names applied to {version_apply_count} clips.")
 
     # Range Audit: flag any clip whose final source range on the new timeline
     # grew significantly versus the raw API-reported range. The only thing in
@@ -2601,6 +2776,43 @@ def run_workflow(
         print("")
     elif use_xml_retime:
         print("Range Audit: no clips grew significantly beyond API range.")
+
+    # Stamp the manifest. Which source timelines this was built from and with
+    # which settings is not recoverable by looking at the result, so without
+    # this an update on the timeline we just made has nothing to re-read and
+    # has to be adopted by hand. run_counter stays 0 and adopted stays False:
+    # it has had no update runs, and it was not taken over from anyone.
+    _p("Recording sources...", 0, 0)
+    new_timeline_uid = ""
+    _uid_getter = getattr(new_timeline, "GetUniqueId", None)
+    if callable(_uid_getter):
+        try:
+            new_timeline_uid = _uid_getter() or ""
+        except Exception:
+            new_timeline_uid = ""
+
+    manifest = build_manifest(
+        new_timeline_uid,
+        dst_timeline_name,
+        [timeline_source_record(name, tl) for name, tl in source_timelines],
+        build_settings_record(
+            connection_threshold=connection_threshold,
+            merge_by_source_file=merge_by_source_file,
+            video_only=video_only,
+            allow_disabled_clips=allow_disabled_clips,
+            use_xml_retime=use_xml_retime,
+            import_clip_names=import_clip_names,
+            mark_duplicates=mark_duplicates,
+            mark_retimed_clips=mark_retimed_clips,
+            preserve_track_layout=preserve_track_layout,
+        ),
+        utc_now_iso(),
+        TOOL_VERSION,
+    )
+    stored = write_manifest(new_timeline, manifest)
+    if stored["metadata"] or stored["marker"]:
+        print(f"Recorded {len(source_timelines)} source timeline(s) on "
+              f"'{dst_timeline_name}'. Update mode can re-read them.")
 
     _p("Done!", 1, 1)
     print("Done!")
@@ -3137,20 +3349,25 @@ def run_update_workflow(
             target_uid = ""
     print(f"Update target: '{target_name}' (uid {target_uid or '<unavailable>'})")
 
-    current_settings = {
-        "connection_threshold": connection_threshold,
-        "merge_by_source_file": merge_by_source_file,
-        "video_only": video_only,
-        "allow_disabled_clips": allow_disabled_clips,
-        "use_xml_retime": use_xml_retime,
-        "import_clip_names": import_clip_names,
-        "mark_duplicates": mark_duplicates,
-        "mark_retimed_clips": mark_retimed_clips,
-    }
-
     manifest, store = read_manifest(target)
     adopted = manifest is None
     forked = False
+
+    # Preserve Source Track Layout is a create-time layout, so update mode has
+    # no value of its own to record: carry the recorded one forward rather than
+    # stamping this run's False over it and losing the note it drives below.
+    current_settings = build_settings_record(
+        connection_threshold=connection_threshold,
+        merge_by_source_file=merge_by_source_file,
+        video_only=video_only,
+        allow_disabled_clips=allow_disabled_clips,
+        use_xml_retime=use_xml_retime,
+        import_clip_names=import_clip_names,
+        mark_duplicates=mark_duplicates,
+        mark_retimed_clips=mark_retimed_clips,
+        preserve_track_layout=bool(
+            ((manifest or {}).get("settings") or {}).get("preserve_track_layout")),
+    )
 
     if manifest is None:
         print("This timeline carries no All Clips manifest.")
