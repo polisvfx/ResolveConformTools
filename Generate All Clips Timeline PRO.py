@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 2.9
+Version: 3.2
 
 Two modes.
 
@@ -32,6 +32,7 @@ new timeline. Detects and marks:
 - Frame holds / freeze frames
 - Non-linear retimes / speed ramps (via XML analysis)
 - Reversed clips (normalized to forward-playing)
+- Transitions: each shot's range includes the handle frames its dissolves need
 
 UPDATE: re-reads the source timelines and reconciles an existing All Clips
 timeline against them — lengthening and shortening shots to the newest state,
@@ -39,12 +40,17 @@ appending genuinely new shots on a track of their own, and marking every shot it
 touched with a timestamped changelog. The source timelines and the settings used
 are stamped onto the timeline so a later run can find them again.
 
-Update mode only rebuilds clips whose source range actually moved, because
-Resolve has no trim and no move: changing a clip's range means deleting and
-re-appending it. Its name, clip colour, flags, enabled state and markers are
-restored afterwards, but ITS GRADE AND FUSION COMPS CANNOT BE — there is no API
-to read a grade back out. Clips carrying that work are skipped by default, and
-dry run exists because Resolve's undo stack is not scriptable.
+Update mode only touches clips whose source range actually moved. On Resolve
+21.1.2 and later it TRIMS them in place, so their grade, colour versions, Fusion
+comps and markers stay exactly as they are — provided the clip has room to grow
+on its own track (and on its linked audio track) and plays at 100%.
+
+Anything that cannot be trimmed falls back to the pre-3.0 behaviour: a boxed-in
+clip gets an updated copy on the run's track, and otherwise the clip is deleted
+and re-appended. A rebuild restores its name, clip colour, flags, enabled state
+and markers, but NOT ITS GRADE OR FUSION COMPS — there is no API to read a
+grade back out. Clips carrying that work are skipped by default on that path,
+and dry run exists because Resolve's undo stack is not scriptable.
 """
 
 from __future__ import annotations
@@ -62,7 +68,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "2.9"
+TOOL_VERSION = "3.2"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -266,6 +272,7 @@ class PlacedClip:
 class ItemState:
     """Everything about a TimelineItem that survives a delete + re-append.
 
+    Only the rebuild path needs it; an in-place trim keeps the item itself.
     Grades and Fusion comps are absent because they cannot be carried across:
     CopyGrades copies FROM a live source item, and SetCDL has no getter. Their
     presence is recorded so a clip that would lose them can be reported, and
@@ -724,6 +731,80 @@ def find_duplicate_groups(all_clip_infos: list[ClipInfo]) -> int:
     return set_index
 
 
+# ---------------------------------------------------------------------------
+# Transition handles
+# ---------------------------------------------------------------------------
+#
+# A dissolve needs source frames beyond the cut. GetSourceStartFrame() and
+# GetSourceEndFrame() describe the clip between its cut points only, so a shot
+# collected from those alone is too short to re-conform its transitions.
+#
+# Measured on 21.2.0.6: GetItemListInTrack() returns each transition as an item
+# of its own, GetType() == 'transition', spanning the record frames it covers,
+# with GetProperty('TransitionDuration'/'TransitionAlignment'). A 66-frame
+# centred Cross Dissolve over a cut at 3651 spans 3618-3684; a left-aligned one
+# ends exactly on the cut. The handle a clip needs is read from that geometry,
+# so every alignment works the same way:
+#
+#   head = cut_in  - transition_start   (transition covering the clip's in point)
+#   tail = transition_end - cut_out     (transition covering its out point)
+
+def is_transition_item(item) -> bool:
+    getter = getattr(item, "GetType", None)
+    if not callable(getter):
+        return False
+    try:
+        return getter() == "transition"
+    except Exception:
+        return False
+
+
+def track_transitions(items) -> list:
+    """[(record_start, record_end_exclusive), ...] of the transitions on a track."""
+    spans = []
+    for item in items or []:
+        if item is None or not is_transition_item(item):
+            continue
+        try:
+            start = int(item.GetStart())
+            spans.append((start, start + int(item.GetDuration())))
+        except Exception:
+            continue
+    return spans
+
+
+def transition_handle_need(record_start: int, record_end: int,
+                           transitions: list) -> tuple:
+    """(head, tail) record frames a clip must reach past its cut points.
+
+    `record_end` is exclusive. A transition covers the in point when it starts
+    before it and has not ended before it (a left-aligned one ends exactly on
+    it); it covers the out point when it starts on or before it and runs past
+    it (a right-aligned one starts exactly on it).
+    """
+    head = tail = 0
+    for start, end in transitions:
+        if start < record_start <= end:
+            head = max(head, record_start - start)
+        if start <= record_end < end:
+            tail = max(tail, end - record_end)
+    return head, tail
+
+
+def record_to_source_frames(frames: int, speed_percent) -> int:
+    """Record frames of handle as source frames, at the clip's speed."""
+    if frames <= 0:
+        return 0
+    try:
+        speed = abs(float(speed_percent))
+    except (TypeError, ValueError):
+        speed = 100.0
+    if speed <= 0:
+        return 0
+    # Ceiling division: a partial source frame of handle is still needed.
+    return int(-(-(frames * speed) // 100.0))
+
+
 def get_all_timeline_clips(timeline) -> list[TimelineClipData]:
     """Extract all video clips from all tracks of a timeline."""
     clip_list = []
@@ -770,56 +851,24 @@ def get_all_timeline_clips(timeline) -> list[TimelineClipData]:
 # ---------------------------------------------------------------------------
 
 def check_retime_properties(clip: TimelineClipData) -> tuple[bool, Optional[float], bool]:
-    """Check clip properties for retime indicators.
+    """Ask Resolve for the clip's speed directly (TimelineItem.GetSpeed, 21.1+).
 
     Returns: (is_retimed, retime_percentage, is_non_linear)
 
-    DEAD ON 21.0.4.5, and probably on every build. GetClipProperty is a
-    MediaPoolItem method; TimelineItem does not have it, and the scripting
-    bridge resolves the unknown attribute to None, so every call below raises
-    "'NoneType' object is not callable" and is swallowed by its own except.
-    Measured on 21.0.4.5: TimelineItem exposes GetProperty/SetProperty instead
-    (GetProperty("ZoomX") -> 0.5), and GetProperty("Speed") returns None — the
-    retime speed is not on that surface either.
+    Measured on 21.2.0.6: GetSpeed() answers {'Percentage': 100.0} for a plain
+    clip and reads back 50, 200 and 0 (freeze) after SetSpeed — the same
+    source-over-timeline convention is_clip_retimed() uses. It is exact, so any
+    speed other than 100% counts, with no frame threshold.
 
-    So is_clip_retimed()'s duration comparison is in practice the only thing
-    that detects a linear retime, and the XML pass the only thing that detects a
-    speed ramp: the "Retime Curve" branch here has never fired. Left in place
-    rather than deleted because it is harmless and a future build may add the
-    method, but do not read it as working detection.
+    Before 21.1 there was no way to read the speed: this used to try
+    GetClipProperty("Speed"), which TimelineItem does not have, and never fired.
+    GetProperty("Speed") still returns False on 21.2. A speed ramp is not
+    distinguishable here; the XML pass is what flags those.
     """
-    # Check Speed property
-    speed = None
-    try:
-        speed = float(clip.clip.GetClipProperty("Speed"))
-    except (ValueError, TypeError, Exception):
-        pass
-
-    if speed is not None and speed != 100.0:
-        print(f"Detected retimed clip via property: {clip.name} with speed: {speed}%")
+    speed = item_speed_percent(clip.clip)
+    if speed is not None and abs(speed - 100.0) > 0.01:
+        print(f"Detected retimed clip via GetSpeed: {clip.name} at {speed:g}%")
         return (True, speed, False)
-
-    # Check for non-linear retime (speed curve/ramp)
-    retime_curve = None
-    try:
-        retime_curve = clip.clip.GetClipProperty("Retime Curve")
-    except Exception:
-        pass
-    if retime_curve and retime_curve != "" and retime_curve != "None":
-        print(f"Detected non-linear retimed clip via Retime Curve: {clip.name} ({retime_curve})")
-        return (True, None, True)
-
-    # Check other retiming attributes
-    for attr in ("Retime Process", "Motion Estimation", "Frame Interpolation"):
-        value = None
-        try:
-            value = clip.clip.GetClipProperty(attr)
-        except Exception:
-            pass
-        if value and value != "" and value != "None":
-            print(f"Detected retimed clip via property: {clip.name} with {attr}: {value}")
-            return (True, None, False)
-
     return (False, None, False)
 
 
@@ -1356,10 +1405,16 @@ def collect_desired_clips(
             if not track_items:
                 print(f"No items in track {track_idx}")
                 continue
+            transitions = track_transitions(track_items)
+            if transitions:
+                print(f"  Track {track_idx}: {len(transitions)} transition(s); "
+                      f"their handles are added to the shots they join")
 
             for item_index, track_item in enumerate(track_items):
                 if track_item is None:
                     print(f"Track item #{item_index + 1} is nil")
+                    continue
+                if is_transition_item(track_item):
                     continue
 
                 # Get name
@@ -1428,6 +1483,23 @@ def collect_desired_clips(
                 # Normalize: always start <= end
                 norm_start = min(raw_start, raw_end)
                 norm_end = max(raw_start, raw_end)
+
+                # GetSourceEndFrame() is inclusive on a clip a human cut, but a
+                # clip AppendToTimeline placed can echo back the EXCLUSIVE
+                # endFrame instead (21.0.4.5 always; 21.2.0.6 when a recordFrame
+                # was given). Same rule as scan_timeline_placements(): an exact
+                # one-frame overhang over the duration is that form. Frame holds
+                # and reversed clips are left alone, and a retime has a duration
+                # unrelated to its source span, so it never matches by accident
+                # beyond the 1-frame case the retime thresholds ignore anyway.
+                if not is_frame_hold and not is_reversed:
+                    try:
+                        item_duration = int(track_item.GetDuration())
+                    except Exception:
+                        item_duration = None
+                    if (item_duration is not None
+                            and norm_end - norm_start + 1 - item_duration == 1):
+                        norm_end -= 1
 
                 # GetSourceEndFrame() on a source clip is the inclusive last
                 # frame, so norm_end is inclusive and passes through unchanged.
@@ -1515,6 +1587,48 @@ def collect_desired_clips(
                                       f"({new_duration}f, +{added}f, {growth:.2f}x)")
                                 norm_start = proposed_start
                                 norm_end = proposed_end
+
+                # Transition handles: the frames a dissolve on either cut needs
+                # beyond it. A reversed clip's head lies at its higher source
+                # frames, so the two ends swap. A frame hold needs nothing.
+                if transitions and not is_frame_hold:
+                    try:
+                        rec_start = int(track_item.GetStart())
+                        rec_end = rec_start + int(track_item.GetDuration())
+                    except Exception:
+                        rec_start = rec_end = None
+                    if rec_start is not None:
+                        head_rec, tail_rec = transition_handle_need(
+                            rec_start, rec_end, transitions)
+                        if head_rec or tail_rec:
+                            speed = item_speed_percent(track_item)
+                            if speed is None:
+                                speed = retime_pct if (is_retimed and retime_pct) else 100.0
+                            head_src = record_to_source_frames(head_rec, speed)
+                            tail_src = record_to_source_frames(tail_rec, speed)
+                            before = (norm_start, norm_end)
+                            if is_reversed:
+                                wanted = (norm_start - tail_src, norm_end + head_src)
+                            else:
+                                wanted = (norm_start - head_src, norm_end + tail_src)
+                            norm_start = max(0, wanted[0])
+                            norm_end = wanted[1]
+                            try:
+                                raw_media_end = media_item.GetClipProperty("End")
+                                media_end = (int(raw_media_end)
+                                             if raw_media_end not in (None, "") else None)
+                            except (TypeError, ValueError, Exception):
+                                media_end = None
+                            if media_end is not None:
+                                norm_end = min(norm_end, media_end)
+                            note = ""
+                            if (norm_start, norm_end) != wanted:
+                                note = (" (clamped at the media's edge - the "
+                                        "transition will be short of frames)")
+                            print(f"  TRANSITION HANDLES: head +{head_rec}f, "
+                                  f"tail +{tail_rec}f on the timeline -> source "
+                                  f"{before[0]}-{before[1]} -> "
+                                  f"{norm_start}-{norm_end}{note}")
 
                 # Capture source clip name + color version names if option is on
                 source_clip_name: Optional[str] = None
@@ -1805,6 +1919,37 @@ def collect_desired_clips(
 # Append Helper
 # ---------------------------------------------------------------------------
 
+def placed_source_range(item) -> tuple:
+    """(source_start, source_end_EXCLUSIVE) of a clip AppendToTimeline just placed.
+
+    Derived from GetDuration() because GetSourceEndFrame() changed convention
+    between builds. On 21.0.4.5 a clip placed from an explicit range echoed back
+    the exclusive endFrame that was requested; on 21.2.0.6 the same request
+    (endFrame=201) reports the INCLUSIVE last frame, 200. The slip check
+    compared that against the exclusive request, so on 21.2 every clip read as
+    one frame short, was retried and ended up widened by a frame. A placed clip
+    is never retimed, so start + duration is the exclusive end on every build.
+    """
+    try:
+        start = item.GetSourceStartFrame()
+        duration = item.GetDuration()
+    except Exception:
+        return None, None
+    if start is None or duration is None:
+        return None, None
+    return int(start), int(start) + int(duration)
+
+
+def with_linked(item) -> list:
+    """`item` plus everything linked to it, for DeleteClips.
+
+    Deleting only the video item of an A/V clip leaves its audio on the
+    timeline. Before 3.0 every slip retry did exactly that, so a run with
+    "Video Only" off left an orphaned audio clip behind for each retry.
+    """
+    return [item] + linked_others(item)
+
+
 def append_clip_with_slip_compensation(
     media_pool,
     timeline,
@@ -1884,12 +2029,7 @@ def append_clip_with_slip_compensation(
             break  # unexpected multi-item return; don't try to fix
         placed = placed_items[0]
         last_item = placed
-        try:
-            actual_start = placed.GetSourceStartFrame()
-            actual_end = placed.GetSourceEndFrame()
-        except Exception:
-            actual_start = None
-            actual_end = None
+        actual_start, actual_end = placed_source_range(placed)
         if actual_start is None or actual_end is None:
             break
         start_delta = actual_start - target_start
@@ -1907,7 +2047,7 @@ def append_clip_with_slip_compensation(
                 return placed, "unfixed", actual_start, actual_end
             # Widening fallback — extra frames are acceptable.
             try:
-                timeline.DeleteClips([placed], False)
+                timeline.DeleteClips(with_linked(placed), False)
             except Exception:
                 print(
                     f"  ERROR: '{clip_name}' slip unfixable and DeleteClips "
@@ -1944,11 +2084,7 @@ def append_clip_with_slip_compensation(
             wide_item = None
             if wide_items and len(wide_items) == 1:
                 wide_item = wide_items[0]
-                try:
-                    w_start = wide_item.GetSourceStartFrame()
-                    w_end = wide_item.GetSourceEndFrame()
-                except Exception:
-                    pass
+                w_start, w_end = placed_source_range(wide_item)
                 if w_start is not None and w_end is not None:
                     covers = (w_start <= target_start and w_end >= target_end)
             if covers:
@@ -1968,7 +2104,7 @@ def append_clip_with_slip_compensation(
             return wide_item, "unfixed", w_start, w_end
         # Silent retry with inverse-of-observed-slip compensation.
         try:
-            timeline.DeleteClips([placed], False)
+            timeline.DeleteClips(with_linked(placed), False)
         except Exception:
             print(
                 f"  ERROR: '{clip_name}' DeleteClips failed during "
@@ -2219,6 +2355,199 @@ def fits_in_place(free_before: int, free_after: int, head_need: int,
             and tail_need + slack <= free_after)
 
 
+# ---------------------------------------------------------------------------
+# In-place trim (Resolve 21.1.2+)
+# ---------------------------------------------------------------------------
+#
+# Resolve 21.1.2 added TimelineItem.Get/SetLeftOffset and Get/SetRightOffset.
+# Measured on 21.2.0.6 (tests/live_trim_probe.py, tests/README.md):
+#
+#   - GetLeftOffset() is the head handle and GetRightOffset() the tail handle, in
+#     TIMELINE frames. At 100% speed they equal source frames; on a 50% clip ten
+#     offset frames are five source frames; on a freeze frame they are garbage.
+#   - SetLeftOffset moves the record start and leaves the end; SetRightOffset
+#     moves the end and leaves the start. Nothing ripples.
+#   - Asking for more handle than the media has, or for a zero-length clip,
+#     returns False and leaves the clip as it was.
+#   - Extending into a neighbour returns True AND OVERWRITES THE NEIGHBOUR. The
+#     free-space check before the call is the only thing preventing that.
+#   - The grade, every colour version and the Fusion comps survive, as do the
+#     clip's own markers (they are keyed in source frames).
+#   - updateLinkedItems=True trims linked audio identically.
+
+def item_uid(item) -> Optional[str]:
+    getter = getattr(item, "GetUniqueId", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter() or None
+    except Exception:
+        return None
+
+
+def linked_others(item) -> list:
+    """The items linked to `item`, not counting `item` itself.
+
+    Whether GetLinkedItems() lists the item itself is not consistent: 21.2.0.6
+    returns only the others (a video clip with one audio channel answered with
+    one item, the audio). Counting len - 1, as earlier versions did, read that
+    clip as having no linked audio at all, so a rebuild deleted the video and
+    orphaned the audio. Filter by uid (wrapper identity is unreliable) and fall
+    back to identity only when there is no uid.
+    """
+    getter = getattr(item, "GetLinkedItems", None)
+    if not callable(getter):
+        return []
+    try:
+        linked = list(getter() or [])
+    except Exception:
+        return []
+    own = item_uid(item)
+    others = []
+    for other in linked:
+        if other is None or other is item:
+            continue
+        if own is not None and item_uid(other) == own:
+            continue
+        others.append(other)
+    return others
+
+
+def trim_api_available(item) -> bool:
+    return all(callable(getattr(item, name, None)) for name in (
+        "GetLeftOffset", "GetRightOffset", "SetLeftOffset", "SetRightOffset"))
+
+
+def item_speed_percent(item) -> Optional[float]:
+    """TimelineItem.GetSpeed()'s percentage (21.1+), or None if unavailable."""
+    getter = getattr(item, "GetSpeed", None)
+    if not callable(getter):
+        return None
+    try:
+        speed = getter()
+    except Exception:
+        return None
+    if not isinstance(speed, dict):
+        return None
+    try:
+        return float(speed.get("Percentage"))
+    except (TypeError, ValueError):
+        return None
+
+
+def plan_trim(left: int, right: int, old_src: tuple, new_src: tuple) -> tuple:
+    """(new_left, new_right, head_need, tail_need) for an in-place trim.
+
+    Only valid at 100% speed, where an offset frame is a source frame. The new
+    offsets are clamped at zero — the media's own edge — and the needs are
+    computed from the clamped values, so a request past the media asks for no
+    more room than it can actually use.
+    """
+    new_left = max(0, left + (new_src[0] - old_src[0]))
+    new_right = max(0, right - (new_src[1] - old_src[1]))
+    head_need = max(0, left - new_left)
+    tail_need = max(0, right - new_right)
+    return new_left, new_right, head_need, tail_need
+
+
+def gap_around(bounds: list, start: int, end: int, timeline_start: int = 0) -> tuple:
+    """(free_before, free_after) around [start, end) among other clips' bounds.
+
+    `bounds` are [(start, end_exclusive), ...] of the OTHER clips on the track.
+    Anything overlapping the clip itself leaves no room on that side.
+    """
+    before_edge = timeline_start
+    after_edge = None
+    for other_start, other_end in bounds:
+        if other_end <= start:
+            before_edge = max(before_edge, other_end)
+        elif other_start >= end:
+            after_edge = other_start if after_edge is None else min(after_edge,
+                                                                    other_start)
+        else:
+            return 0, 0
+    free_before = max(0, start - before_edge)
+    free_after = FREE_SPACE_UNBOUNDED if after_edge is None else max(0, after_edge - end)
+    return free_before, free_after
+
+
+def linked_item_room(timeline, linked_item, timeline_start: int = 0):
+    """(free_before, free_after) around a linked item on its own track, or None.
+
+    Read live from the timeline every time, so a trim earlier in the same run is
+    already accounted for. None means the item could not be located — the
+    caller must then not trim, since it cannot prove the trim is safe.
+    """
+    try:
+        track_type, track_index = linked_item.GetTrackTypeAndIndex()
+        start = int(linked_item.GetStart())
+        end = start + int(linked_item.GetDuration())
+        items = timeline.GetItemListInTrack(track_type, int(track_index)) or []
+    except Exception:
+        return None
+    own = item_uid(linked_item)
+    bounds = []
+    for other in items:
+        if other is None or other is linked_item:
+            continue
+        if own is not None and item_uid(other) == own:
+            continue
+        try:
+            other_start = int(other.GetStart())
+            bounds.append((other_start, other_start + int(other.GetDuration())))
+        except Exception:
+            return None
+    return gap_around(bounds, start, end, timeline_start)
+
+
+def apply_trim(item, left: int, right: int, new_left: int, new_right: int,
+               old_src: tuple) -> tuple:
+    """Trim `item` to the new offsets. (ok, achieved_start, achieved_end, why).
+
+    On any refusal or a read-back that does not match, the original offsets are
+    put back and ok is False, so the caller can fall back to a rebuild. The
+    achieved range is derived from the offsets, not from GetSourceEndFrame(),
+    which has no single convention.
+    """
+    def _restore():
+        try:
+            item.SetLeftOffset(left)
+        except Exception:
+            pass
+        try:
+            item.SetRightOffset(right)
+        except Exception:
+            pass
+
+    for setter, current, wanted, side in (
+            ("SetLeftOffset", left, new_left, "head"),
+            ("SetRightOffset", right, new_right, "tail")):
+        if wanted == current:
+            continue
+        try:
+            done = bool(getattr(item, setter)(wanted))
+        except Exception as exc:
+            _restore()
+            return False, None, None, f"{setter} raised {exc}"
+        if not done:
+            _restore()
+            return False, None, None, f"Resolve refused the {side} trim"
+
+    try:
+        got_left = int(round(item.GetLeftOffset()))
+        got_right = int(round(item.GetRightOffset()))
+    except Exception:
+        _restore()
+        return False, None, None, "could not read the offsets back"
+    if got_left != new_left or got_right != new_right:
+        _restore()
+        return False, None, None, (f"offsets read back {got_left}/{got_right}, "
+                                   f"wanted {new_left}/{new_right}")
+    achieved_start = old_src[0] + (got_left - left)
+    achieved_end = old_src[1] - (got_right - right)
+    return True, achieved_start, achieved_end, ""
+
+
 def group_desired_by_identity(clip_infos: list, merge_by_source_file: bool) -> dict:
     """identity -> [ClipInfo] sorted by source start, for the diff."""
     grouped: dict = {}
@@ -2308,15 +2637,7 @@ def scan_timeline_placements(timeline, merge_by_source_file: bool) -> tuple:
 
             accepted_start, accepted_end = read_accepted_range(normalised_markers(item))
 
-            linked_count = 0
-            linked_getter = getattr(item, "GetLinkedItems", None)
-            if callable(linked_getter):
-                try:
-                    linked = linked_getter() or []
-                    # An item lists itself among its linked items on some builds.
-                    linked_count = max(0, len(linked) - 1)
-                except Exception:
-                    linked_count = 0
+            linked_count = len(linked_others(item))
 
             name = ""
             try:
@@ -2740,10 +3061,10 @@ def run_workflow(
 
 
     # Range Audit: flag any clip whose final source range on the new timeline
-    # grew significantly versus the raw API-reported range. The only thing in
-    # the pipeline that can cause growth past 1.0x is XML retime expansion of
-    # a constituent — so this is the primary diagnostic when clips end up
-    # longer than expected.
+    # grew significantly versus the raw API-reported range. Growth past 1.0x
+    # comes from XML retime expansion of a constituent or, since 3.1, from
+    # transition handles on a short clip — so this is the primary diagnostic
+    # when clips end up longer than expected.
     audit_rows = []
     for ci in all_clip_infos:
         if ci.api_source_start is None or ci.api_source_end is None:
@@ -2765,8 +3086,9 @@ def run_workflow(
         print("")
         print(f"=== Range Audit: {len(audit_rows)} clip(s) grew "
               f">={RANGE_AUDIT_GROWTH_THRESHOLD:.1f}x vs raw API range ===")
-        print("(Cause: XML retime expansion. Disable 'Use XML for Precise "
-              "Retime Detection' to keep raw API ranges.)")
+        print("(Cause: XML retime expansion, or transition handles on a short "
+              "clip — see the TRANSITION HANDLES lines above. Disabling 'Use "
+              "XML for Precise Retime Detection' removes the first.)")
         for (growth, name, tl, api_s, api_e, api_d,
              fin_s, fin_e, fin_d, non_lin) in audit_rows:
             tag = " [non-linear]" if non_lin else ""
@@ -2974,12 +3296,7 @@ def capture_item_state(item, track_index: int) -> ItemState:
         except Exception:
             state.version_names = []
 
-    linked = getattr(item, "GetLinkedItems", None)
-    if callable(linked):
-        try:
-            state.linked_item_count = max(0, len(linked() or []) - 1)
-        except Exception:
-            state.linked_item_count = 0
+    state.linked_item_count = len(linked_others(item))
 
     return state
 
@@ -3233,6 +3550,27 @@ def clamp_desired_to_media(clip_info: ClipInfo) -> tuple:
     return start, end
 
 
+def remove_update_markers(item, markers: dict) -> int:
+    """Delete a clip's own update markers, before a trimmed clip gets this run's.
+
+    A rebuilt clip drops them on the way through restore_item_state(); a trimmed
+    clip keeps every marker, so without this each run would stack another one.
+    """
+    deleter = getattr(item, "DeleteMarkerAtFrame", None)
+    if not callable(deleter):
+        return 0
+    removed = 0
+    for frame, info in (markers or {}).items():
+        custom = (info or {}).get("customData") or ""
+        if isinstance(custom, str) and custom.startswith(UPDATE_MARKER_PREFIX):
+            try:
+                if deleter(frame):
+                    removed += 1
+            except Exception:
+                pass
+    return removed
+
+
 def write_update_marker(item, kind: str, run_no: int, note: str,
                         marker_name: str, desired_range=None) -> bool:
     """Add this run's marker to a clip, stepping off any frame already taken."""
@@ -3319,8 +3657,9 @@ def run_update_workflow(
     """Reconcile the current All Clips timeline against its source timelines.
 
     Minimal disturbance: only clips whose source range actually moved are
-    rebuilt, because Resolve has no trim or move and a rebuild costs that clip
-    its grade and Fusion comps. Everything else is left exactly as it is.
+    touched. They are trimmed in place where the build supports it and there is
+    room (_trim_in_place); otherwise they are rebuilt, which costs that clip its
+    grade and Fusion comps. Everything else is left exactly as it is.
     """
 
     def _p(stage: str, current: int = 0, total: int = 0) -> None:
@@ -3456,18 +3795,26 @@ def run_update_workflow(
     # along with it is the accident worth catching.
     recorded_records = (manifest.get("sources") or []) if manifest else []
     if recorded_records:
-        recorded_names = {}
+        current = [(timeline_source_record(name, timeline)["uid"], name)
+                   for name, timeline in unique_sources]
+        unmatched = list(range(len(current)))
+        kept, dropped = [], []
+        # Match on uid first, then on name. A copied or re-imported project gives
+        # every timeline a new uid, so resolve_timelines_by_source_record() finds
+        # them by name — matching on uid alone here then reported all of them as
+        # dropped and re-added, with a warning that shots would go unused.
         for record in recorded_records:
-            key = record.get("uid") or f"name:{record.get('name', '')}"
-            recorded_names[key] = record.get("name") or "?"
-        current_names = {}
-        for name, timeline in unique_sources:
-            record = timeline_source_record(name, timeline)
-            current_names[record["uid"] or f"name:{name}"] = name
-
-        kept = [n for k, n in recorded_names.items() if k in current_names]
-        dropped = [n for k, n in recorded_names.items() if k not in current_names]
-        added = [n for k, n in current_names.items() if k not in recorded_names]
+            rec_uid, rec_name = record.get("uid"), record.get("name") or "?"
+            hit = next((i for i in unmatched if rec_uid and current[i][0] == rec_uid),
+                       None)
+            if hit is None:
+                hit = next((i for i in unmatched if current[i][1] == rec_name), None)
+            if hit is None:
+                dropped.append(rec_name)
+            else:
+                unmatched.remove(hit)
+                kept.append(rec_name)
+        added = [current[i][1] for i in unmatched]
 
         print(f"Source set: {len(kept)} kept, {len(added)} added, "
               f"{len(dropped)} dropped")
@@ -3671,6 +4018,7 @@ def run_update_workflow(
         "cursor": end_frame + INTER_TIMELINE_GAP,
         "warned_record": False,
         "first_new_record": None,
+        "trimmed": 0,
     }
     tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
              "dropped": 0, "skipped": 0, "failed": 0}
@@ -3785,6 +4133,80 @@ def run_update_workflow(
     def _mark_in_place(placed, kind, marker_name, note):
         write_update_marker(placed.item, kind, run_no, note, marker_name)
 
+    def _trim_in_place(diff, state, label, history) -> Optional[str]:
+        """Trim the clip where it stands. Returns the outcome, or None to rebuild.
+
+        None covers every case the trim cannot prove safe or cannot do: no trim
+        API (pre-21.1.2), a retimed or frozen clip (offsets are not source
+        frames there), no room on its own track or on a linked audio track, or
+        Resolve refusing. The rebuild path that follows then handles it exactly
+        as before — including routing a boxed-in clip to the update track.
+        """
+        placed = diff.placed
+        clip_info = diff.clip_info
+        item = placed.item
+        if not trim_api_available(item):
+            return None
+        if placed.source_end - placed.source_start < 1:
+            return None
+        speed = item_speed_percent(item)
+        if speed is not None and abs(speed - 100.0) > 0.01:
+            print(f"  '{label}' plays at {speed:g}%, so its handles are not in "
+                  f"source frames; rebuilding it instead of trimming.")
+            return None
+        try:
+            left = int(round(item.GetLeftOffset()))
+            right = int(round(item.GetRightOffset()))
+        except Exception:
+            return None
+        old_src = (placed.source_start, placed.source_end)
+        new_src = (clip_info.start_frame, clip_info.end_frame)
+        new_left, new_right, head_need, tail_need = plan_trim(left, right,
+                                                              old_src, new_src)
+
+        bounds = occupancy.setdefault(placed.track_index, [])
+        index = occupancy_index(bounds, placed.record_start)
+        if index < 0:
+            return None
+        free_before, free_after = compute_free_space(bounds, index, timeline_start)
+        if not fits_in_place(free_before, free_after, head_need, tail_need):
+            return None
+
+        # Linked audio is trimmed with the video, so it needs the same room on
+        # its own track. Resolve would otherwise overwrite the neighbour there.
+        for other in linked_others(item):
+            room = linked_item_room(target, other, timeline_start)
+            if room is None or not fits_in_place(room[0], room[1], head_need,
+                                                 tail_need):
+                print(f"  '{label}' has room on its video track but not on its "
+                      f"linked audio track; not trimming it.")
+                return None
+
+        ok, achieved_start, achieved_end, why = apply_trim(
+            item, left, right, new_left, new_right, old_src)
+        if not ok:
+            print(f"  '{label}' could not be trimmed in place ({why}); "
+                  f"falling back to a rebuild.")
+            return None
+
+        bounds.pop(index)
+        try:
+            new_start = int(item.GetStart())
+            new_end = new_start + max(1, int(item.GetDuration()))
+        except Exception:
+            new_start = placed.record_start - head_need
+            new_end = placed.record_end + tail_need
+        insert_occupancy(bounds, new_start, new_end)
+
+        remove_update_markers(item, state.markers)
+        write_update_marker(item, diff.kind, run_no, history,
+                            f"Updated ({diff.kind}, run {run_no})",
+                            _accepted_for(clip_info, achieved_start, achieved_end))
+        state_box["trimmed"] += 1
+        print(f"  TRIMMED '{label}' in place: {old_src[0]}-{old_src[1]} -> "
+              f"{achieved_start}-{achieved_end}; grade and comps untouched.")
+        return diff.kind
+
     def _rebuild(diff) -> str:
         placed = diff.placed
         clip_info = diff.clip_info
@@ -3795,6 +4217,10 @@ def run_update_workflow(
         line = format_change_line(now_local, run_no, diff.head_delta,
                                   diff.tail_delta, old_src, new_src)
         history = merge_changelog(previous_update_note(state.markers), line)
+
+        trimmed = _trim_in_place(diff, state, label, history)
+        if trimmed is not None:
+            return trimmed
 
         if state.linked_item_count > 0:
             print(f"  SKIP '{label}': it has linked audio. Deleting the video item "
@@ -3995,6 +4421,9 @@ def run_update_workflow(
     for key in ("extended", "shortened", "both", "new", "superseded", "dropped",
                 "skipped", "failed"):
         print(f"  {key:<11} {tally.get(key, 0)}")
+    if changed:
+        print(f"  ({state_box['trimmed']} of the range changes were trimmed in "
+              f"place, keeping their grade; the rest were rebuilt or moved.)")
     if tally.get("failed"):
         print("  Check the log above for the clips that failed.")
     _p("Done!", 1, 1)
@@ -4230,14 +4659,17 @@ def build_and_show_ui() -> Optional[dict]:
                 "Text": "Update only: skip clips with Fusion comps or extra colour versions",
                 "Checked": True,
                 "ToolTip": (
-                    "Resolve has no trim or move, so changing a clip's range "
-                    "means deleting and re-appending it. Its name, colour, "
-                    "flags and markers are put back, but its grade and any "
-                    "Fusion comps cannot be — there is no API to read a grade "
-                    "back out.\n\n"
-                    "When ON (default): a clip carrying a Fusion comp or more "
-                    "than one colour version is left alone and marked for "
-                    "manual attention instead.\n\n"
+                    "On Resolve 21.1.2 and later a changed clip is trimmed in "
+                    "place and keeps its grade, versions and Fusion comps, so "
+                    "this option does not apply to it.\n\n"
+                    "It applies when a clip cannot be trimmed - an older "
+                    "Resolve, a retimed clip, or a trim Resolve refuses - and "
+                    "has to be deleted and re-appended instead. Its name, "
+                    "colour, flags and markers are put back, but its grade "
+                    "and Fusion comps cannot be.\n\n"
+                    "When ON (default): such a clip carrying a Fusion comp or "
+                    "more than one colour version is left alone and marked "
+                    "for manual attention instead.\n\n"
                     "When OFF: it is rebuilt anyway and that work is lost."
                 ),
             }),

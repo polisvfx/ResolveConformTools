@@ -37,6 +37,7 @@ A full Python rewrite of the Lua script with improved retime handling and XML-ba
 - **Retime handling**: Correctly detects and handles retimed clips, reversed clips, and frame holds (freeze frames). All clips are normalized to forward-playing source ranges on the master timeline.
 - **XML retime analysis (2.8+)**: Optionally exports the source timeline to FCP 7 XML and reads the Time Remap curve, then widens each clip's source range to every frame its ramp actually touches. This matters because `GetSourceStartFrame`/`GetSourceEndFrame` can only express an in and an out, so a **negative speed ramp — one that runs past its out-point and reverses back — is under-reported by the API**, and those frames would be silently missing from a pull. Measured on a real ramp: the API reported source 0-3119 while the curve reached 8750, so 5631 frames were recovered. The range is scoped to the clip's own window into the curve and unioned with the API range, so it only ever widens. Before 2.8 this pass detected nothing at all — see the release notes for that history.
 - **Distinct retime markers**: Red markers distinguish between "Frame Hold", "Non-Linear Retime", "Retimed Clip" (with speed percentage) and "Extreme Retime", with a note when the source was originally reversed. A whip past 400% gets the last of those: the percentage stops meaning anything at that speed, so the marker reports the source span instead (`31 source frames (1717-1747) played over roughly 5 timeline frames`).
+- **Transition handles (3.1+)**: A dissolve needs source frames beyond the cut, but the API's in and out describe only the cut. Each shot's range now includes the frames its transitions need, read from where each transition actually sits, so centred, start-on-edit and end-on-edit transitions all work: a 66-frame centred dissolve adds 33 frames to both shots it joins. Retimed shots are scaled by their speed, and a handle that runs past the start or end of the media is clamped and logged. Before 3.1 shots with dissolves came out too short to re-conform them. Update mode will now see such shots on older timelines as extended and grow them to match.
 - **Clean API calls**: Only API-recognized fields are passed to `AppendToTimeline`, preventing silent failures caused by extra metadata.
 - **Complete source ranges (2.3+)**: `AppendToTimeline`'s `endFrame` is *exclusive* — asking for `endFrame=E` places frames up to `E-1`. Every clip is now requested one frame past its last frame, so the range that lands is the range that was asked for, and freeze frames (a one-frame range, previously refused as zero-length) place correctly.
 - All features from the Lua version (sorting, merging, duplicate marking, audio removal) are fully preserved.
@@ -69,34 +70,42 @@ cannot be undone in one step. Dry run prints the whole plan and writes nothing.
 
 ##### What it costs, and why
 
-Resolve's API has no trim and no move. Changing a clip's range therefore means
-deleting it and re-appending it, and **a rebuilt clip loses its grade and its
-Fusion comps** — `CopyGrades` needs the source clip still alive and there is no
-way to read a grade back out. Its name, clip colour, flags, enabled state and
-your own markers *are* restored. Clips carrying a Fusion comp or more than one
-colour version are skipped by default and flagged for manual attention; untick
-*skip clips with Fusion comps* to rebuild them anyway.
+**On Resolve 21.1.2 and later (PRO 3.0+), a changed clip is trimmed in place.**
+It stays the same clip, so its grade, colour versions, Fusion comps and markers
+are all kept, and linked audio is trimmed along with it. Verified on 21.2.0.6.
 
-That constraint is why only clips whose range actually moved are touched, and it
-shapes one behaviour worth expecting: **on a gapless timeline a clip has nowhere
-to grow**, so extensions are placed as a full-range copy on the run's update
-track and the original is marked superseded rather than moved. Growth happens in
-place only where a gap exists — usually one that a shortening opened earlier in
-the same run, which is why range changes are applied smallest-delta first.
+A clip is only trimmed where it has room. Resolve does not refuse a trim that
+runs into the next clip: it reports success and cuts into that clip. So the
+script checks for free space on the clip's track, and on its linked audio track,
+before every trim. That shapes one behaviour worth expecting: **on a gapless
+timeline a clip has nowhere to grow**, so the extension is placed as a
+full-range copy on the run's update track and the original is marked
+superseded rather than moved. Shortening always fits.
+
+Anything that cannot be trimmed falls back to the older behaviour: the clip is
+deleted and re-appended, and **a rebuilt clip loses its grade and its Fusion
+comps** — there is no way to read a grade back out. That happens on Resolve
+builds before 21.1.2, for retimed clips (their handles are not counted in source
+frames), and when Resolve refuses a trim. Its name, clip colour, flags, enabled
+state and your own markers *are* restored. On that path, clips carrying a Fusion
+comp or more than one colour version are skipped by default and flagged for
+manual attention; untick *skip clips with Fusion comps* to rebuild them anyway.
 
 Other things to know:
 
-- **Growing and shrinking are not treated alike.** A shot is rebuilt once it
+- **Growing and shrinking are not treated alike.** A shot is updated once it
   needs more than 3 frames it does not have, but only once it is carrying more
   than 12 surplus frames. Missing frames break a pull; surplus frames are just
-  handle, and rebuilding to remove a few of them would cost that clip its grade
-  for nothing. Both are constants near the top of the script
+  handle, and on the rebuild path removing a few of them would cost that clip
+  its grade for nothing. Both are constants near the top of the script
   (`UPDATE_CHANGE_TOLERANCE`, `UPDATE_SHRINK_TOLERANCE`) if your handles differ.
 - **The tool owns source ranges.** A clip you trimmed by hand — by more than
   those thresholds — reads as changed and is put back to the collected range.
   Every such rebuild is marked.
-- **Video only.** A clip with linked audio is skipped: deleting the video item
-  would orphan the audio. Generate with *Video Only* on, which is the default.
+- **Video only.** A clip with linked audio is trimmed together with its audio
+  when both tracks have room. When it would need a rebuild or an update-track
+  copy instead, it is skipped and marked for manual attention: deleting the
+  video item would orphan the audio. *Video Only* on, the default, avoids that.
 - **The connection threshold matters between runs.** It decides which source
   edits merge into one range, so changing it makes nearly everything read as
   changed. The value used is stored and offered back to you; the script warns
