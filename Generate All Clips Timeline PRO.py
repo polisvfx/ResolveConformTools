@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.3
+Version: 3.4
 
 Two modes.
 
@@ -45,8 +45,9 @@ Update mode only touches clips whose source range actually moved. On Resolve
 comps and markers stay exactly as they are — provided the clip has room to grow
 on its own track (and on its linked audio track) and plays at 100%.
 
-A clip with no room where it stands is moved up a track and trimmed there (3.3),
-so there is still only one version of the shot.
+A clip with no room where it stands gets room made for it, so there is still
+only one version of the shot: either every later clip is shifted right to open
+the gap, or the clip itself is moved up a track and trimmed there (3.3).
 
 Anything that can be neither trimmed nor moved falls back to the pre-3.0
 behaviour: a boxed-in clip gets an updated copy on the run's track, and
@@ -71,7 +72,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.3"
+TOOL_VERSION = "3.4"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -183,6 +184,13 @@ CHANGELOG_SEPARATOR = " | "
 # run_update_workflow expects.
 MODE_CREATE = "Create New Timeline"
 MODE_UPDATE = "Update Existing Timeline"
+# How update mode makes room for a clip that has none where it stands.
+ROOM_SHIFT = "shift"   # push every later clip, on every track, to the right
+ROOM_LIFT = "lift"     # move the clip itself up a track
+ROOM_MODES = [
+    ("Shift later clips", ROOM_SHIFT),
+    ("Move the clip up a track", ROOM_LIFT),
+]
 SOURCE_MODES = [
     ("Recorded in timeline", "Recorded"),
     ("Current selection", "Selection"),
@@ -3686,6 +3694,7 @@ def run_update_workflow(
     protect_graded_clips: bool,
     dry_run: bool,
     progress: Optional["ProgressUI"] = None,
+    make_room: str = ROOM_SHIFT,
 ) -> None:
     """Reconcile the current All Clips timeline against its source timelines.
 
@@ -4053,6 +4062,8 @@ def run_update_workflow(
         "first_new_record": None,
         "trimmed": 0,
         "lifted": 0,
+        "shifts": 0,
+        "shift_frames": 0,
     }
     tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
              "dropped": 0, "skipped": 0, "failed": 0}
@@ -4167,6 +4178,99 @@ def run_update_workflow(
     def _mark_in_place(placed, kind, marker_name, note):
         write_update_marker(placed.item, kind, run_no, note, marker_name)
 
+    def _shift_from(point: int, delta: int) -> bool:
+        """Move everything starting at or after `point` right by `delta`.
+
+        Every video and audio track moves together, so clips stacked above one
+        another stay stacked. Measured on 21.2.0.6: one MoveItems call takes
+        video and audio items from several tracks, keeps each on its own track,
+        and accepts a block whose new positions overlap its own old ones.
+        Timeline ruler markers do not move with the clips.
+
+        A clip on another track that straddles `point` stays where it is; the
+        clips after it only move away from it, so nothing can collide.
+        """
+        mover = getattr(target, "MoveItems", None)
+        if not callable(mover) or delta <= 0:
+            return False
+        moving = []
+        for kind in ("video", "audio"):
+            try:
+                count = target.GetTrackCount(kind) or 0
+            except Exception:
+                count = 0
+            for track in range(1, count + 1):
+                try:
+                    items = target.GetItemListInTrack(kind, track) or []
+                except Exception:
+                    return False
+                for other in items:
+                    if other is None:
+                        continue
+                    if is_transition_item(other):
+                        # How a transition travels with its clips is unmeasured.
+                        print("  This timeline has transitions on it; not "
+                              "shifting clips around them.")
+                        return False
+                    try:
+                        start = int(other.GetStart())
+                    except Exception:
+                        return False
+                    if start >= point:
+                        moving.append((start, other))
+        if moving:
+            leftmost = min(start for start, _other in moving)
+            try:
+                done = bool(mover([other for _start, other in moving],
+                                  {"startFrame": leftmost + delta}, False))
+            except Exception:
+                done = False
+            if not done:
+                return False
+            probe_start, probe = moving[0]
+            try:
+                landed = int(probe.GetStart())
+            except Exception:
+                landed = None
+            if landed != probe_start + delta:
+                print(f"  ERROR: asked Resolve to shift clips from frame {point} "
+                      f"by {delta}f, but one moved from {probe_start} to "
+                      f"{landed}. Check the timeline before going on.")
+                return False
+
+        for track_bounds in occupancy.values():
+            for entry in track_bounds:
+                if entry[0] >= point:
+                    entry[0] += delta
+                    entry[1] += delta
+        for other_diff in diffs:
+            other_placed = other_diff.placed
+            if other_placed is not None and other_placed.record_start >= point:
+                other_placed.record_start += delta
+                other_placed.record_end += delta
+        state_box["cursor"] += delta
+        if (state_box["first_new_record"] is not None
+                and state_box["first_new_record"] >= point):
+            state_box["first_new_record"] += delta
+        state_box["shifts"] += 1
+        state_box["shift_frames"] += delta
+        return True
+
+    def _open_gaps(placed, head_need, tail_need, free_before, free_after) -> bool:
+        """Push later clips right until this clip has the room it needs.
+
+        The head gap is opened by moving the clip itself (and everything after
+        it) right, so that trimming its head back brings it to where it was.
+        The tail gap is opened by moving only what follows it.
+        """
+        head_short = max(0, head_need - free_before)
+        tail_short = max(0, tail_need - free_after)
+        if head_short and not _shift_from(placed.record_start, head_short):
+            return False
+        if tail_short and not _shift_from(placed.record_end, tail_short):
+            return False
+        return True
+
     def _lift(item, placed, label, linked, left, right, new_left,
               new_right) -> Optional[int]:
         """Move a boxed-in clip up to a track with room. Returns the track.
@@ -4262,15 +4366,32 @@ def run_update_workflow(
 
         # No room where it stands: move the clip itself up a track and trim it
         # there, rather than leaving it and adding a second copy of the shot.
+        # ...or, by choice, push the later clips right to open the gap, which
+        # keeps everything on its own track and in order.
         lifted_to = None
+        shifted_by = 0
         if not fits_in_place(free_before, free_after, head_need, tail_need):
-            lifted_to = _lift(item, placed, label, linked,
-                              left, right, new_left, new_right)
-            if lifted_to is None:
-                return None
-            bounds.pop(index)
-            bounds = occupancy.setdefault(lifted_to, [])
-            index = None
+            frames_before = state_box["shift_frames"]
+            made_room = (make_room == ROOM_SHIFT and _open_gaps(
+                placed, head_need, tail_need, free_before, free_after))
+            shifted_by = state_box["shift_frames"] - frames_before
+            if shifted_by:
+                # Some or all of it moved: the clip's own entry moved with it.
+                index = occupancy_index(bounds, placed.record_start)
+                if index < 0:
+                    return None
+                free_before, free_after = compute_free_space(
+                    bounds, index, timeline_start)
+                made_room = made_room and fits_in_place(
+                    free_before, free_after, head_need, tail_need)
+            if not made_room:
+                lifted_to = _lift(item, placed, label, linked,
+                                  left, right, new_left, new_right)
+                if lifted_to is None:
+                    return None
+                bounds.pop(index)
+                bounds = occupancy.setdefault(lifted_to, [])
+                index = None
 
         def _put_back():
             if lifted_to is None:
@@ -4319,7 +4440,9 @@ def run_update_workflow(
                             _accepted_for(clip_info, achieved_start, achieved_end))
         state_box["trimmed"] += 1
         if lifted_to is None:
-            print(f"  TRIMMED '{label}' in place: {old_src[0]}-{old_src[1]} -> "
+            how = (f"after shifting later clips {shifted_by}f right"
+                   if shifted_by else "in place")
+            print(f"  TRIMMED '{label}' {how}: {old_src[0]}-{old_src[1]} -> "
                   f"{achieved_start}-{achieved_end}; grade and comps untouched.")
         else:
             state_box["lifted"] += 1
@@ -4552,6 +4675,11 @@ def run_update_workflow(
               f"without a rebuild, keeping their grade - "
               f"{state_box['lifted']} of them after moving the clip up a "
               f"track for room; the rest were rebuilt or copied.)")
+    if state_box["shifts"]:
+        print(f"  Later clips were shifted right {state_box['shifts']} time(s), "
+              f"{state_box['shift_frames']}f in total, to open gaps. Timeline "
+              f"ruler markers do not move with clips, so markers from earlier "
+              f"runs may no longer sit over the clips they were placed at.")
     if tally.get("failed"):
         print("  Check the log above for the clips that failed.")
     _p("Done!", 1, 1)
@@ -4782,6 +4910,27 @@ def build_and_show_ui() -> Optional[dict]:
                     "rely on sub-clips being treated as their own sources)."
                 ),
             }),
+            ui.HGroup({}, [
+                ui.Label({"ID": "makeRoomLabel",
+                          "Text": "Update only: make room by"}),
+                ui.ComboBox({
+                    "ID": "makeRoom",
+                    "ToolTip": (
+                        "What to do when a shot got longer but has no free "
+                        "space next to it, which is the normal case on a "
+                        "gapless All Clips timeline. Either way it stays the "
+                        "same clip and keeps its grade.\n\n"
+                        "Shift later clips: every clip after it, on every "
+                        "track, is pushed right to open the gap. Shots stay on "
+                        "their tracks and in order, but everything after the "
+                        "shot changes timecode, and ruler markers do not "
+                        "move with the clips.\n\n"
+                        "Move the clip up a track: only that shot moves, to "
+                        "the first track above it with room. Nothing else "
+                        "changes position."
+                    ),
+                }),
+            ]),
             ui.CheckBox({
                 "ID": "protectGradedClips",
                 "Text": "Update only: skip clips with Fusion comps or extra colour versions",
@@ -4847,6 +4996,8 @@ def build_and_show_ui() -> Optional[dict]:
 
     for label, _value in SOURCE_MODES:
         itm["sourceTimelines"].AddItem(label)
+    for label, _value in ROOM_MODES:
+        itm["makeRoom"].AddItem(label)
 
     itm["selectionMethod"].AddItem("Current Selection")
     itm["selectionMethod"].AddItem("Current Bin")
@@ -4872,7 +5023,8 @@ def build_and_show_ui() -> Optional[dict]:
         # that already exists and that the user has since worked on.
         for widget_id in ("DstTimelineName", "sortingMethod", "preserveTrackLayout"):
             _set(widget_id, "Enabled", not updating)
-        for widget_id in ("sourceTimelines", "protectGradedClips", "dryRun"):
+        for widget_id in ("sourceTimelines", "makeRoom", "protectGradedClips",
+                          "dryRun"):
             _set(widget_id, "Enabled", updating)
         if updating and recorded_settings and not prefilled["done"]:
             # Offer the settings this timeline was last built with: changing the
@@ -4932,6 +5084,7 @@ def build_and_show_ui() -> Optional[dict]:
         "preserve_track_layout": itm["preserveTrackLayout"].Checked,
         "merge_by_source_file": itm["mergeBySourceFile"].Checked,
         "protect_graded_clips": itm["protectGradedClips"].Checked,
+        "make_room": dict(ROOM_MODES).get(itm["makeRoom"].CurrentText, ROOM_SHIFT),
         "dry_run": itm["dryRun"].Checked,
     }
 
@@ -4959,6 +5112,7 @@ def main():
             call = {key: params[key] for key in shared}
             call["source_selection_mode"] = params["source_selection_mode"]
             call["protect_graded_clips"] = params["protect_graded_clips"]
+            call["make_room"] = params["make_room"]
             call["dry_run"] = params["dry_run"]
             run_update_workflow(progress=progress, **call)
         else:

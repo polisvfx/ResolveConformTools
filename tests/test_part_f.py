@@ -815,6 +815,7 @@ UI_RESULT = {
     "preserve_track_layout": False,
     "merge_by_source_file": True,
     "protect_graded_clips": True,
+    "make_room": "shift",
     "dry_run": True,
 }
 
@@ -838,6 +839,7 @@ check("update mode calls run_update_workflow", calls[-1][0], "update")
 check("update mode passes the source mode",
       calls[-1][1]["source_selection_mode"], "Union")
 check("update mode passes dry run", calls[-1][1]["dry_run"], True)
+check("update mode passes how to make room", calls[-1][1]["make_room"], "shift")
 check("update mode does not pass create-only options",
       [k for k in ("dst_timeline_name", "sorting_method", "preserve_track_layout")
        if k in calls[-1][1]], [])
@@ -1684,6 +1686,134 @@ check_true("and handled the old way, with a copy on the update track",
            "placing the updated version on the update track" in log)
 check("no clip overlaps another", no_overlaps(dest), True)
 
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
+
+
+# ---------------------------------------------------------------------------
+# 3.4: make room by shifting later clips
+# ---------------------------------------------------------------------------
+#
+# Measured on 21.2.0.6: Timeline.MoveItems moves a block from several tracks in
+# one call, each item keeping its track, the leftmost going to startFrame.
+
+print("\n== 3.4 shift later clips to open gaps ==")
+
+
+def _move_items(self, items, position, move_linked=True, subframe=False):
+    delta = position["startFrame"] - min(i.record_start for i in items)
+    for item in items:
+        item.record_start += delta
+    self.move_calls = getattr(self, "move_calls", 0) + 1
+    return True
+
+
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+Timeline.MoveItems = _move_items
+
+# -- a middle clip growing both ways on a gapless spine, with a clip above ----
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501, fusion_comps=1),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 86620, track=2)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+above = dest.tracks[2][0]
+mod = load(res)
+log = run_update(mod)          # make_room defaults to shifting
+check("the grown clip is still the same clip on its own track",
+      (items_on(dest, 1)[1] is b, b.track), (True, 1))
+check("it covers the new range", (b.source_start, b.source_end), (480, 640))
+check("it starts where it did - right after the clip before it",
+      b.record_start, 86501)
+check("the clip before it has not moved", a.record_start, 86400)
+check("the clip after it moved right by both gaps (20 + 40)",
+      c.record_start, 86602 + 60)
+check("the clip stacked above moved by the same amount",
+      (above.track, above.record_start), (2, 86620 + 60))
+check("the spine is still gapless",
+      (a.GetEnd() == b.record_start, b.GetEnd() == c.record_start), (True, True))
+check("no clip overlaps another", no_overlaps(dest), True)
+check("nothing was appended and no track was added",
+      (project.media_pool.append_calls, dest.GetTrackCount("video")), ([], 2))
+check("its Fusion comp is still there", b.fusion_comps, 1)
+check_true("the log says what was shifted",
+           "after shifting later clips 60f right" in log
+           and "60f in total" in log)
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("an immediate re-run has nothing to do", "Nothing to do" in log2)
+
+# -- the first clip's head grows: it must not start before the timeline -------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+Item.timeline = dest
+first, second = dest.tracks[1]
+mod = load(res)
+run_update(mod)
+check("the first clip grows its head and still starts the timeline",
+      (first.record_start, first.source_start), (86400, 80))
+check("the next clip moved right to make the room", second.record_start,
+      86501 + 20)
+
+# -- two clips grow in one run: the second sees the first one's shift ---------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 230)], "shot_b": [(470, 600)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+mod = load(res)
+run_update(mod)
+check("both grew", ((a.source_start, a.source_end), (b.source_start, b.source_end)),
+      ((100, 230), (470, 600)))
+check("in order, gapless, nothing overlapping",
+      (a.record_start, a.GetEnd() == b.record_start, b.GetEnd() == c.record_start,
+       no_overlaps(dest)), (86400, True, True, True))
+
+# -- the other choice still moves the clip up a track -------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+mod = load(res)
+run_update(mod, make_room="lift")
+check("with 'move up a track' nothing is shifted",
+      (b.track, c.record_start, getattr(dest, "move_calls", 0)), (2, 86602, 0))
+
+# -- a timeline with a transition on it is not shifted; the clip is lifted ----
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+_listing = dest.GetItemListInTrack
+_dissolve = types.SimpleNamespace(
+    GetType=lambda: "transition", GetStart=lambda: 86700,
+    GetDuration=lambda: 20, GetMediaPoolItem=lambda: None,
+    GetName=lambda: "Cross Dissolve")
+dest.GetItemListInTrack = lambda kind, index: (
+    _listing(kind, index) + ([_dissolve]
+                             if (kind, index) == ("video", 1) else []))
+mod = load(res)
+log = run_update(mod)
+check_true("transitions on the timeline stop the shift",
+           "not shifting clips around them" in log)
+check("and nothing was moved along the track", c.record_start, 86602)
+
+del Timeline.MoveItems
 for _name in LIFT_API:
     delattr(Item, _name)
 del Item.timeline

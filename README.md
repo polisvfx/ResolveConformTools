@@ -79,14 +79,27 @@ runs into the next clip: it reports success and cuts into that clip. So the
 script checks for free space on the clip's track, and on its linked audio track,
 before every trim. Shortening always fits.
 
-**On a gapless timeline a clip has nowhere to grow, so it is moved up a track
-and lengthened there (3.3+).** It is still the same clip, with its grade, and
-there is only ever one version of the shot. It goes to the lowest track above it
-that is free over the span it needs, or to a new track named for the run. Its
-kept frames stay at the same timeline position, so it sits directly above the
-gap it left; the one exception is a shot at the very start of the timeline whose
-head grows, which is shifted right so it does not start before the timeline. The
-marker on the clip says which track it moved to.
+**On a gapless timeline a clip has nowhere to grow, so room is made for it.**
+Either way it is still the same clip, with its grade, and there is only ever one
+version of the shot. *Update only: make room by* chooses how:
+
+- **Shift later clips (3.4+, the default).** Every clip after the shot, on every
+  video and audio track, is pushed right by exactly the frames the shot needs,
+  and the shot is lengthened into the gap. Shots stay on their own tracks and in
+  the same order, and clips stacked above one another stay stacked. The cost is
+  that everything after the shot changes timecode. Because all tracks move
+  together, a shot growing on one track leaves a gap of that size on the others.
+  Timeline ruler markers do not move with clips, so the run markers of earlier
+  updates may no longer sit over the clips they were placed at. A timeline that
+  has transitions on it is not shifted; its clips are moved up a track instead.
+- **Move the clip up a track (3.3+).** Only that shot moves, to the lowest track
+  above it that is free over the span it needs, or to a new track named for the
+  run. Its kept frames stay at the same timeline position, so it sits directly
+  above the gap it left, and nothing else changes position. The marker on the
+  clip says which track it moved to.
+
+In both, a shot at the very start of the timeline whose head grows never ends up
+starting before the timeline does.
 
 A full-range copy on the update track, with the original marked superseded, is
 now only the fallback for a clip that can be neither trimmed nor moved.
