@@ -831,6 +831,7 @@ UI_RESULT = {
     "merge_by_source_file": True,
     "protect_graded_clips": True,
     "make_room": "shift",
+    "sync_stacked": True,
     "dry_run": True,
 }
 
@@ -1827,6 +1828,141 @@ log = run_update(mod)
 check_true("transitions on the timeline stop the shift",
            "not shifting clips around them" in log)
 check("and nothing was moved along the track", c.record_start, 86602)
+
+del Timeline.MoveItems
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
+
+
+# ---------------------------------------------------------------------------
+# Clips stacked exactly above a shot follow it
+# ---------------------------------------------------------------------------
+#
+# The user duplicates a shot to the track above and conforms it to the
+# published plate: different media, same record in and out. It is in no source
+# timeline, so without this it was reported as no longer used.
+
+print("\n== clips stacked above a shot ==")
+
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+Timeline.MoveItems = _move_items
+
+
+def stacked_world(source_ranges, plate_src=(1000, 1100), plate_end=5000):
+    res, project, dest, src = build_world(
+        source_ranges,
+        [make_dest("shot_a", (100, 200), 86400),
+         make_dest("shot_b", (500, 600), 86501),
+         make_dest("shot_c", (700, 800), 86602),
+         make_dest("plate_b", plate_src, 86501, track=2)])
+    Item.timeline = dest
+    plate = dest.tracks[2][0]
+    plate.mpi._end = plate_end
+    return res, project, dest, plate
+
+
+SAME = {"shot_a": [(100, 200)], "shot_b": [(500, 600)], "shot_c": [(700, 800)]}
+GROWN = {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]}
+
+# -- nothing changed: the plate is not flagged ---------------------------------
+res, project, dest, plate = stacked_world(SAME)
+log = run_update(load(res))
+check_true("a clip exactly above a shot is reported as stacked",
+           "stacked        1" in log)
+check_true("it is not reported as unused", "- unused" not in log)
+check("and gets no marker", update_markers(plate), [])
+check_true("so a matching timeline still has nothing to do", "Nothing to do" in log)
+
+# -- with the option off it is flagged, as before ------------------------------
+res, project, dest, plate = stacked_world(SAME)
+log = run_update(load(res), sync_stacked=False)
+check("with the option off it is marked no longer used",
+      [m["color"] for m in update_markers(plate)], ["Rose"])
+
+# -- a stale 'no longer used' marker from an earlier run is taken off again ----
+res, project, dest, plate = stacked_world(SAME)
+mod = load(res)
+run_update(mod, sync_stacked=False)
+run_update(mod, source_selection_mode="Recorded")
+check("the stale marker is removed once the clip is recognised as stacked",
+      update_markers(plate), [])
+
+# -- the shot grows; later clips shift; the plate grows with it ----------------
+res, project, dest, plate = stacked_world(GROWN)
+a, b, c = dest.tracks[1]
+log = run_update(load(res))
+check("the shot grew in place", (b.record_start, b.source_start, b.source_end),
+      (86501, 480, 640))
+check("the plate grew by the same frames at each end",
+      (plate.source_start, plate.source_end), (980, 1140))
+check("and still sits exactly above its shot",
+      (plate.track, plate.record_start, plate.GetEnd()),
+      (2, b.record_start, b.GetEnd()))
+check("the next shot moved right to make the room", c.record_start, 86602 + 60)
+check("no clip overlaps another", no_overlaps(dest), True)
+marks = update_markers(plate)
+check("the plate is marked as following its shot",
+      [m["color"] for m in marks], ["Lavender"])
+check_true("and its note says by how much",
+           "head +20f, tail +40f" in marks[0]["note"])
+check_true("it is not called short", "SHORT" not in marks[0]["name"])
+
+# -- the plate has too few frames: as far as it goes, still in sync -----------
+# Plate media runs 990..1110 only: 10 spare frames at each end.
+res, project, dest, plate = stacked_world(GROWN, plate_src=(1000, 1100),
+                                          plate_end=1110)
+plate.GetLeftOffset = lambda: float(plate.source_start - 990)
+_plain_set_left = Item.SetLeftOffset
+plate.SetLeftOffset = lambda off, *a: _plain_set_left(plate, off + 990, *a)
+a, b, c = dest.tracks[1]
+mod = load(res)
+log = run_update(mod)
+check("the shot still gets its full range", (b.source_start, b.source_end),
+      (480, 640))
+check("the plate takes every frame it has",
+      (plate.source_start, plate.source_end), (990, 1110))
+check("it is shorter than the shot now",
+      (plate.record_start - b.record_start, b.GetEnd() - plate.GetEnd()),
+      (10, 30))
+# Sync: plate frame 1000 was over shot frame 500 before, and must still be.
+check("but the frames it had are still over the same shot frames",
+      (plate.record_start + (1000 - plate.source_start))
+      - (b.record_start + (500 - b.source_start)), 0)
+marks = update_markers(plate)
+check_true("it is marked short", "SHORT" in marks[0]["name"]
+           and "10f at the head and 30f at the tail" in marks[0]["note"])
+check_true("the log counts it", "ended up SHORTER" in log)
+
+# A later run still knows the short plate belongs to the shot.
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("a short plate is still recognised on the next run",
+           "stacked        1" in log2 and "- unused" not in log2)
+check_true("and there is nothing to do", "Nothing to do" in log2)
+
+# -- the shot shrinks: the plate shrinks with it and the gap stays -------------
+res, project, dest, plate = stacked_world(
+    {"shot_a": [(100, 200)], "shot_b": [(520, 570)], "shot_c": [(700, 800)]})
+a, b, c = dest.tracks[1]
+run_update(load(res))
+check("the shot was shortened at both ends", (b.source_start, b.source_end),
+      (520, 570))
+check("the plate was shortened the same way",
+      (plate.source_start, plate.source_end, plate.record_start, plate.GetEnd()),
+      (1020, 1070, b.record_start, b.GetEnd()))
+check("the shots either side did not move - the gaps stay",
+      (a.record_start, c.record_start, b.record_start - a.GetEnd(),
+       c.record_start - b.GetEnd()), (86400, 86602, 20, 30))
+
+# -- moving the shot up a track leaves the plate trimmed in place -------------
+res, project, dest, plate = stacked_world(GROWN)
+a, b, c = dest.tracks[1]
+run_update(load(res), make_room="lift")
+check("with 'move up a track' the shot goes above its plate", b.track, 3)
+check("and the plate still grew with it, in sync",
+      (plate.track, plate.source_start, plate.source_end, plate.record_start),
+      (2, 980, 1140, b.record_start))
 
 del Timeline.MoveItems
 for _name in LIFT_API:

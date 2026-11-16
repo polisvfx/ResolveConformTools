@@ -56,14 +56,15 @@ against what they say now:
 - shots whose source range grew or shrank are brought to the newest state,
 - genuinely new shots are appended on a **new video track per run**, named for
   the run (`Update 3 - 2026-08-06`), flush after the existing content and back
-  to back with no gaps between them (3.5+; earlier versions left 25 frames),
+  to back with no gaps between them (3.3+; earlier versions left 25 frames),
 - shots that no longer appear in any source are **marked, never removed**,
 - every shot it touches gets a marker with a timestamp and a short changelog,
   e.g. `2026-08-06 14:22 | run 3 | head +20f, tail +40f | 100-200 -> 80-240`,
   accumulating up to eight entries before the tail is summarised.
 
 Marker colours: green extended, yellow shortened, sand both ends, mint new,
-purple superseded, rose no longer used, fuchsia needs manual attention. A Sky
+purple superseded, rose no longer used, fuchsia needs manual attention,
+lavender stacked clip that followed its shot. A Sky
 marker on the timeline ruler summarises each run.
 
 **Run a dry run first.** Resolve's undo stack is not scriptable, so an update
@@ -84,7 +85,7 @@ before every trim. Shortening always fits.
 Either way it is still the same clip, with its grade, and there is only ever one
 version of the shot. *Update only: make room by* chooses how:
 
-- **Shift later clips (3.4+, the default).** Every clip after the shot, on every
+- **Shift later clips (3.3+, the default).** Every clip after the shot, on every
   video and audio track, is pushed right by exactly the frames the shot needs,
   and the shot is lengthened into the gap. Shots stay on their own tracks and in
   the same order, and clips stacked above one another stay stacked. The cost is
@@ -113,6 +114,26 @@ frames), and when Resolve refuses a trim. Its name, clip colour, flags, enabled
 state and your own markers *are* restored. On that path, clips carrying a Fusion
 comp or more than one colour version are skipped by default and flagged for
 manual attention; untick *skip clips with Fusion comps* to rebuild them anyway.
+
+**Clips stacked exactly above a shot follow it (3.3+).** If you duplicate a shot
+to the track above and conform it to something else - a published plate, say -
+that clip is in no source timeline. With *keep clips stacked exactly above a
+shot in sync with it* on (the default), a clip on a higher track with the same
+timeline in and out as a shot is treated as belonging to that shot:
+
+- it is not marked as no longer used,
+- when the shot gets longer or shorter it is trimmed by the same frames at the
+  same ends, and when later clips are shifted it moves with them,
+- if its media has too few frames, or there is no room on its track, it grows as
+  far as it can and gets a Lavender marker saying how many frames short it is.
+  It is then shorter than the shot, but the frames it has stay over the same
+  frames of the shot, and later runs still recognise it from that marker.
+
+With *Move the clip up a track*, the shot ends up above its stacked clip, which
+is trimmed where it is.
+
+**A shot that got shorter leaves its gap.** Shortening never pulls later clips
+left; the timeline keeps the hole, on every track.
 
 Other things to know:
 

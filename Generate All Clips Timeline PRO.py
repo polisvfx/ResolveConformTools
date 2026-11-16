@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.5
+Version: 3.3
 
 Two modes.
 
@@ -72,7 +72,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.5"
+TOOL_VERSION = "3.3"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -165,6 +165,7 @@ UPDATE_MARKER_COLORS = {
     "superseded": "Purple",
     "dropped": "Rose",
     "manual": "Fuchsia",
+    "stacked": "Lavender",
 }
 # Fraction of the clip the update marker sits at. The duplicate pass uses 0.25
 # and the retime pass 0.5, so 0.75 keeps all three apart on all but tiny clips —
@@ -2749,6 +2750,56 @@ def diff_desired_vs_placed(desired_by_identity: dict, placed_by_identity: dict,
     return diffs
 
 
+def find_stacked_clips(diffs: list) -> dict:
+    """Relabel clips stacked above a shot as 'stacked'. id(base placed) -> diffs.
+
+    A clip the sources do not account for is normally reported as no longer
+    used. But a clip sitting exactly above a shot - same record in and out, on
+    a higher track - was put there on purpose: typically the published plate,
+    conformed over the shot it replaces. It is not a shot of its own, so it is
+    neither flagged nor left behind: it follows the shot below when that one is
+    trimmed or moved.
+
+    A stacked clip whose media ran out of frames no longer matches its shot's
+    in and out exactly. It carries a 'stacked' update marker from the run that
+    trimmed it, and is recognised again as long as it still lies within the
+    span of a shot on a lower track.
+    """
+    bases = [d for d in diffs
+             if d.placed is not None
+             and d.kind in ("unchanged", "extended", "shortened", "both")]
+    stacked: dict = {}
+    for diff in diffs:
+        if diff.kind != "dropped" or diff.placed is None:
+            continue
+        clip = diff.placed
+        marked = None
+        chosen = None
+        for base_diff in bases:
+            base = base_diff.placed
+            if base.track_index >= clip.track_index:
+                continue
+            exact = (base.record_start == clip.record_start
+                     and base.record_end == clip.record_end)
+            if not exact:
+                within = (base.record_start <= clip.record_start
+                          and clip.record_end <= base.record_end)
+                if not within:
+                    continue
+                if marked is None:
+                    marked = previous_update_kind(
+                        normalised_markers(clip.item)) == "stacked"
+                if not marked:
+                    continue
+            # The nearest shot below wins if several qualify.
+            if chosen is None or base.track_index > chosen.track_index:
+                chosen = base
+        if chosen is not None:
+            diff.kind = "stacked"
+            stacked.setdefault(id(chosen), []).append(diff)
+    return stacked
+
+
 def summarise_diffs(diffs: list) -> dict:
     """Counts per change kind, for logging and the manifest run record."""
     counts = {"unchanged": 0, "extended": 0, "shortened": 0, "both": 0,
@@ -3695,6 +3746,7 @@ def run_update_workflow(
     dry_run: bool,
     progress: Optional["ProgressUI"] = None,
     make_room: str = ROOM_SHIFT,
+    sync_stacked: bool = True,
 ) -> None:
     """Reconcile the current All Clips timeline against its source timelines.
 
@@ -3903,6 +3955,8 @@ def run_update_workflow(
     desired_by_identity = group_desired_by_identity(
         all_clip_infos, merge_by_source_file)
     diffs = diff_desired_vs_placed(desired_by_identity, placed_by_identity)
+    stacked_by_base = find_stacked_clips(diffs) if sync_stacked else {}
+    stacked_diffs = [d for group in stacked_by_base.values() for d in group]
     counts = summarise_diffs(diffs)
 
     run_no = (manifest.get("run_counter", 0) if manifest else 0) + 1
@@ -3945,6 +3999,9 @@ def run_update_workflow(
     print(f"  both ends      {counts.get('both', 0)}")
     print(f"  new            {len(added)}")
     print(f"  no longer used {len(removed)}")
+    if stacked_diffs:
+        print(f"  stacked        {len(stacked_diffs)}  (clips sitting exactly "
+              f"above a shot; they follow it and are not flagged)")
     if already_flagged:
         print(f"  ({already_flagged} already flagged as unused by an earlier run)")
     for diff in diffs:
@@ -3956,6 +4013,8 @@ def run_update_workflow(
         elif diff.kind == "dropped":
             print(f"  - unused    {diff.placed.name or diff.identity} "
                   f"{diff.placed.source_start}-{diff.placed.source_end}")
+        elif diff.kind == "stacked":
+            continue
         else:
             print(f"  ~ {diff.kind:<9} {diff.placed.name or diff.identity} "
                   f"{diff.placed.source_start}-{diff.placed.source_end} -> "
@@ -3990,6 +4049,14 @@ def run_update_workflow(
         else:
             manifest = manifest_add_run(manifest, run_record)
         write_manifest(target, manifest)
+
+    # A stacked clip an earlier run (or an earlier version) flagged as no longer
+    # used is not: take that marker off again.
+    if not dry_run:
+        for stacked_diff in stacked_diffs:
+            stale = normalised_markers(stacked_diff.placed.item)
+            if previous_update_kind(stale) == "dropped":
+                remove_update_markers(stacked_diff.placed.item, stale)
 
     actionable = changed + added + removed
     if not actionable:
@@ -4060,7 +4127,7 @@ def run_update_workflow(
         # Appended clips go flush: right after the existing content, and right
         # after one another. Each is fully placed - slip retries, widening and
         # all - before the next position is taken from its actual length, so no
-        # spare frames are needed between them. (Up to 3.4 a 25-frame gap was
+        # spare frames are needed between them. (Up to 3.2 a 25-frame gap was
         # left here for no stated reason.)
         "cursor": end_frame,
         "warned_record": False,
@@ -4069,6 +4136,8 @@ def run_update_workflow(
         "lifted": 0,
         "shifts": 0,
         "shift_frames": 0,
+        "stacked_synced": 0,
+        "stacked_short": 0,
     }
     tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
              "dropped": 0, "skipped": 0, "failed": 0}
@@ -4276,6 +4345,106 @@ def run_update_workflow(
             return False
         return True
 
+    def _sync_stacked(base_placed, label, left_change, right_change) -> None:
+        """Trim the clips stacked above a shot by what the shot just changed.
+
+        `left_change` / `right_change` are the shot's offset changes: negative
+        grows that end, positive pulls it in. A stacked clip grows as far as
+        its own media and the room on its own track allow and no further - it
+        may end up shorter than the shot, but a trim never moves the frames a
+        clip keeps, so it stays in sync with the shot either way.
+        """
+        for stacked_diff in stacked_by_base.get(id(base_placed), []):
+            clip = stacked_diff.placed
+            item = clip.item
+            name = clip.name or "stacked clip"
+            if not trim_api_available(item):
+                continue
+            speed = item_speed_percent(item)
+            if speed is not None and abs(speed - 100.0) > 0.01:
+                print(f"  '{name}' above '{label}' is retimed ({speed:g}%); "
+                      f"it was not trimmed with the shot. Check it by hand.")
+                continue
+            try:
+                left = int(round(item.GetLeftOffset()))
+                right = int(round(item.GetRightOffset()))
+            except Exception:
+                continue
+            bounds = occupancy.setdefault(clip.track_index, [])
+            index = occupancy_index(bounds, clip.record_start)
+            if index < 0:
+                continue
+            free_before, free_after = compute_free_space(bounds, index,
+                                                         timeline_start)
+            if linked_others(item):
+                # Its audio is trimmed with it and has neighbours of its own.
+                for other in linked_others(item):
+                    room = linked_item_room(target, other, timeline_start)
+                    if room is None:
+                        free_before = free_after = 0
+                    else:
+                        free_before = min(free_before, room[0])
+                        free_after = min(free_after, room[1])
+            want_left = left + left_change
+            want_right = right + right_change
+            new_left = max(want_left, 0, left - free_before) \
+                if left_change < 0 else want_left
+            new_right = max(want_right, 0, right - free_after) \
+                if right_change < 0 else want_right
+            duration = clip.record_end - clip.record_start
+            if (new_left - left) + (new_right - right) >= duration:
+                print(f"  '{name}' above '{label}' would be trimmed away "
+                      f"entirely; left as it is.")
+                continue
+            if (new_left, new_right) == (left, right):
+                short_head = new_left - want_left
+                short_tail = new_right - want_right
+                if not (short_head or short_tail):
+                    continue
+                ok, achieved = True, (clip.source_start, clip.source_end)
+            else:
+                ok, a_start, a_end, why = apply_trim(
+                    item, left, right, new_left, new_right,
+                    (clip.source_start, clip.source_end))
+                achieved = (a_start, a_end)
+                if not ok:
+                    print(f"  '{name}' above '{label}' could not be trimmed "
+                          f"with the shot ({why}). Check it by hand.")
+                    continue
+                short_head = new_left - want_left
+                short_tail = new_right - want_right
+                bounds.pop(index)
+                try:
+                    new_start = int(item.GetStart())
+                    new_end = new_start + max(1, int(item.GetDuration()))
+                except Exception:
+                    new_start = clip.record_start + (new_left - left)
+                    new_end = clip.record_end - (new_right - right)
+                insert_occupancy(bounds, new_start, new_end)
+                clip.record_start, clip.record_end = new_start, new_end
+                clip.source_start, clip.source_end = achieved
+
+            line = (f"{now_local}{CHANGELOG_SEPARATOR}run {run_no}"
+                    f"{CHANGELOG_SEPARATOR}followed '{label}': head "
+                    f"{left - new_left:+d}f, tail {right - new_right:+d}f")
+            if short_head or short_tail:
+                line += (f"{CHANGELOG_SEPARATOR}SHORT of the shot by "
+                         f"{short_head}f at the head and {short_tail}f at the "
+                         f"tail (no more frames, or no room on its track)")
+                state_box["stacked_short"] += 1
+            markers = normalised_markers(item)
+            note = merge_changelog(previous_update_note(markers), line)
+            remove_update_markers(item, markers)
+            write_update_marker(
+                item, "stacked", run_no, note,
+                f"In sync with the shot below (run {run_no})"
+                + (" - SHORT" if (short_head or short_tail) else ""))
+            state_box["stacked_synced"] += 1
+            print(f"  SYNCED '{name}' above '{label}': head "
+                  f"{left - new_left:+d}f, tail {right - new_right:+d}f"
+                  + (f" - {short_head}f short at the head, {short_tail}f at "
+                     f"the tail" if (short_head or short_tail) else ""))
+
     def _lift(item, placed, label, linked, left, right, new_left,
               new_right) -> Optional[int]:
         """Move a boxed-in clip up to a track with room. Returns the track.
@@ -4458,6 +4627,7 @@ def run_update_workflow(
                   f"V{lifted_to} and trimmed it there: {old_src[0]}-{old_src[1]} "
                   f"-> {achieved_start}-{achieved_end}; grade and comps "
                   f"untouched.")
+        _sync_stacked(placed, label, new_left - left, new_right - right)
         return diff.kind
 
     def _rebuild(diff) -> str:
@@ -4679,6 +4849,12 @@ def run_update_workflow(
               f"without a rebuild, keeping their grade - "
               f"{state_box['lifted']} of them after moving the clip up a "
               f"track for room; the rest were rebuilt or copied.)")
+    if state_box["stacked_synced"]:
+        print(f"  {state_box['stacked_synced']} clip(s) stacked above a changed "
+              f"shot were trimmed with it"
+              + (f"; {state_box['stacked_short']} ended up SHORTER than their "
+                 f"shot and are marked" if state_box["stacked_short"] else "")
+              + ".")
     if state_box["shifts"]:
         print(f"  Later clips were shifted right {state_box['shifts']} time(s), "
               f"{state_box['shift_frames']}f in total, to open gaps. Timeline "
@@ -4936,6 +5112,23 @@ def build_and_show_ui() -> Optional[dict]:
                 }),
             ]),
             ui.CheckBox({
+                "ID": "syncStacked",
+                "Text": "Update only: keep clips stacked exactly above a shot in sync with it",
+                "Checked": True,
+                "ToolTip": (
+                    "For clips you placed on a higher track exactly over a "
+                    "shot - same in and out on the timeline - such as a "
+                    "published plate conformed over its source.\n\n"
+                    "When ON (default): such a clip is not reported as no "
+                    "longer used. When its shot gets longer, shorter or is "
+                    "moved, it is trimmed and moved the same way. If its media "
+                    "has too few frames it grows as far as it can and is "
+                    "marked as short; it still stays in sync with the shot.\n\n"
+                    "When OFF: clips that are not in any source timeline are "
+                    "marked as no longer used, wherever they sit."
+                ),
+            }),
+            ui.CheckBox({
                 "ID": "protectGradedClips",
                 "Text": "Update only: skip clips with Fusion comps or extra colour versions",
                 "Checked": True,
@@ -5027,8 +5220,8 @@ def build_and_show_ui() -> Optional[dict]:
         # that already exists and that the user has since worked on.
         for widget_id in ("DstTimelineName", "sortingMethod", "preserveTrackLayout"):
             _set(widget_id, "Enabled", not updating)
-        for widget_id in ("sourceTimelines", "makeRoom", "protectGradedClips",
-                          "dryRun"):
+        for widget_id in ("sourceTimelines", "makeRoom", "syncStacked",
+                          "protectGradedClips", "dryRun"):
             _set(widget_id, "Enabled", updating)
         if updating and recorded_settings and not prefilled["done"]:
             # Offer the settings this timeline was last built with: changing the
@@ -5089,6 +5282,7 @@ def build_and_show_ui() -> Optional[dict]:
         "merge_by_source_file": itm["mergeBySourceFile"].Checked,
         "protect_graded_clips": itm["protectGradedClips"].Checked,
         "make_room": dict(ROOM_MODES).get(itm["makeRoom"].CurrentText, ROOM_SHIFT),
+        "sync_stacked": itm["syncStacked"].Checked,
         "dry_run": itm["dryRun"].Checked,
     }
 
@@ -5117,6 +5311,7 @@ def main():
             call["source_selection_mode"] = params["source_selection_mode"]
             call["protect_graded_clips"] = params["protect_graded_clips"]
             call["make_room"] = params["make_room"]
+            call["sync_stacked"] = params["sync_stacked"]
             call["dry_run"] = params["dry_run"]
             run_update_workflow(progress=progress, **call)
         else:
