@@ -250,6 +250,41 @@ check("b restored to its source name", lastName(s.b), "clipB.mov")
 check("a still renamed (outside selection)", lastName(s.a), "SH_0010")
 check("c still renamed (outside selection)", lastName(s.c), "SH_0030")
 
+print("\n=== 8. next-number default reads existing clip names ===")
+s = build()
+s.a._name = "SH_0010"
+s.b._name = "SH_0120_clipB"
+s.c._name = "XX_0500"
+env = loadWith(s.tl)
+ordered = env.GetOrderedTimelineItems(s.tl)
+check("highest SH_ number is 120", env.FindHighestShotNumber(ordered, "SH_"), 120)
+check("next SH_ number is 130", env.NextShotNumber(ordered, "SH_", 10), 130)
+check("next XX_ number is 505 with increment 5", env.NextShotNumber(ordered, "XX_", 5), 505)
+check("no match -> first number (increment)", env.NextShotNumber(ordered, "VFX_", 10), 10)
+
+print("\n=== 9. custom start, whole timeline ===")
+s = build()
+run("custom start 200, whole timeline", s.tl, cfg{ numbering = "custom", startNumber = 200 })
+check("a -> SH_0200", lastName(s.a), "SH_0200")
+check("b -> SH_0210", lastName(s.b), "SH_0210")
+check("c -> SH_0220", lastName(s.c), "SH_0220")
+
+print("\n=== 10. custom start, scoped to new clips {b,c} ===")
+s = build{ select = { "b", "c" } }
+s.a._name = "SH_0120"
+run("custom start 130, selected={b,c}", s.tl,
+    cfg{ selectedOnly = true, numbering = "custom", startNumber = 130 })
+check("b -> SH_0130", lastName(s.b), "SH_0130")
+check("c -> SH_0140", lastName(s.c), "SH_0140")
+check("a untouched", lastName(s.a), nil)
+
+print("\n=== 11. custom start without a value -> next free number ===")
+s = build{ select = { "c" } }
+s.a._name = "SH_0050"
+run("custom start nil, selected={c}", s.tl,
+    cfg{ selectedOnly = true, numbering = "custom" })
+check("c -> SH_0060", lastName(s.c), "SH_0060")
+
 print("\n" .. string.rep("=", 66))
 if failures == 0 then
     print("RESULT: PASS")

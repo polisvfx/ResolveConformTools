@@ -20,7 +20,7 @@
 --
 
 -- Script to set sequential shot numbers as Clip Names on timeline items
--- Version: 1.1
+-- Version: 1.2
 -- Requires: DaVinci Resolve 20.2+ (uses TimelineItem:SetName API)
 --
 -- Uses TimelineItem:SetName() to rename each clip instance on the timeline.
@@ -37,8 +37,13 @@
 --     entire timeline.
 -- On builds without the API the scope control is disabled and behaviour is
 -- unchanged.
+--
+-- A third numbering mode, "Start at a custom number", numbers the scope (the
+-- selection, or the whole timeline) from a start number you choose. Its default
+-- is the next number after the highest one already on the timeline for the
+-- current prefix, so newly added clips continue the existing sequence.
 
-local SCRIPT_VERSION = "1.1"
+local SCRIPT_VERSION = "1.2"
 
 -- Get Resolve API and Fusion object
 local resolve = bmd.scriptapp("Resolve")
@@ -217,6 +222,33 @@ function GetOrderedTimelineItems(tl)
 end
 
 
+-- Highest shot number already used on the timeline for `prefix`, read from the
+-- clip names (e.g. "SH_0120" or "SH_0120_clipA" -> 120). nil when none match.
+function FindHighestShotNumber(items, prefix)
+    prefix = prefix or ""
+    local highest = nil
+    for _, itemData in ipairs(items) do
+        local name = nil
+        pcall(function() name = itemData.item:GetName() end)
+        if type(name) == "string" and name:sub(1, #prefix) == prefix then
+            local digits = name:sub(#prefix + 1):match("^(%d+)")
+            local n = digits and tonumber(digits)
+            if n and (highest == nil or n > highest) then highest = n end
+        end
+    end
+    return highest
+end
+
+
+-- The number the next new shot would normally get: one increment past the highest
+-- existing number, or the first number (one increment) on an unnumbered timeline.
+function NextShotNumber(items, prefix, increment)
+    local highest = FindHighestShotNumber(items, prefix)
+    if highest == nil then return increment end
+    return highest + increment
+end
+
+
 -- Function to restore clip names from their Media Pool source.
 -- `itemList` restricts the sweep; defaults to the whole timeline. Callers pass the
 -- scoped list: an unscoped restore is destructive and asymmetric, since a user who
@@ -256,14 +288,15 @@ function ShowConfigDialog()
         includeOriginalName = false,
         separator = "_",
         selectedOnly = false,
-        numbering = "keep"
+        numbering = "keep",
+        startNumber = nil
     }
     local result = nil
 
     local win = disp:AddWindow({
         WindowTitle = "Shot Numbering - Clip Name (v" .. SCRIPT_VERSION .. ")",
         ID = "ConfigWin",
-        Geometry = { 100, 100, 470, 440 },
+        Geometry = { 100, 100, 470, 480 },
         Spacing = 10,
         ui:VGroup{ ID = "root", Weight = 1.0,
             ui:HGroup{
@@ -289,6 +322,11 @@ function ShowConfigDialog()
             ui:HGroup{
                 ui:Label{ Text = "Numbering:", Weight = 0.3 },
                 ui:ComboBox{ ID = "NumberingCombo", Weight = 0.7 }
+            },
+            ui:HGroup{
+                ui:Label{ Text = "Start Number:", Weight = 0.3 },
+                ui:SpinBox{ ID = "StartInput", Value = 10, Minimum = 0, Maximum = 999999999, Weight = 0.5 },
+                ui:Button{ ID = "StartResetButton", Text = "Next free", Weight = 0.2 }
             },
             ui:Label{ ID = "ScopeNote", Text = "", WordWrap = true },
             ui:CheckBox{
@@ -317,7 +355,32 @@ function ShowConfigDialog()
     itm.ScopeCombo:AddItem("Selected clips only")
     itm.NumberingCombo:AddItem("Keep full-timeline numbers")
     itm.NumberingCombo:AddItem("Renumber selection from the first number")
-    itm.NumberingCombo.Enabled = false
+    itm.NumberingCombo:AddItem("Start at a custom number")
+
+    -- The start number defaults to the next number a new shot would normally get,
+    -- and follows Prefix/Increment edits until the user types their own value.
+    local startEdited = false
+    local settingStart = false
+    local function refreshStartDefault()
+        local n = NextShotNumber(GetOrderedTimelineItems(GetActiveTimeline()),
+            itm.PrefixInput.Text, itm.IncrementInput.Value)
+        settingStart = true
+        itm.StartInput.Value = n
+        settingStart = false
+        startEdited = false
+    end
+    local function updateNumberingEnables()
+        -- Keep vs Renumber only differ for a selection; the custom start applies
+        -- to either scope, so the combo itself stays usable on the whole timeline.
+        if itm.ScopeCombo.CurrentIndex ~= 1 and itm.NumberingCombo.CurrentIndex == 1 then
+            itm.NumberingCombo.CurrentIndex = 0
+        end
+        local custom = (itm.NumberingCombo.CurrentIndex == 2)
+        itm.StartInput.Enabled = custom
+        itm.StartResetButton.Enabled = custom
+    end
+    refreshStartDefault()
+    updateNumberingEnables()
 
     if not HasTimelineSelectionAPI(GetActiveTimeline()) then
         itm.ScopeCombo.Enabled = false
@@ -327,7 +390,27 @@ function ShowConfigDialog()
     end
 
     function win.On.ScopeCombo.CurrentIndexChanged(ev)
-        itm.NumberingCombo.Enabled = (itm.ScopeCombo.CurrentIndex == 1)
+        updateNumberingEnables()
+    end
+
+    function win.On.NumberingCombo.CurrentIndexChanged(ev)
+        updateNumberingEnables()
+    end
+
+    function win.On.StartInput.ValueChanged(ev)
+        if not settingStart then startEdited = true end
+    end
+
+    function win.On.PrefixInput.TextChanged(ev)
+        if not startEdited then refreshStartDefault() end
+    end
+
+    function win.On.IncrementInput.ValueChanged(ev)
+        if not startEdited then refreshStartDefault() end
+    end
+
+    function win.On.StartResetButton.Clicked(ev)
+        refreshStartDefault()
     end
 
     function win.On.ConfigWin.Close(ev)
@@ -346,7 +429,15 @@ function ShowConfigDialog()
         config.separator = itm.SeparatorInput.Text
         config.includeOriginalName = itm.IncludeOriginalCheckBox.Checked
         config.selectedOnly = (itm.ScopeCombo.CurrentIndex == 1)
-        config.numbering = (itm.NumberingCombo.CurrentIndex == 1) and "renumber" or "keep"
+        local numberingIndex = itm.NumberingCombo.CurrentIndex
+        if numberingIndex == 2 then
+            config.numbering = "custom"
+            config.startNumber = itm.StartInput.Value
+        elseif numberingIndex == 1 then
+            config.numbering = "renumber"
+        else
+            config.numbering = "keep"
+        end
         result = config
         disp:ExitLoop()
     end
@@ -406,12 +497,23 @@ function Main()
 
     local orderedItems, selectedOnly, scopeLabel =
         ApplySelectionScope(items, config.selectedOnly, tl)
+    local customStart = (config.numbering == "custom")
     local renumberFromScratch = (selectedOnly ~= nil) and (config.numbering == "renumber")
 
+    local firstNumber = shotStep
+    if customStart then
+        firstNumber = tonumber(config.startNumber)
+            or NextShotNumber(items, prefix, shotStep)
+    end
+
     print(string.format("  Scope: %s", scopeLabel))
-    print(string.format("  Numbering: %s", renumberFromScratch
-        and "renumber selection from the first number"
-        or "keep full-timeline numbers"))
+    if customStart then
+        print(string.format("  Numbering: start at %s", string.format(formatString, firstNumber)))
+    else
+        print(string.format("  Numbering: %s", renumberFromScratch
+            and "renumber selection from the first number"
+            or "keep full-timeline numbers"))
+    end
 
     -- Build the work list. Each entry is { data = itemData, apply = bool }.
     --
@@ -421,8 +523,15 @@ function Main()
     --
     -- "renumber from scratch" walks only the selection, numbering it from the first
     -- number as though it were the whole timeline.
+    --
+    -- "custom start" walks only the scope (the selection, or the whole timeline
+    -- when unscoped) and numbers it from the chosen start number.
     local workList = {}
-    if renumberFromScratch then
+    if customStart then
+        for _, itemData in ipairs(selectedOnly or orderedItems) do
+            table.insert(workList, { data = itemData, apply = true })
+        end
+    elseif renumberFromScratch then
         for _, itemData in ipairs(selectedOnly) do
             table.insert(workList, { data = itemData, apply = true })
         end
@@ -440,7 +549,7 @@ function Main()
         if entry.apply then appliedCount = appliedCount + 1 end
     end
 
-    local currentShotNumberValue = shotStep
+    local currentShotNumberValue = firstNumber
     local renamedCount = 0
     local failedCount = 0
     local skippedOutOfScope = 0
