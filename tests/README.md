@@ -74,6 +74,45 @@ undocumented and are what the placement arithmetic rests on.
 Exit codes: `0` pass, `1` fail, `2` skipped because Resolve was unavailable. A skip
 is not a pass — `test_part_d.py` verifies nothing without a live project.
 
+### Trim and move probes (21.1+ editing APIs)
+
+`live_trim_probe.py` measures the in-place editing APIs added in 21.1/21.1.2
+(`Set/GetLeftOffset`, `Set/GetRightOffset`, `Get/SetPosition`, `MoveItems`,
+`Get/SetSpeed`, `CopyAttributes`). It saves the open project, works in a
+throwaway project `RCT_TRIM_<pid>`, then reloads yours and deletes the throwaway.
+It needs a video file with audio, 300+ frames:
+
+```bash
+RCT_LIVE_WRITE=1 RCT_PROBE_MEDIA=clip.mov py -3.12 -u tests/live_trim_probe.py
+```
+
+Run on **21.2.0.6** on 2026-11-16 (25 fps, timeline starting at 90000, 400-frame
+ProRes clip with audio):
+
+| Probe | Answer |
+|---|---|
+| `GetLeftOffset()` | source frames of head handle (= source start) at 100% speed |
+| `GetRightOffset()` | `frames - exclusive source end` at 100% speed |
+| Offsets on a retimed clip | in **timeline** frames: at 50%, 10 offset frames = 5 source frames |
+| Offsets on a freeze frame | meaningless (`L90000 R1409901`); do not trim a frame hold this way |
+| `SetLeftOffset` | moves the record **start**, end fixed; no ripple |
+| `SetRightOffset` | moves the record **end**, start fixed; no ripple, neighbour untouched |
+| Extend into a neighbour | returns **True and overwrites the neighbour** (trims it) — check free space first |
+| Extend past media start/end, or to zero length | returns False, item unchanged |
+| Grade (LUT hash), colour versions, Fusion comps | **survive** trims, `SetPosition` and a track change |
+| `SetPosition` onto another clip | returns **True and overwrites** it |
+| `SetPosition` to a track that does not exist | returns True and creates the track |
+| `MoveItems` of several items | leftmost goes to `startFrame`, the rest keep their relative offsets |
+| `MoveItems` onto another clip | returns **True and overwrites** it — "fails if any item cannot reach its destination" does not cover overlap |
+| Trim with `updateLinkedItems=True` | linked audio is trimmed identically; `False` trims video only |
+| `SetPosition` with `moveLinkedItems=True` | linked audio moves with it |
+| `GetSpeed()` | `{'Percentage': 100.0}`; reads back 50/200/0 after `SetSpeed` |
+| `SetSpeed` | keeps record duration, changes the source range |
+| `GetProperty("Speed")` | `False` — still not on that surface |
+| `GetType()` | `'video'` for a clip |
+| `CopyAttributes(allVideoAttributes, clipColor)` | copies zoom, crop and clip colour |
+| `GetCDL(1)` | returns the active version's CDL (`Saturation` as a float) |
+
 `final_live_check.py` waits up to six minutes for a timeline selection, so you can
 start it and then make the selection. For its Find Clip assertions to exercise the
 timeline-selection tier, the **Media Pool selection must be empty** — otherwise the
