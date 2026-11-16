@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.1
+Version: 3.2
 
 Two modes.
 
@@ -68,7 +68,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.1"
+TOOL_VERSION = "3.2"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -3795,18 +3795,26 @@ def run_update_workflow(
     # along with it is the accident worth catching.
     recorded_records = (manifest.get("sources") or []) if manifest else []
     if recorded_records:
-        recorded_names = {}
+        current = [(timeline_source_record(name, timeline)["uid"], name)
+                   for name, timeline in unique_sources]
+        unmatched = list(range(len(current)))
+        kept, dropped = [], []
+        # Match on uid first, then on name. A copied or re-imported project gives
+        # every timeline a new uid, so resolve_timelines_by_source_record() finds
+        # them by name — matching on uid alone here then reported all of them as
+        # dropped and re-added, with a warning that shots would go unused.
         for record in recorded_records:
-            key = record.get("uid") or f"name:{record.get('name', '')}"
-            recorded_names[key] = record.get("name") or "?"
-        current_names = {}
-        for name, timeline in unique_sources:
-            record = timeline_source_record(name, timeline)
-            current_names[record["uid"] or f"name:{name}"] = name
-
-        kept = [n for k, n in recorded_names.items() if k in current_names]
-        dropped = [n for k, n in recorded_names.items() if k not in current_names]
-        added = [n for k, n in current_names.items() if k not in recorded_names]
+            rec_uid, rec_name = record.get("uid"), record.get("name") or "?"
+            hit = next((i for i in unmatched if rec_uid and current[i][0] == rec_uid),
+                       None)
+            if hit is None:
+                hit = next((i for i in unmatched if current[i][1] == rec_name), None)
+            if hit is None:
+                dropped.append(rec_name)
+            else:
+                unmatched.remove(hit)
+                kept.append(rec_name)
+        added = [current[i][1] for i in unmatched]
 
         print(f"Source set: {len(kept)} kept, {len(added)} added, "
               f"{len(dropped)} dropped")

@@ -691,6 +691,15 @@ check("no clip was re-appended",
       len(project.media_pool.append_calls), before_appends)
 check("no track was added", dest.GetTrackCount("video"), before_tracks)
 
+# A copied or re-imported project gives every timeline a new unique id. The
+# source is then found by name, and must count as kept, not dropped and added.
+src.uid = "tl:src01-after-project-copy"
+log3 = run_update(mod, source_selection_mode="Recorded")
+check_true("a source whose uid changed is matched by name",
+           "matched by name" in log3)
+check_true("and counted as kept, without a dropped-source warning",
+           "1 kept, 0 added, 0 dropped" in log3 and "DROPPED:" not in log3)
+
 # A dropped shot stays dropped without collecting a marker on every run.
 gone_marks = update_markers(gone)
 check("the dropped shot is not re-marked", len(gone_marks), 1)
