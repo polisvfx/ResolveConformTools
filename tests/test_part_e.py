@@ -51,7 +51,7 @@ WANTED = [
     "build_retime_marker_text", "item_speed_percent",
     "item_uid", "linked_others", "trim_api_available", "plan_trim", "gap_around",
     "apply_trim", "transition_handle_need", "record_to_source_frames",
-    "track_transitions", "is_transition_item",
+    "track_transitions", "is_transition_item", "plan_lift", "span_is_free",
 ]
 
 
@@ -875,6 +875,31 @@ class ClipStub:
 check("track_transitions keeps only the transitions",
       track_transitions([ClipStub(), TransitionStub(90, 20), None, object()]),
       [(90, 110)])
+
+
+# ---------------------------------------------------------------------------
+# Lifting a boxed-in clip (3.3)
+# ---------------------------------------------------------------------------
+
+print("\n== plan_lift / span_is_free ==")
+
+plan_lift = ns["plan_lift"]
+span_is_free = ns["span_is_free"]
+
+# Clip at record 1000-1100, L=100 R=200. Growing 20 at the head and 40 at the
+# tail ends up at 980-1140; it moves across untrimmed, so it lands at 1000.
+check("a clip growing both ways keeps its kept frames in place",
+      plan_lift(1000, 1100, 100, 200, 80, 160, 0), (1000, 980, 1140))
+check("a head that would start before the timeline shifts the clip right",
+      plan_lift(1000, 1100, 100, 200, 80, 200, 1000), (1020, 1000, 1120))
+check("growing the head while shrinking the tail still needs the landing spot",
+      plan_lift(1000, 1100, 100, 200, 80, 230, 0), (1000, 980, 1100))
+
+check("a span between two clips is free",
+      span_is_free([[0, 100], [300, 400]], 100, 300), True)
+check("a span touching a clip by one frame is not",
+      span_is_free([[0, 100], [300, 400]], 100, 301), False)
+check("an empty track is free", span_is_free([], 0, 10), True)
 
 
 # ---------------------------------------------------------------------------

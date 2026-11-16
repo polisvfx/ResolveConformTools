@@ -55,14 +55,16 @@ against what they say now:
 
 - shots whose source range grew or shrank are brought to the newest state,
 - genuinely new shots are appended on a **new video track per run**, named for
-  the run (`Update 3 - 2026-08-06`), starting after the existing content,
+  the run (`Update 3 - 2026-08-06`), flush after the existing content and back
+  to back with no gaps between them (3.3+; earlier versions left 25 frames),
 - shots that no longer appear in any source are **marked, never removed**,
 - every shot it touches gets a marker with a timestamp and a short changelog,
   e.g. `2026-08-06 14:22 | run 3 | head +20f, tail +40f | 100-200 -> 80-240`,
   accumulating up to eight entries before the tail is summarised.
 
 Marker colours: green extended, yellow shortened, sand both ends, mint new,
-purple superseded, rose no longer used, fuchsia needs manual attention. A Sky
+purple superseded, rose no longer used, fuchsia needs manual attention,
+lavender stacked clip that followed its shot. A Sky
 marker on the timeline ruler summarises each run.
 
 **Run a dry run first.** Resolve's undo stack is not scriptable, so an update
@@ -77,10 +79,32 @@ are all kept, and linked audio is trimmed along with it. Verified on 21.2.0.6.
 A clip is only trimmed where it has room. Resolve does not refuse a trim that
 runs into the next clip: it reports success and cuts into that clip. So the
 script checks for free space on the clip's track, and on its linked audio track,
-before every trim. That shapes one behaviour worth expecting: **on a gapless
-timeline a clip has nowhere to grow**, so the extension is placed as a
-full-range copy on the run's update track and the original is marked
-superseded rather than moved. Shortening always fits.
+before every trim. Shortening always fits.
+
+**On a gapless timeline a clip has nowhere to grow, so room is made for it.**
+Either way it is still the same clip, with its grade, and there is only ever one
+version of the shot. *Update only: make room by* chooses how:
+
+- **Shift later clips (3.3+, the default).** Every clip after the shot, on every
+  video and audio track, is pushed right by exactly the frames the shot needs,
+  and the shot is lengthened into the gap. Shots stay on their own tracks and in
+  the same order, and clips stacked above one another stay stacked. The cost is
+  that everything after the shot changes timecode. Because all tracks move
+  together, a shot growing on one track leaves a gap of that size on the others.
+  Timeline ruler markers do not move with clips, so the run markers of earlier
+  updates may no longer sit over the clips they were placed at. A timeline that
+  has transitions on it is not shifted; its clips are moved up a track instead.
+- **Move the clip up a track (3.3+).** Only that shot moves, to the lowest track
+  above it that is free over the span it needs, or to a new track named for the
+  run. Its kept frames stay at the same timeline position, so it sits directly
+  above the gap it left, and nothing else changes position. The marker on the
+  clip says which track it moved to.
+
+In both, a shot at the very start of the timeline whose head grows never ends up
+starting before the timeline does.
+
+A full-range copy on the update track, with the original marked superseded, is
+now only the fallback for a clip that can be neither trimmed nor moved.
 
 Anything that cannot be trimmed falls back to the older behaviour: the clip is
 deleted and re-appended, and **a rebuilt clip loses its grade and its Fusion
@@ -90,6 +114,26 @@ frames), and when Resolve refuses a trim. Its name, clip colour, flags, enabled
 state and your own markers *are* restored. On that path, clips carrying a Fusion
 comp or more than one colour version are skipped by default and flagged for
 manual attention; untick *skip clips with Fusion comps* to rebuild them anyway.
+
+**Clips stacked exactly above a shot follow it (3.3+).** If you duplicate a shot
+to the track above and conform it to something else - a published plate, say -
+that clip is in no source timeline. With *keep clips stacked exactly above a
+shot in sync with it* on (the default), a clip on a higher track with the same
+timeline in and out as a shot is treated as belonging to that shot:
+
+- it is not marked as no longer used,
+- when the shot gets longer or shorter it is trimmed by the same frames at the
+  same ends, and when later clips are shifted it moves with them,
+- if its media has too few frames, or there is no room on its track, it grows as
+  far as it can and gets a Lavender marker saying how many frames short it is.
+  It is then shorter than the shot, but the frames it has stay over the same
+  frames of the shot, and later runs still recognise it from that marker.
+
+With *Move the clip up a track*, the shot ends up above its stacked clip, which
+is trimmed where it is.
+
+**A shot that got shorter leaves its gap.** Shortening never pulls later clips
+left; the timeline keeps the hole, on every track.
 
 Other things to know:
 
@@ -103,8 +147,10 @@ Other things to know:
   those thresholds — reads as changed and is put back to the collected range.
   Every such rebuild is marked.
 - **Video only.** A clip with linked audio is trimmed together with its audio
-  when both tracks have room. When it would need a rebuild or an update-track
-  copy instead, it is skipped and marked for manual attention: deleting the
+  when both tracks have room. Moving up a track helps only the video: the audio
+  stays on its own track and still needs room there. When it would need a
+  rebuild or an update-track copy instead, it is skipped and marked for manual
+  attention: deleting the
   video item would orphan the audio. *Video Only* on, the default, avoids that.
 - **The connection threshold matters between runs.** It decides which source
   edits merge into one range, so changing it makes nearly everything read as

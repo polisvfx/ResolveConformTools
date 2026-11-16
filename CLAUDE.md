@@ -14,8 +14,11 @@ Version: X.Y
 
 ### When to bump
 
-Whenever you modify a script's behaviour, UI, or fix a bug, bump its version
-in the same commit as the change. Use the existing `X.Y` format:
+A script's version goes up **at most once per pull request**, however many
+features, tweaks and fixes that PR makes to it. Do not bump per commit or per
+feature: a branch that adds three things to a script still moves it from 3.2 to
+3.3, not to 3.5. If the script's version already differs from the one on `main`,
+it has had its bump — leave it.
 
 - Bump **Y** (minor) for bug fixes, small tweaks, and most edits.
 - Bump **X** (major) and reset Y to 0 only for a significant rewrite or a

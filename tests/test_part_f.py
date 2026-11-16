@@ -664,6 +664,21 @@ check("with the collected range",
       (added[0].source_start, added[0].source_end), (10, 90))
 check("its marker is the new colour",
       update_markers(added[0])[0]["color"], "Mint")
+check("it starts flush with the end of the existing content",
+      added[0].record_start, 86501 + 101)
+
+# Several new shots in one run sit back to back, with no gap between them.
+res2, project2, dest2, src2 = build_world(
+    {"shot_a": [(100, 200)], "shot_n1": [(10, 90)], "shot_n2": [(300, 349)],
+     "shot_n3": [(600, 620)]},
+    [make_dest("shot_a", (100, 200), 86400)])
+run_update(load(res2))
+news = items_on(dest2, 2)
+check("three new shots were appended", len(news), 3)
+check("the first right after the existing content", news[0].record_start,
+      86400 + 101)
+check("and each flush against the one before",
+      [b.record_start - a.GetEnd() for a, b in zip(news, news[1:])], [0, 0])
 
 track1 = items_on(dest, 1)
 check("the dropped shot is still on the timeline", len(track1), 2)
@@ -815,6 +830,8 @@ UI_RESULT = {
     "preserve_track_layout": False,
     "merge_by_source_file": True,
     "protect_graded_clips": True,
+    "make_room": "shift",
+    "sync_stacked": True,
     "dry_run": True,
 }
 
@@ -838,6 +855,7 @@ check("update mode calls run_update_workflow", calls[-1][0], "update")
 check("update mode passes the source mode",
       calls[-1][1]["source_selection_mode"], "Union")
 check("update mode passes dry run", calls[-1][1]["dry_run"], True)
+check("update mode passes how to make room", calls[-1][1]["make_room"], "shift")
 check("update mode does not pass create-only options",
       [k for k in ("dst_timeline_name", "sorting_method", "preserve_track_layout")
        if k in calls[-1][1]], [])
@@ -1560,6 +1578,396 @@ check_true("and, being linked, it is left for a manual update",
 
 for _name in TRIM_API:
     delattr(Item, _name)
+
+
+# ---------------------------------------------------------------------------
+# 3.3: a boxed-in clip is moved up a track and trimmed there
+# ---------------------------------------------------------------------------
+#
+# Measured on 21.2.0.6: SetPosition to another track keeps the item (and its
+# grade), creates the track if needed, and overwrites whatever is in the way.
+
+print("\n== 3.3 lift a boxed-in clip ==")
+
+
+def _set_position(self, position, move_linked=True, subframe=False):
+    timeline = Item.timeline
+    new_track = position.get("trackIndex", self.track)
+    for track in timeline.tracks.values():
+        if self in track:
+            track.remove(self)
+    timeline.tracks.setdefault(new_track, []).append(self)
+    self.track = new_track
+    self.record_start = position.get("startFrame", self.record_start)
+    return True
+
+
+LIFT_API = dict(TRIM_API)
+LIFT_API["SetPosition"] = _set_position
+LIFT_API["GetTrackTypeAndIndex"] = lambda self: ["video", self.track]
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+
+# -- the gapless spine: the first clip grows both ways ------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400, fusion_comps=1),
+     make_dest("shot_b", (500, 600), 86501)])
+Item.timeline = dest
+first, second = dest.tracks[1]
+mod = load(res)
+log = run_update(mod)
+check("the boxed-in clip itself moved up a track",
+      [i is first for i in items_on(dest, 2)], [True])
+check("only its neighbour is left on V1", items_on(dest, 1), [second])
+check("it covers the new range", (first.source_start, first.source_end), (80, 240))
+check("it does not start before the timeline", first.record_start, 86400)
+check("nothing was appended - there is one version of the shot",
+      project.media_pool.append_calls, [])
+check("its Fusion comp is still there", first.fusion_comps, 1)
+check("the neighbour is untouched",
+      (second.record_start, second.source_start, second.source_end),
+      (86501, 500, 600))
+check("no clip overlaps another", no_overlaps(dest), True)
+marks = update_markers(first)
+check("one update marker, none marked superseded",
+      [m["color"] for m in marks], ["Green"])
+check_true("the marker says where it went", "moved to V2" in marks[0]["name"])
+check_true("the new track is named for the run",
+           dest.GetTrackName("video", 2).startswith("Update 1 - "))
+check_true("the log says it was lifted", "LIFTED" in log)
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("an immediate re-run has nothing to do", "Nothing to do" in log2)
+
+# -- a middle clip keeps its kept frames in place on the track above ----------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+mod = load(res)
+run_update(mod)
+check("a middle clip is lifted and anchored on its kept frames",
+      (middle.track, middle.record_start, middle.source_start, middle.source_end),
+      (2, 86501 - 20, 480, 640))
+
+# -- an existing upper track is used when the span is free, skipped when not --
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 86550, track=2)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+blocker = dest.tracks[2][0]
+mod = load(res)
+run_update(mod)
+check("a busy V2 is skipped for a new track above it", middle.track, 3)
+check("the clip on V2 is untouched",
+      (blocker.track, blocker.record_start), (2, 86550))
+check("no clip overlaps another", no_overlaps(dest), True)
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 87000, track=2)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+mod = load(res)
+run_update(mod)
+check("a V2 with room there is used", middle.track, 2)
+check("and no extra track is created", dest.GetTrackCount("video"), 2)
+
+# -- a trim Resolve refuses after the move puts the clip back ----------------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+middle.refuse_trim = True
+mod = load(res)
+log = run_update(mod)
+check("a clip whose trim is refused is put back where it was",
+      (middle.track, middle.record_start, middle.source_start), (1, 86501, 500))
+check_true("and handled the old way, with a copy on the update track",
+           "placing the updated version on the update track" in log)
+check("no clip overlaps another", no_overlaps(dest), True)
+
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
+
+
+# ---------------------------------------------------------------------------
+# 3.4: make room by shifting later clips
+# ---------------------------------------------------------------------------
+#
+# Measured on 21.2.0.6: Timeline.MoveItems moves a block from several tracks in
+# one call, each item keeping its track, the leftmost going to startFrame.
+
+print("\n== 3.4 shift later clips to open gaps ==")
+
+
+def _move_items(self, items, position, move_linked=True, subframe=False):
+    delta = position["startFrame"] - min(i.record_start for i in items)
+    for item in items:
+        item.record_start += delta
+    self.move_calls = getattr(self, "move_calls", 0) + 1
+    return True
+
+
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+Timeline.MoveItems = _move_items
+
+# -- a middle clip growing both ways on a gapless spine, with a clip above ----
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501, fusion_comps=1),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 86620, track=2)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+above = dest.tracks[2][0]
+mod = load(res)
+log = run_update(mod)          # make_room defaults to shifting
+check("the grown clip is still the same clip on its own track",
+      (items_on(dest, 1)[1] is b, b.track), (True, 1))
+check("it covers the new range", (b.source_start, b.source_end), (480, 640))
+check("it starts where it did - right after the clip before it",
+      b.record_start, 86501)
+check("the clip before it has not moved", a.record_start, 86400)
+check("the clip after it moved right by both gaps (20 + 40)",
+      c.record_start, 86602 + 60)
+check("the clip stacked above moved by the same amount",
+      (above.track, above.record_start), (2, 86620 + 60))
+check("the spine is still gapless",
+      (a.GetEnd() == b.record_start, b.GetEnd() == c.record_start), (True, True))
+check("no clip overlaps another", no_overlaps(dest), True)
+check("nothing was appended and no track was added",
+      (project.media_pool.append_calls, dest.GetTrackCount("video")), ([], 2))
+check("its Fusion comp is still there", b.fusion_comps, 1)
+check_true("the log says what was shifted",
+           "after shifting later clips 60f right" in log
+           and "60f in total" in log)
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("an immediate re-run has nothing to do", "Nothing to do" in log2)
+
+# -- the first clip's head grows: it must not start before the timeline -------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+Item.timeline = dest
+first, second = dest.tracks[1]
+mod = load(res)
+run_update(mod)
+check("the first clip grows its head and still starts the timeline",
+      (first.record_start, first.source_start), (86400, 80))
+check("the next clip moved right to make the room", second.record_start,
+      86501 + 20)
+
+# -- two clips grow in one run: the second sees the first one's shift ---------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 230)], "shot_b": [(470, 600)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+mod = load(res)
+run_update(mod)
+check("both grew", ((a.source_start, a.source_end), (b.source_start, b.source_end)),
+      ((100, 230), (470, 600)))
+check("in order, gapless, nothing overlapping",
+      (a.record_start, a.GetEnd() == b.record_start, b.GetEnd() == c.record_start,
+       no_overlaps(dest)), (86400, True, True, True))
+
+# -- the other choice still moves the clip up a track -------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+mod = load(res)
+run_update(mod, make_room="lift")
+check("with 'move up a track' nothing is shifted",
+      (b.track, c.record_start, getattr(dest, "move_calls", 0)), (2, 86602, 0))
+
+# -- a timeline with a transition on it is not shifted; the clip is lifted ----
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+a, b, c = dest.tracks[1]
+_listing = dest.GetItemListInTrack
+_dissolve = types.SimpleNamespace(
+    GetType=lambda: "transition", GetStart=lambda: 86700,
+    GetDuration=lambda: 20, GetMediaPoolItem=lambda: None,
+    GetName=lambda: "Cross Dissolve")
+dest.GetItemListInTrack = lambda kind, index: (
+    _listing(kind, index) + ([_dissolve]
+                             if (kind, index) == ("video", 1) else []))
+mod = load(res)
+log = run_update(mod)
+check_true("transitions on the timeline stop the shift",
+           "not shifting clips around them" in log)
+check("and nothing was moved along the track", c.record_start, 86602)
+
+del Timeline.MoveItems
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
+
+
+# ---------------------------------------------------------------------------
+# Clips stacked exactly above a shot follow it
+# ---------------------------------------------------------------------------
+#
+# The user duplicates a shot to the track above and conforms it to the
+# published plate: different media, same record in and out. It is in no source
+# timeline, so without this it was reported as no longer used.
+
+print("\n== clips stacked above a shot ==")
+
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+Timeline.MoveItems = _move_items
+
+
+def stacked_world(source_ranges, plate_src=(1000, 1100), plate_end=5000):
+    res, project, dest, src = build_world(
+        source_ranges,
+        [make_dest("shot_a", (100, 200), 86400),
+         make_dest("shot_b", (500, 600), 86501),
+         make_dest("shot_c", (700, 800), 86602),
+         make_dest("plate_b", plate_src, 86501, track=2)])
+    Item.timeline = dest
+    plate = dest.tracks[2][0]
+    plate.mpi._end = plate_end
+    return res, project, dest, plate
+
+
+SAME = {"shot_a": [(100, 200)], "shot_b": [(500, 600)], "shot_c": [(700, 800)]}
+GROWN = {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]}
+
+# -- nothing changed: the plate is not flagged ---------------------------------
+res, project, dest, plate = stacked_world(SAME)
+log = run_update(load(res))
+check_true("a clip exactly above a shot is reported as stacked",
+           "stacked        1" in log)
+check_true("it is not reported as unused", "- unused" not in log)
+check("and gets no marker", update_markers(plate), [])
+check_true("so a matching timeline still has nothing to do", "Nothing to do" in log)
+
+# -- with the option off it is flagged, as before ------------------------------
+res, project, dest, plate = stacked_world(SAME)
+log = run_update(load(res), sync_stacked=False)
+check("with the option off it is marked no longer used",
+      [m["color"] for m in update_markers(plate)], ["Rose"])
+
+# -- a stale 'no longer used' marker from an earlier run is taken off again ----
+res, project, dest, plate = stacked_world(SAME)
+mod = load(res)
+run_update(mod, sync_stacked=False)
+run_update(mod, source_selection_mode="Recorded")
+check("the stale marker is removed once the clip is recognised as stacked",
+      update_markers(plate), [])
+
+# -- the shot grows; later clips shift; the plate grows with it ----------------
+res, project, dest, plate = stacked_world(GROWN)
+a, b, c = dest.tracks[1]
+log = run_update(load(res))
+check("the shot grew in place", (b.record_start, b.source_start, b.source_end),
+      (86501, 480, 640))
+check("the plate grew by the same frames at each end",
+      (plate.source_start, plate.source_end), (980, 1140))
+check("and still sits exactly above its shot",
+      (plate.track, plate.record_start, plate.GetEnd()),
+      (2, b.record_start, b.GetEnd()))
+check("the next shot moved right to make the room", c.record_start, 86602 + 60)
+check("no clip overlaps another", no_overlaps(dest), True)
+marks = update_markers(plate)
+check("the plate is marked as following its shot",
+      [m["color"] for m in marks], ["Lavender"])
+check_true("and its note says by how much",
+           "head +20f, tail +40f" in marks[0]["note"])
+check_true("it is not called short", "SHORT" not in marks[0]["name"])
+
+# -- the plate has too few frames: as far as it goes, still in sync -----------
+# Plate media runs 990..1110 only: 10 spare frames at each end.
+res, project, dest, plate = stacked_world(GROWN, plate_src=(1000, 1100),
+                                          plate_end=1110)
+plate.GetLeftOffset = lambda: float(plate.source_start - 990)
+_plain_set_left = Item.SetLeftOffset
+plate.SetLeftOffset = lambda off, *a: _plain_set_left(plate, off + 990, *a)
+a, b, c = dest.tracks[1]
+mod = load(res)
+log = run_update(mod)
+check("the shot still gets its full range", (b.source_start, b.source_end),
+      (480, 640))
+check("the plate takes every frame it has",
+      (plate.source_start, plate.source_end), (990, 1110))
+check("it is shorter than the shot now",
+      (plate.record_start - b.record_start, b.GetEnd() - plate.GetEnd()),
+      (10, 30))
+# Sync: plate frame 1000 was over shot frame 500 before, and must still be.
+check("but the frames it had are still over the same shot frames",
+      (plate.record_start + (1000 - plate.source_start))
+      - (b.record_start + (500 - b.source_start)), 0)
+marks = update_markers(plate)
+check_true("it is marked short", "SHORT" in marks[0]["name"]
+           and "10f at the head and 30f at the tail" in marks[0]["note"])
+check_true("the log counts it", "ended up SHORTER" in log)
+
+# A later run still knows the short plate belongs to the shot.
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("a short plate is still recognised on the next run",
+           "stacked        1" in log2 and "- unused" not in log2)
+check_true("and there is nothing to do", "Nothing to do" in log2)
+
+# -- the shot shrinks: the plate shrinks with it and the gap stays -------------
+res, project, dest, plate = stacked_world(
+    {"shot_a": [(100, 200)], "shot_b": [(520, 570)], "shot_c": [(700, 800)]})
+a, b, c = dest.tracks[1]
+run_update(load(res))
+check("the shot was shortened at both ends", (b.source_start, b.source_end),
+      (520, 570))
+check("the plate was shortened the same way",
+      (plate.source_start, plate.source_end, plate.record_start, plate.GetEnd()),
+      (1020, 1070, b.record_start, b.GetEnd()))
+check("the shots either side did not move - the gaps stay",
+      (a.record_start, c.record_start, b.record_start - a.GetEnd(),
+       c.record_start - b.GetEnd()), (86400, 86602, 20, 30))
+
+# -- moving the shot up a track leaves the plate trimmed in place -------------
+res, project, dest, plate = stacked_world(GROWN)
+a, b, c = dest.tracks[1]
+run_update(load(res), make_room="lift")
+check("with 'move up a track' the shot goes above its plate", b.track, 3)
+check("and the plate still grew with it, in sync",
+      (plate.track, plate.source_start, plate.source_end, plate.record_start),
+      (2, 980, 1140, b.record_start))
+
+del Timeline.MoveItems
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
 
 
 # ---------------------------------------------------------------------------
