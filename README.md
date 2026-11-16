@@ -77,10 +77,19 @@ are all kept, and linked audio is trimmed along with it. Verified on 21.2.0.6.
 A clip is only trimmed where it has room. Resolve does not refuse a trim that
 runs into the next clip: it reports success and cuts into that clip. So the
 script checks for free space on the clip's track, and on its linked audio track,
-before every trim. That shapes one behaviour worth expecting: **on a gapless
-timeline a clip has nowhere to grow**, so the extension is placed as a
-full-range copy on the run's update track and the original is marked
-superseded rather than moved. Shortening always fits.
+before every trim. Shortening always fits.
+
+**On a gapless timeline a clip has nowhere to grow, so it is moved up a track
+and lengthened there (3.3+).** It is still the same clip, with its grade, and
+there is only ever one version of the shot. It goes to the lowest track above it
+that is free over the span it needs, or to a new track named for the run. Its
+kept frames stay at the same timeline position, so it sits directly above the
+gap it left; the one exception is a shot at the very start of the timeline whose
+head grows, which is shifted right so it does not start before the timeline. The
+marker on the clip says which track it moved to.
+
+A full-range copy on the update track, with the original marked superseded, is
+now only the fallback for a clip that can be neither trimmed nor moved.
 
 Anything that cannot be trimmed falls back to the older behaviour: the clip is
 deleted and re-appended, and **a rebuilt clip loses its grade and its Fusion
@@ -103,8 +112,10 @@ Other things to know:
   those thresholds — reads as changed and is put back to the collected range.
   Every such rebuild is marked.
 - **Video only.** A clip with linked audio is trimmed together with its audio
-  when both tracks have room. When it would need a rebuild or an update-track
-  copy instead, it is skipped and marked for manual attention: deleting the
+  when both tracks have room. Moving up a track helps only the video: the audio
+  stays on its own track and still needs room there. When it would need a
+  rebuild or an update-track copy instead, it is skipped and marked for manual
+  attention: deleting the
   video item would orphan the audio. *Video Only* on, the default, avoids that.
 - **The connection threshold matters between runs.** It decides which source
   edits merge into one range, so changing it makes nearly everything read as

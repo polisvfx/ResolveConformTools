@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.2
+Version: 3.3
 
 Two modes.
 
@@ -45,9 +45,12 @@ Update mode only touches clips whose source range actually moved. On Resolve
 comps and markers stay exactly as they are — provided the clip has room to grow
 on its own track (and on its linked audio track) and plays at 100%.
 
-Anything that cannot be trimmed falls back to the pre-3.0 behaviour: a boxed-in
-clip gets an updated copy on the run's track, and otherwise the clip is deleted
-and re-appended. A rebuild restores its name, clip colour, flags, enabled state
+A clip with no room where it stands is moved up a track and trimmed there (3.3),
+so there is still only one version of the shot.
+
+Anything that can be neither trimmed nor moved falls back to the pre-3.0
+behaviour: a boxed-in clip gets an updated copy on the run's track, and
+otherwise the clip is deleted and re-appended. A rebuild restores its name, clip colour, flags, enabled state
 and markers, but NOT ITS GRADE OR FUSION COMPS — there is no API to read a
 grade back out. Clips carrying that work are skipped by default on that path,
 and dry run exists because Resolve's undo stack is not scriptable.
@@ -68,7 +71,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.2"
+TOOL_VERSION = "3.3"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -2471,6 +2474,36 @@ def gap_around(bounds: list, start: int, end: int, timeline_start: int = 0) -> t
     return free_before, free_after
 
 
+def span_is_free(bounds: list, start: int, end: int) -> bool:
+    """Whether [start, end) touches none of a track's [start, end) bounds."""
+    return all(other_end <= start or other_start >= end
+               for other_start, other_end in bounds)
+
+
+def plan_lift(record_start: int, record_end: int, left: int, right: int,
+              new_left: int, new_right: int, timeline_start: int) -> tuple:
+    """(move_to, need_start, need_end) for trimming a clip on another track.
+
+    A boxed-in clip is moved up a track and trimmed there. Its kept frames stay
+    at the same record position unless the grown head would start before the
+    timeline does - Resolve allows that trim (measured on 21.2.0.6: the clip
+    ends up at 89980 on a timeline starting at 90000) and it must not happen -
+    in which case the whole clip is shifted right by the shortfall.
+
+    `move_to` is where the untrimmed clip has to sit before the trim.
+    [need_start, need_end) is everything it covers on the way: where it lands
+    untrimmed and where it ends up, so a clip growing at one end and shrinking
+    at the other still has its landing spot checked.
+    """
+    final_start = record_start + (new_left - left)
+    final_end = record_end - (new_right - right)
+    shift = max(0, timeline_start - final_start)
+    move_to = record_start + shift
+    moved_end = record_end + shift
+    return (move_to, min(final_start + shift, move_to),
+            max(final_end + shift, moved_end))
+
+
 def linked_item_room(timeline, linked_item, timeline_start: int = 0):
     """(free_before, free_after) around a linked item on its own track, or None.
 
@@ -4019,6 +4052,7 @@ def run_update_workflow(
         "warned_record": False,
         "first_new_record": None,
         "trimmed": 0,
+        "lifted": 0,
     }
     tally = {"extended": 0, "shortened": 0, "both": 0, "new": 0, "superseded": 0,
              "dropped": 0, "skipped": 0, "failed": 0}
@@ -4133,6 +4167,61 @@ def run_update_workflow(
     def _mark_in_place(placed, kind, marker_name, note):
         write_update_marker(placed.item, kind, run_no, note, marker_name)
 
+    def _lift(item, placed, label, linked, left, right, new_left,
+              new_right) -> Optional[int]:
+        """Move a boxed-in clip up to a track with room. Returns the track.
+
+        Measured on 21.2.0.6: SetPosition to another track keeps the grade and
+        the Fusion comps, and creates the track if it does not exist. It also
+        overwrites whatever is there, so the span is checked first. The lowest
+        track above the clip that is free wins; failing that, this run's update
+        track. With moveLinkedItems off, linked audio stays on its own track
+        and stays linked, so it is trimmed along afterwards as usual.
+        """
+        mover = getattr(item, "SetPosition", None)
+        if not callable(mover):
+            return None
+        move_to, need_start, need_end = plan_lift(
+            placed.record_start, placed.record_end, left, right, new_left,
+            new_right, timeline_start)
+        if linked and move_to != placed.record_start:
+            # The audio would have to shift too, and it has nowhere to go.
+            return None
+
+        chosen = None
+        for track in sorted(t for t in occupancy if t > placed.track_index):
+            if span_is_free(occupancy[track], need_start, need_end):
+                chosen = track
+                break
+        if chosen is None:
+            had_track = state_box["track"] is not None
+            chosen = _ensure_update_track()
+            if chosen is None or chosen <= placed.track_index:
+                return None
+            if had_track and not span_is_free(occupancy[chosen], need_start,
+                                              need_end):
+                return None
+
+        try:
+            moved = bool(mover({"trackIndex": chosen, "startFrame": move_to},
+                               False))
+            landed_track = item.GetTrackTypeAndIndex()[1]
+            landed_start = int(item.GetStart())
+        except Exception:
+            moved = False
+            landed_track = landed_start = None
+        if not moved or landed_track != chosen or landed_start != move_to:
+            print(f"  '{label}' could not be moved to V{chosen}; leaving it "
+                  f"where it is.")
+            if moved:
+                try:
+                    mover({"trackIndex": placed.track_index,
+                           "startFrame": placed.record_start}, False)
+                except Exception:
+                    pass
+            return None
+        return chosen
+
     def _trim_in_place(diff, state, label, history) -> Optional[str]:
         """Trim the clip where it stands. Returns the outcome, or None to rebuild.
 
@@ -4169,17 +4258,40 @@ def run_update_workflow(
         if index < 0:
             return None
         free_before, free_after = compute_free_space(bounds, index, timeline_start)
+        linked = linked_others(item)
+
+        # No room where it stands: move the clip itself up a track and trim it
+        # there, rather than leaving it and adding a second copy of the shot.
+        lifted_to = None
         if not fits_in_place(free_before, free_after, head_need, tail_need):
-            return None
+            lifted_to = _lift(item, placed, label, linked,
+                              left, right, new_left, new_right)
+            if lifted_to is None:
+                return None
+            bounds.pop(index)
+            bounds = occupancy.setdefault(lifted_to, [])
+            index = None
+
+        def _put_back():
+            if lifted_to is None:
+                return
+            try:
+                item.SetPosition({"trackIndex": placed.track_index,
+                                  "startFrame": placed.record_start}, False)
+            except Exception:
+                pass
+            insert_occupancy(occupancy.setdefault(placed.track_index, []),
+                             placed.record_start, placed.record_end)
 
         # Linked audio is trimmed with the video, so it needs the same room on
         # its own track. Resolve would otherwise overwrite the neighbour there.
-        for other in linked_others(item):
+        for other in linked:
             room = linked_item_room(target, other, timeline_start)
             if room is None or not fits_in_place(room[0], room[1], head_need,
                                                  tail_need):
                 print(f"  '{label}' has room on its video track but not on its "
                       f"linked audio track; not trimming it.")
+                _put_back()
                 return None
 
         ok, achieved_start, achieved_end, why = apply_trim(
@@ -4187,9 +4299,11 @@ def run_update_workflow(
         if not ok:
             print(f"  '{label}' could not be trimmed in place ({why}); "
                   f"falling back to a rebuild.")
+            _put_back()
             return None
 
-        bounds.pop(index)
+        if index is not None:
+            bounds.pop(index)
         try:
             new_start = int(item.GetStart())
             new_end = new_start + max(1, int(item.GetDuration()))
@@ -4199,12 +4313,24 @@ def run_update_workflow(
         insert_occupancy(bounds, new_start, new_end)
 
         remove_update_markers(item, state.markers)
+        where = "" if lifted_to is None else f", moved to V{lifted_to}"
         write_update_marker(item, diff.kind, run_no, history,
-                            f"Updated ({diff.kind}, run {run_no})",
+                            f"Updated ({diff.kind}{where}, run {run_no})",
                             _accepted_for(clip_info, achieved_start, achieved_end))
         state_box["trimmed"] += 1
-        print(f"  TRIMMED '{label}' in place: {old_src[0]}-{old_src[1]} -> "
-              f"{achieved_start}-{achieved_end}; grade and comps untouched.")
+        if lifted_to is None:
+            print(f"  TRIMMED '{label}' in place: {old_src[0]}-{old_src[1]} -> "
+                  f"{achieved_start}-{achieved_end}; grade and comps untouched.")
+        else:
+            state_box["lifted"] += 1
+            # New shots queue up on the update track from this cursor; keep it
+            # clear of anything a lifted clip now reaches.
+            state_box["cursor"] = max(state_box["cursor"],
+                                      new_end + INTER_TIMELINE_GAP)
+            print(f"  LIFTED '{label}' from V{placed.track_index} to "
+                  f"V{lifted_to} and trimmed it there: {old_src[0]}-{old_src[1]} "
+                  f"-> {achieved_start}-{achieved_end}; grade and comps "
+                  f"untouched.")
         return diff.kind
 
     def _rebuild(diff) -> str:
@@ -4422,8 +4548,10 @@ def run_update_workflow(
                 "skipped", "failed"):
         print(f"  {key:<11} {tally.get(key, 0)}")
     if changed:
-        print(f"  ({state_box['trimmed']} of the range changes were trimmed in "
-              f"place, keeping their grade; the rest were rebuilt or moved.)")
+        print(f"  ({state_box['trimmed']} of the range changes were trimmed "
+              f"without a rebuild, keeping their grade - "
+              f"{state_box['lifted']} of them after moving the clip up a "
+              f"track for room; the rest were rebuilt or copied.)")
     if tally.get("failed"):
         print("  Check the log above for the clips that failed.")
     _p("Done!", 1, 1)

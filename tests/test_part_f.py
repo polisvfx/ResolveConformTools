@@ -1563,6 +1563,133 @@ for _name in TRIM_API:
 
 
 # ---------------------------------------------------------------------------
+# 3.3: a boxed-in clip is moved up a track and trimmed there
+# ---------------------------------------------------------------------------
+#
+# Measured on 21.2.0.6: SetPosition to another track keeps the item (and its
+# grade), creates the track if needed, and overwrites whatever is in the way.
+
+print("\n== 3.3 lift a boxed-in clip ==")
+
+
+def _set_position(self, position, move_linked=True, subframe=False):
+    timeline = Item.timeline
+    new_track = position.get("trackIndex", self.track)
+    for track in timeline.tracks.values():
+        if self in track:
+            track.remove(self)
+    timeline.tracks.setdefault(new_track, []).append(self)
+    self.track = new_track
+    self.record_start = position.get("startFrame", self.record_start)
+    return True
+
+
+LIFT_API = dict(TRIM_API)
+LIFT_API["SetPosition"] = _set_position
+LIFT_API["GetTrackTypeAndIndex"] = lambda self: ["video", self.track]
+for _name, _fn in LIFT_API.items():
+    setattr(Item, _name, _fn)
+
+# -- the gapless spine: the first clip grows both ways ------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400, fusion_comps=1),
+     make_dest("shot_b", (500, 600), 86501)])
+Item.timeline = dest
+first, second = dest.tracks[1]
+mod = load(res)
+log = run_update(mod)
+check("the boxed-in clip itself moved up a track",
+      [i is first for i in items_on(dest, 2)], [True])
+check("only its neighbour is left on V1", items_on(dest, 1), [second])
+check("it covers the new range", (first.source_start, first.source_end), (80, 240))
+check("it does not start before the timeline", first.record_start, 86400)
+check("nothing was appended - there is one version of the shot",
+      project.media_pool.append_calls, [])
+check("its Fusion comp is still there", first.fusion_comps, 1)
+check("the neighbour is untouched",
+      (second.record_start, second.source_start, second.source_end),
+      (86501, 500, 600))
+check("no clip overlaps another", no_overlaps(dest), True)
+marks = update_markers(first)
+check("one update marker, none marked superseded",
+      [m["color"] for m in marks], ["Green"])
+check_true("the marker says where it went", "moved to V2" in marks[0]["name"])
+check_true("the new track is named for the run",
+           dest.GetTrackName("video", 2).startswith("Update 1 - "))
+check_true("the log says it was lifted", "LIFTED" in log)
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("an immediate re-run has nothing to do", "Nothing to do" in log2)
+
+# -- a middle clip keeps its kept frames in place on the track above ----------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+mod = load(res)
+run_update(mod)
+check("a middle clip is lifted and anchored on its kept frames",
+      (middle.track, middle.record_start, middle.source_start, middle.source_end),
+      (2, 86501 - 20, 480, 640))
+
+# -- an existing upper track is used when the span is free, skipped when not --
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 86550, track=2)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+blocker = dest.tracks[2][0]
+mod = load(res)
+run_update(mod)
+check("a busy V2 is skipped for a new track above it", middle.track, 3)
+check("the clip on V2 is untouched",
+      (blocker.track, blocker.record_start), (2, 86550))
+check("no clip overlaps another", no_overlaps(dest), True)
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)],
+     "shot_d": [(900, 1000)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602),
+     make_dest("shot_d", (900, 1000), 87000, track=2)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+mod = load(res)
+run_update(mod)
+check("a V2 with room there is used", middle.track, 2)
+check("and no extra track is created", dest.GetTrackCount("video"), 2)
+
+# -- a trim Resolve refuses after the move puts the clip back ----------------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(480, 640)], "shot_c": [(700, 800)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501),
+     make_dest("shot_c", (700, 800), 86602)])
+Item.timeline = dest
+middle = dest.tracks[1][1]
+middle.refuse_trim = True
+mod = load(res)
+log = run_update(mod)
+check("a clip whose trim is refused is put back where it was",
+      (middle.track, middle.record_start, middle.source_start), (1, 86501, 500))
+check_true("and handled the old way, with a copy on the update track",
+           "placing the updated version on the update track" in log)
+check("no clip overlaps another", no_overlaps(dest), True)
+
+for _name in LIFT_API:
+    delattr(Item, _name)
+del Item.timeline
+
+
+# ---------------------------------------------------------------------------
 # 3.0: GetSourceEndFrame convention change, and retries orphaning audio
 # ---------------------------------------------------------------------------
 #
