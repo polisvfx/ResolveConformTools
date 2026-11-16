@@ -170,6 +170,7 @@ If you are only using trims, duplicates shouldnt be of concern.
 An alternative approach that uses the `TimelineItem:SetName()` API introduced in DaVinci Resolve 20.2 to apply sequential shot numbers directly to the clip name on the timeline. Unlike the metadata-based version, each timeline instance is renamed independently — duplicate source clips are not an issue.
 - Configurable prefix (default: `SH_`), padding, and increment
 - Option to append the original clip name as a suffix
+- **Start at a custom number** mode: numbers the clips in scope (the selection, or the whole timeline) from a start number you choose. The start number defaults to the next free number — one increment past the highest number already on the timeline for the current prefix (e.g. `SH_0120` exists → `130`) — so newly added shots continue the sequence. It follows Prefix/Increment edits until you type your own value; **Next free** recalculates it.
 - Restore button to revert timeline clips back to their original Media Pool names
 - Does not modify the source Media Pool item
 
