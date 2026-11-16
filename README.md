@@ -55,7 +55,8 @@ against what they say now:
 
 - shots whose source range grew or shrank are brought to the newest state,
 - genuinely new shots are appended on a **new video track per run**, named for
-  the run (`Update 3 - 2026-08-06`), starting after the existing content,
+  the run (`Update 3 - 2026-08-06`), flush after the existing content and back
+  to back with no gaps between them (3.5+; earlier versions left 25 frames),
 - shots that no longer appear in any source are **marked, never removed**,
 - every shot it touches gets a marker with a timestamp and a short changelog,
   e.g. `2026-08-06 14:22 | run 3 | head +20f, tail +40f | 100-200 -> 80-240`,

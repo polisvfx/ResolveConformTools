@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.4
+Version: 3.5
 
 Two modes.
 
@@ -72,7 +72,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.4"
+TOOL_VERSION = "3.5"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -4057,7 +4057,12 @@ def run_update_workflow(
     track_name = format_update_track_name(run_no, now_local.split(" ")[0])
     state_box = {
         "track": None,
-        "cursor": end_frame + INTER_TIMELINE_GAP,
+        # Appended clips go flush: right after the existing content, and right
+        # after one another. Each is fully placed - slip retries, widening and
+        # all - before the next position is taken from its actual length, so no
+        # spare frames are needed between them. (Up to 3.4 a 25-frame gap was
+        # left here for no stated reason.)
+        "cursor": end_frame,
         "warned_record": False,
         "first_new_record": None,
         "trimmed": 0,
@@ -4169,7 +4174,7 @@ def run_update_workflow(
         duration = _record_placement(item, track, requested)
         if state_box["first_new_record"] is None:
             state_box["first_new_record"] = requested
-        state_box["cursor"] = requested + max(1, duration) + INTER_TIMELINE_GAP
+        state_box["cursor"] = requested + max(1, duration)
         _annotate_new(item, clip_info)
         write_update_marker(item, kind, run_no, note, marker_name,
                             _accepted_for(clip_info, achieved_start, achieved_end))
@@ -4448,8 +4453,7 @@ def run_update_workflow(
             state_box["lifted"] += 1
             # New shots queue up on the update track from this cursor; keep it
             # clear of anything a lifted clip now reaches.
-            state_box["cursor"] = max(state_box["cursor"],
-                                      new_end + INTER_TIMELINE_GAP)
+            state_box["cursor"] = max(state_box["cursor"], new_end)
             print(f"  LIFTED '{label}' from V{placed.track_index} to "
                   f"V{lifted_to} and trimmed it there: {old_src[0]}-{old_src[1]} "
                   f"-> {achieved_start}-{achieved_end}; grade and comps "

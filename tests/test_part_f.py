@@ -664,6 +664,21 @@ check("with the collected range",
       (added[0].source_start, added[0].source_end), (10, 90))
 check("its marker is the new colour",
       update_markers(added[0])[0]["color"], "Mint")
+check("it starts flush with the end of the existing content",
+      added[0].record_start, 86501 + 101)
+
+# Several new shots in one run sit back to back, with no gap between them.
+res2, project2, dest2, src2 = build_world(
+    {"shot_a": [(100, 200)], "shot_n1": [(10, 90)], "shot_n2": [(300, 349)],
+     "shot_n3": [(600, 620)]},
+    [make_dest("shot_a", (100, 200), 86400)])
+run_update(load(res2))
+news = items_on(dest2, 2)
+check("three new shots were appended", len(news), 3)
+check("the first right after the existing content", news[0].record_start,
+      86400 + 101)
+check("and each flush against the one before",
+      [b.record_start - a.GetEnd() for a, b in zip(news, news[1:])], [0, 0])
 
 track1 = items_on(dest, 1)
 check("the dropped shot is still on the timeline", len(track1), 2)
