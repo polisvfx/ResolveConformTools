@@ -35,6 +35,7 @@ python tests/test_part_b.py     # Find Clip in Timelines source tiers
 python tests/test_part_e.py     # Generate All Clips PRO decision functions
 python tests/test_part_f.py     # Generate All Clips PRO create + update, end to end
 python tests/test_part_g.py     # tools/make_release_zip.py, the release gate
+python tests/test_part_i.py     # DCTL Report plugin scan + installed lookup
 
 # Live tests (Resolve must be running with a project open)
 python tests/test_part_d.py     # Generate All Clips timeline resolution

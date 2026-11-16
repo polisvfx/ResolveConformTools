@@ -21,7 +21,7 @@
 """
 DCTL Report  (DRP-only variant)
 ================================
-Version: 1.1
+Version: 1.2
 
 Scans the currently-open DaVinci Resolve project for every LUT and DCTL
 reference it uses, resolves each reference against the standard Resolve
@@ -29,6 +29,9 @@ LUT roots *and* any extra directories configured in Preferences > General
 > LUT Locations, and produces a consolidated report of what is present
 and what is missing - so you don't have to dismiss N modal warnings one
 by one when opening a project authored on another machine.
+
+The same scan lists every OFX plugin the project uses and checks each
+against the plugins Resolve has registered on this machine.
 
 Data source: the project file itself.
   - ProjectManager.ExportProject() writes the current project to a .drp
@@ -39,6 +42,22 @@ Data source: the project file itself.
     .ilut/.olut/.davlut filenames. This is the only known way to recover
     DCTL filenames - every other Resolve export format strips OFX/
     ResolveFX parameters entirely.
+  - The same blobs name the OFX plugin behind every effect: its
+    identifier sits directly in front of an "OfxImageEffectContext..."
+    string. Identifiers are stored lower-cased.
+
+Plugins:
+  - Installed plugins are read from Resolve's own OFX plugin cache
+    (OFXPluginCacheV2.xml in Resolve's support folder), which lists every
+    plugin identifier with its bundle path, label and version. A plugin
+    counts as installed when the cache lists it and its bundle is still
+    on disk.
+  - com.blackmagicdesign.* (ResolveFX) is built into Resolve and never
+    appears in that cache; it is listed as used, never as missing.
+  - A missing plugin can only be named by its identifier - the readable
+    label lives in the plugin that is not there.
+  - "Installed" is not "licensed": an unlicensed plugin reports as found.
+  - If the cache cannot be found, plugins are listed as "not checked".
 
 Modes:
   - Selected Timelines (default): results are restricted to references
@@ -50,12 +69,13 @@ Modes:
 Actions after scanning:
   - Copy Existing Files...   copies every resolved LUT/DCTL into a
                               destination folder, preserving parent
-                              directory structure.
+                              directory structure. Plugins are not copied.
   - Show Missing List...     opens a window with the full *expected*
                               paths of every missing file, one per line,
-                              selectable and copyable.
-  - Export Full Report...    writes a .txt file listing every LUT and
-                              DCTL reference found, categorised by
+                              selectable and copyable, followed by the
+                              identifiers of any missing plugins.
+  - Export Full Report...    writes a .txt file listing every LUT, DCTL
+                              and plugin reference found, categorised by
                               status (missing / found).
 
 Requirements:
@@ -72,6 +92,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+import glob
+import html
 import shutil
 import zipfile
 import platform
@@ -118,6 +140,20 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 DCTL_RE = re.compile(rb"[\w\-./\\: ]{1,200}\.dctl", re.IGNORECASE)
 LUT_RE = re.compile(rb"[\w\-./\\: ]{1,200}\.(?:cube|3dl|ilut|olut|davlut)",
                     re.IGNORECASE)
+
+PLUGIN_KIND = "Plugin"
+KIND_ORDER = {"DCTL": 0, "LUT": 1, "Plugin": 2}
+
+# Every OFX effect in a body blob is stored as its plugin identifier followed,
+# a few framing bytes later, by "OfxImageEffectContextFilter_<uuid>_<n>" (or
+# ...ContextGeneral...). The identifier is what we want; this string is the
+# anchor that finds it.
+OFX_CONTEXT_MARK = b"OfxImageEffectContext"
+PLUGIN_ID_CHARS = (b"abcdefghijklmnopqrstuvwxyz"
+                   b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+# ResolveFX and friends ship inside Resolve and are not in the OFX cache.
+BUILTIN_PLUGIN_PREFIX = "com.blackmagicdesign."
+BUILTIN_PLUGIN_NOTE = "built into Resolve"
 
 
 DARK_STYLE = """
@@ -190,15 +226,33 @@ QFrame#Separator { background-color: #555555; max-height: 1px; }
 
 @dataclass
 class Reference:
-    kind: str          # "LUT" or "DCTL"
+    kind: str          # "LUT", "DCTL" or "Plugin"
     path: str          # stored path as it appears in the project
+                       # (for a Plugin: its OFX identifier)
     source: str        # "DRP/<inner xml>"
     timelines: list = field(default_factory=list)  # timeline names matched in body
-    resolved: Optional[str] = None
+    resolved: Optional[str] = None   # file path; for a Plugin its bundle path
+    # Plugin-only fields.
+    label: str = ""        # readable name, known only when installed
+    version: str = ""      # installed version
+    builtin: bool = False  # ships inside Resolve (ResolveFX)
+    unknown: bool = False  # could not be checked: no plugin cache found
+    note: str = ""
 
     @property
     def missing(self) -> bool:
-        return self.resolved is None
+        return self.resolved is None and not self.unknown and not self.builtin
+
+    @property
+    def is_file(self) -> bool:
+        return self.kind != PLUGIN_KIND
+
+    @property
+    def display(self) -> str:
+        """One-line name: the basename of a file, or 'Label [id]' of a plugin."""
+        if self.is_file:
+            return self.basename
+        return f"{self.label} [{self.path}]" if self.label else self.path
 
     @property
     def basename(self) -> str:
@@ -215,6 +269,7 @@ class ScanResult:
     timelines_scanned: list = field(default_factory=list)
     drp_path: str = ""
     errors: list = field(default_factory=list)
+    plugin_cache: str = ""   # OFX cache the plugins were checked against
 
     @property
     def missing(self) -> list:
@@ -222,7 +277,16 @@ class ScanResult:
 
     @property
     def found(self) -> list:
-        return [r for r in self.refs if not r.missing]
+        """Everything present: files on disk, installed and built-in plugins."""
+        return [r for r in self.refs if not r.missing and not r.unknown]
+
+    @property
+    def unchecked(self) -> list:
+        return [r for r in self.refs if r.unknown]
+
+    @property
+    def found_files(self) -> list:
+        return [r for r in self.found if r.is_file]
 
 
 # ---------------------------------------------------------------------------
@@ -487,8 +551,196 @@ def _decompress_body(hex_text: str, zstd_module) -> Optional[bytes]:
             return None
 
 
+def scan_plugin_ids(data: bytes) -> list:
+    """Return the OFX plugin identifiers named in decompressed body bytes.
+
+    Each effect is serialised (protobuf-style, length-prefixed strings) as
+
+        <len> <plugin id> "\\n" <~10 framing bytes> "OfxImageEffectContext..."
+
+    so we find every context string, step back to the newline in front of
+    it, and read the identifier that ends there. Reading backwards over
+    identifier characters can swallow the length byte when that byte happens
+    to be a printable one (a 52-character id is prefixed with "4"), so the
+    start is fixed by finding the position whose preceding byte equals the
+    remaining length. Identifiers are returned as stored, in first-seen order.
+    """
+    out = []
+    seen = set()
+    pos = 0
+    mark_len = len(OFX_CONTEXT_MARK)
+    while True:
+        pos = data.find(OFX_CONTEXT_MARK, pos)
+        if pos < 0:
+            break
+        end = data.rfind(b"\n", max(0, pos - 24), pos)
+        pos += mark_len
+        if end <= 0:
+            continue
+        start = end
+        while start > 0 and end - start < 200 \
+                and data[start - 1] in PLUGIN_ID_CHARS:
+            start -= 1
+        if end - start < 3:
+            continue
+        ident = None
+        for k in range(start, end - 2):
+            if k > 0 and data[k - 1] == end - k:
+                ident = data[k:end]
+                break
+        if ident is None:
+            # No length byte lined up (an id of 128+ characters has a
+            # two-byte length). Trust the run only if it looks like an id.
+            ident = data[start:end]
+            if b"." not in ident:
+                continue
+        text = ident.decode("ascii", "replace").strip(".-")
+        if len(text) < 3 or text.lower() in seen:
+            continue
+        seen.add(text.lower())
+        out.append(text)
+    return out
+
+
+def ofx_plugin_cache_paths() -> list:
+    """Candidate locations of Resolve's OFX plugin cache, per OS.
+
+    Verified on Windows (Resolve 21). The macOS and Linux locations follow
+    where Resolve keeps its other support files there and are not verified.
+    The file name carries a format version, hence the glob.
+    """
+    system = platform.system()
+    dirs = []
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            dirs.append(os.path.join(appdata, "Blackmagic Design",
+                                     "DaVinci Resolve", "Support"))
+    elif system == "Darwin":
+        dirs.append(os.path.expanduser(
+            "~/Library/Application Support/Blackmagic Design/DaVinci Resolve"))
+    else:
+        dirs.append(os.path.expanduser("~/.local/share/DaVinciResolve"))
+        dirs.append(os.path.expanduser("~/.local/share/DaVinci Resolve"))
+    out = []
+    for d in dirs:
+        out.extend(sorted(glob.glob(os.path.join(d, "OFXPluginCache*.xml")),
+                          reverse=True))
+    return out
+
+
+def parse_ofx_plugin_cache(text: str) -> dict:
+    """Parse OFXPluginCacheV2.xml into {lower-cased id: [entry, ...]}.
+
+    Each entry is {"name", "label", "group", "version", "bundle"}. One id can
+    have several entries: the cache keeps bundles from earlier installs next
+    to the current one. Parsed with regexes rather than an XML parser so one
+    malformed property cannot lose the whole file.
+    """
+    plugins = {}
+    for chunk in text.split("<bundle>")[1:]:
+        m = re.search(r'<binary\b[^>]*\bbundle_path="([^"]*)"', chunk)
+        bundle = html.unescape(m.group(1)) if m else ""
+        for part in chunk.split("<plugin ")[1:]:
+            head = part.split(">", 1)[0]
+            m = re.search(r'\bname="([^"]*)"', head)
+            if not m or not m.group(1):
+                continue
+            name = html.unescape(m.group(1))
+            major = re.search(r'\bmajor_version="(\d+)"', head)
+            minor = re.search(r'\bminor_version="(\d+)"', head)
+            version = ""
+            if major:
+                version = major.group(1)
+                if minor:
+                    version += "." + minor.group(1)
+            props = {}
+            for prop_name in ("OfxPropLabel",
+                              "OfxImageEffectPluginPropGrouping"):
+                pm = re.search(
+                    r'<property name="' + prop_name + r'"[^>]*>\s*'
+                    r'<value value="([^"]*)"', part)
+                props[prop_name] = \
+                    html.unescape(pm.group(1)).strip() if pm else ""
+            plugins.setdefault(name.lower(), []).append({
+                "name": name,
+                "label": props["OfxPropLabel"],
+                "group": props["OfxImageEffectPluginPropGrouping"],
+                "version": version,
+                "bundle": bundle,
+            })
+    return plugins
+
+
+def load_installed_plugins():
+    """Return (plugins, cache_path); plugins is None when no cache is readable."""
+    for path in ofx_plugin_cache_paths():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception as e:
+            print(f"[DCTL Report] Could not read {path}: {e}", file=sys.stderr)
+            continue
+        return parse_ofx_plugin_cache(text), path
+    return None, ""
+
+
+def classify_plugin(plugin_id: str, installed, exists=None) -> dict:
+    """Decide whether a plugin identifier is available on this machine.
+
+    Returns {"status", "bundle", "label", "version", "note"} with status one
+    of "builtin", "found", "missing", "unknown". `installed` is the dict from
+    parse_ofx_plugin_cache(), or None when there was no cache to read.
+    `exists` tests a bundle path (default os.path.exists).
+    """
+    if exists is None:
+        exists = os.path.exists
+    out = {"status": "missing", "bundle": "", "label": "", "version": "",
+           "note": ""}
+    low = plugin_id.lower()
+    if low.startswith(BUILTIN_PLUGIN_PREFIX):
+        out["status"] = "builtin"
+        out["note"] = BUILTIN_PLUGIN_NOTE
+        return out
+    if installed is None:
+        out["status"] = "unknown"
+        out["note"] = "Resolve's OFX plugin cache was not found"
+        return out
+    entries = installed.get(low) or []
+    if not entries:
+        return out
+    present = [e for e in entries if e["bundle"] and exists(e["bundle"])]
+    if present:
+        # Several installs of one plugin: report the newest.
+        best = max(present, key=lambda e: tuple(
+            int(x) for x in e["version"].split(".") if x.isdigit()))
+        out["status"] = "found"
+    else:
+        best = entries[-1]
+        out["note"] = ("registered with Resolve, but its bundle is no longer "
+                       "at " + (best["bundle"] or "(unknown path)"))
+    label = best["label"] or best["name"]
+    if best["group"] and best["label"]:
+        label = best["group"] + " / " + best["label"]
+    out["bundle"] = best["bundle"]
+    out["label"] = label
+    out["version"] = best["version"]
+    return out
+
+
+def apply_plugin_status(ref, installed) -> None:
+    """Fill in a Plugin Reference from classify_plugin()."""
+    info = classify_plugin(ref.path, installed)
+    ref.builtin = info["status"] == "builtin"
+    ref.unknown = info["status"] == "unknown"
+    ref.resolved = info["bundle"] if info["status"] == "found" else None
+    ref.label = info["label"]
+    ref.version = info["version"]
+    ref.note = info["note"]
+
+
 def _scan_decompressed(data: bytes, source: str) -> list:
-    """Extract LUT/DCTL refs from decompressed body bytes."""
+    """Extract LUT/DCTL/plugin refs from decompressed body bytes."""
     out = []
     local_seen = set()
 
@@ -519,6 +771,9 @@ def _scan_decompressed(data: bytes, source: str) -> list:
             continue
         local_seen.add(key)
         out.append(Reference("LUT", s, source, []))
+
+    for ident in scan_plugin_ids(data):
+        out.append(Reference(PLUGIN_KIND, ident, source, []))
 
     return out
 
@@ -1067,22 +1322,23 @@ class ReportDialog(QDialog):
         # Layout rows are assembled below.
         self.copy_btn.setToolTip(
             "Copy every resolved LUT/DCTL to a destination folder, "
-            "preserving parent directory structure.")
+            "preserving parent directory structure. Plugins are not copied.")
         self.copy_btn.clicked.connect(self._do_copy)
         self.missing_btn = QPushButton("Show Missing List...")
         self.missing_btn.setToolTip(
-            "Show full expected paths of every missing file, "
-            "selectable and copyable.")
+            "Show full expected paths of every missing file and the "
+            "identifiers of missing plugins, selectable and copyable.")
         self.missing_btn.clicked.connect(self._do_missing)
         self.complete_btn = QPushButton("Show Complete List...")
         self.complete_btn.setToolTip(
             "Show every referenced LUT/DCTL with the path it is being "
-            "read from. Missing entries are marked '(missing)'.")
+            "read from, then every OFX plugin used. Missing entries are "
+            "marked '(missing)'.")
         self.complete_btn.clicked.connect(self._do_complete)
         self.report_btn = QPushButton("Export Full Report...")
         self.report_btn.setToolTip(
-            "Write a .txt file listing every LUT and DCTL reference found, "
-            "with status and source.")
+            "Write a .txt file listing every LUT, DCTL and plugin reference "
+            "found, with status and source.")
         self.report_btn.clicked.connect(self._do_report)
         for b in (self.copy_btn, self.missing_btn, self.complete_btn,
                   self.report_btn):
@@ -1231,9 +1487,13 @@ class ReportDialog(QDialog):
         result.drp_path = drp_path
 
         roots = get_roots()
+        installed, result.plugin_cache = load_installed_plugins()
         for ref in result.refs:
-            ref.resolved = resolve_reference(ref.path, roots)
-        result.refs.sort(key=lambda r: (0 if r.kind == "DCTL" else 1,
+            if ref.is_file:
+                ref.resolved = resolve_reference(ref.path, roots)
+            else:
+                apply_plugin_status(ref, installed)
+        result.refs.sort(key=lambda r: (KIND_ORDER.get(r.kind, 9),
                                         r.path.lower()))
         self.result = result
 
@@ -1241,16 +1501,24 @@ class ReportDialog(QDialog):
         found = result.found
         dctl_m = sum(1 for r in missing if r.kind == "DCTL")
         lut_m = sum(1 for r in missing if r.kind == "LUT")
+        plug_m = sum(1 for r in missing if r.kind == PLUGIN_KIND)
+        plugins = [r for r in result.refs if r.kind == PLUGIN_KIND]
+        builtin = sum(1 for r in plugins if r.builtin)
         scope_desc = ("all timelines" if self.mode_all.isChecked()
                       else f"{len(scope_names)} selected timeline(s)")
-        self.summary.setText(
+        text = (
             f"Scanned {scope_desc} via DRP. "
             f"{len(result.refs)} unique reference(s): "
             f"{len(found)} found, {len(missing)} missing "
-            f"({dctl_m} DCTL, {lut_m} LUT)."
+            f"({dctl_m} DCTL, {lut_m} LUT, {plug_m} plugin). "
+            f"Plugins used: {len(plugins)} ({builtin} built-in ResolveFX)."
         )
+        if result.unchecked:
+            text += (f" {len(result.unchecked)} plugin(s) could not be "
+                     f"checked: Resolve's OFX plugin cache was not found.")
+        self.summary.setText(text)
         self.progress.setValue(100)
-        self.copy_btn.setEnabled(bool(found))
+        self.copy_btn.setEnabled(bool(result.found_files))
         self.missing_btn.setEnabled(bool(missing))
         self.complete_btn.setEnabled(bool(result.refs))
         self.report_btn.setEnabled(bool(result.refs))
@@ -1261,7 +1529,7 @@ class ReportDialog(QDialog):
     def _do_copy(self):
         if not self.result:
             return
-        found = self.result.found
+        found = self.result.found_files
         if not found:
             QMessageBox.information(self, "Nothing to copy",
                                     "No existing files to copy.")
@@ -1309,15 +1577,32 @@ class ReportDialog(QDialog):
         primary_root = roots[0] if roots else ""
         lines = []
         for ref in missing:
+            if not ref.is_file:
+                continue
             sp = ref.path.strip().strip('"').replace("\\", "/")
             if os.path.isabs(sp):
                 full = os.path.normpath(sp)
             else:
                 full = os.path.normpath(os.path.join(primary_root, sp))
             lines.append(full)
+        n_files = len(lines)
+        plugins = [r for r in missing if not r.is_file]
+        if plugins:
+            if lines:
+                lines.append("")
+            lines.append("Missing OFX plugins:")
+            for ref in plugins:
+                line = ref.display
+                if ref.note:
+                    line += f"  ({ref.note})"
+                lines.append(line)
         text = "\n".join(lines)
+        header = (f"{n_files} missing file(s) - full expected paths, one per "
+                  f"line - and {len(plugins)} missing plugin(s), by OFX "
+                  f"identifier:")
         dlg = MissingListDialog(text, len(missing), self,
-                                title="Missing Files")
+                                title="Missing Files and Plugins",
+                                header=header)
         dlg.exec()
 
     def _do_complete(self):
@@ -1325,18 +1610,38 @@ class ReportDialog(QDialog):
             return
         refs = list(self.result.refs)
         if not refs:
-            QMessageBox.information(self, "Nothing to show",
-                                    "No LUT/DCTL references were found.")
+            QMessageBox.information(
+                self, "Nothing to show",
+                "No LUT, DCTL or plugin references were found.")
             return
         roots = get_roots()
         primary_root = roots[0] if roots else ""
-        # Sort: DCTLs first, then LUTs; within each kind, missing first, then
-        # by basename (case-insensitive) for stable reading.
-        refs.sort(key=lambda r: (r.kind != "DCTL",
+        # Sort: DCTLs first, then LUTs, then plugins; within each kind,
+        # missing first and built-in plugins last, then by name
+        # (case-insensitive) for stable reading.
+        refs.sort(key=lambda r: (KIND_ORDER.get(r.kind, 9),
                                  not r.missing,
-                                 r.basename.lower()))
+                                 r.builtin,
+                                 r.display.lower()))
         lines = []
+        plugin_header_done = False
         for ref in refs:
+            if not ref.is_file:
+                if not plugin_header_done:
+                    plugin_header_done = True
+                    if lines:
+                        lines.append("")
+                    lines.append("OFX plugins:")
+                if ref.builtin:
+                    lines.append(f"{ref.display} ({BUILTIN_PLUGIN_NOTE})")
+                elif ref.unknown:
+                    lines.append(f"{ref.display} (not checked)")
+                elif ref.resolved:
+                    lines.append(
+                        f"{ref.display}  ->  {os.path.normpath(ref.resolved)}")
+                else:
+                    lines.append(f"{ref.display} (missing)")
+                continue
             if ref.resolved:
                 path = os.path.normpath(ref.resolved)
                 lines.append(f"{path}")
@@ -1352,7 +1657,8 @@ class ReportDialog(QDialog):
         text = "\n".join(lines)
         header = (f"{len(refs)} reference(s). Each line shows the path the "
                   f"file is being read from; missing entries are marked "
-                  f"'(missing)'.")
+                  f"'(missing)'. Plugins follow, with the bundle each is "
+                  f"loaded from.")
         dlg = MissingListDialog(text, len(refs), self,
                                 title="Complete List", header=header)
         dlg.exec()
@@ -1390,27 +1696,59 @@ class ReportDialog(QDialog):
         for root in get_roots():
             lines.append(f"  - {root}")
         lines.append("")
+        lines.append("OFX plugin cache (installed plugins):")
+        lines.append(
+            f"  - {r.plugin_cache or '(not found - plugins not checked)'}")
+        lines.append("")
         lines.append(f"Total unique references: {len(r.refs)}")
         lines.append(f"  Found:   {len(r.found)}")
         lines.append(f"  Missing: {len(r.missing)}")
+        if r.unchecked:
+            lines.append(f"  Not checked: {len(r.unchecked)}")
         lines.append("")
 
-        for status_name, items in (("MISSING", r.missing), ("FOUND", r.found)):
-            for kind in ("DCTL", "LUT"):
+        builtin = [x for x in r.found if x.builtin]
+        found = [x for x in r.found if not x.builtin]
+        for status_name, items in (("MISSING", r.missing),
+                                   ("NOT CHECKED", r.unchecked),
+                                   ("FOUND", found)):
+            for kind in ("DCTL", "LUT", PLUGIN_KIND):
                 sub = [x for x in items if x.kind == kind]
                 if not sub:
                     continue
                 lines.append(f"=== {status_name} {kind}s ({len(sub)}) ===")
                 for ref in sub:
-                    lines.append(f"  {ref.basename}")
-                    lines.append(f"    stored:   {ref.path}")
-                    if ref.resolved:
-                        lines.append(f"    resolved: {ref.resolved}")
+                    if ref.is_file:
+                        lines.append(f"  {ref.basename}")
+                        lines.append(f"    stored:   {ref.path}")
+                        if ref.resolved:
+                            lines.append(f"    resolved: {ref.resolved}")
+                    else:
+                        lines.append(f"  {ref.label or ref.path}")
+                        lines.append(f"    id:       {ref.path}")
+                        if ref.version:
+                            lines.append(f"    version:  {ref.version} "
+                                         f"(installed)")
+                        if ref.resolved:
+                            lines.append(f"    bundle:   {ref.resolved}")
+                        if ref.note:
+                            lines.append(f"    note:     {ref.note}")
                     if ref.timelines:
                         lines.append(
                             f"    timelines: {', '.join(ref.timelines)}")
                     lines.append(f"    source:   {ref.source}")
                 lines.append("")
+
+        if builtin:
+            lines.append(f"=== BUILT-IN Plugins ({len(builtin)}) ===")
+            lines.append("  Ship with Resolve; not checked against the "
+                         "edition (Studio / free) in use.")
+            for ref in builtin:
+                line = f"  {ref.path}"
+                if ref.timelines:
+                    line += f"   [{', '.join(ref.timelines)}]"
+                lines.append(line)
+            lines.append("")
         return "\n".join(lines)
 
 

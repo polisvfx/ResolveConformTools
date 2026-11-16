@@ -197,13 +197,14 @@ A companion script that skips the settings dialog entirely when settings have al
 
 
 ## DCTL Report (Python, PySide6)
-Scans the currently-open project for every LUT and DCTL reference, resolves each against Resolve's standard LUT directories **and** any custom directories configured in **Preferences > General > LUT Locations**, and reports what is present and what is missing.
+Scans the currently-open project for every LUT and DCTL reference, resolves each against Resolve's standard LUT directories **and** any custom directories configured in **Preferences > General > LUT Locations**, and reports what is present and what is missing. The same scan lists every OFX plugin the project uses and flags the ones not installed on this machine.
 
 - **DRP-based scanning**: Exports the project to a .drp file and decodes zstd-compressed body blobs to recover DCTL/LUT filenames — the only reliable way to extract OFX/ResolveFX parameters
 - **Scope modes**: Scan selected timelines only or all timelines in the project
-- **Show Missing List**: Full expected paths of every missing file, selectable and copyable
-- **Show Complete List**: Every referenced LUT/DCTL with the resolved path it is being read from; missing entries are marked `(missing)`
-- **Copy Existing Files**: Copies every resolved LUT/DCTL into a destination folder, preserving parent directory structure
+- **Plugin check**: Every OFX plugin used is checked against Resolve's own plugin cache (`OFXPluginCacheV2.xml`). Installed plugins are shown with their name, version and bundle path; missing ones can only be shown by identifier (e.g. `co.videovillage.filmbox3ofx`), since the readable name lives in the plugin itself. ResolveFX is listed as built-in. Installed does not mean licensed.
+- **Show Missing List**: Full expected paths of every missing file, selectable and copyable, followed by the identifiers of missing plugins
+- **Show Complete List**: Every referenced LUT/DCTL with the resolved path it is being read from, then every plugin used; missing entries are marked `(missing)`
+- **Copy Existing Files**: Copies every resolved LUT/DCTL into a destination folder, preserving parent directory structure (plugins are not copied)
 - **Export Full Report**: Writes a categorised .txt report of all references with status and source
 - Requires `zstandard` installed into Resolve's Python interpreter (usually just a `pip install zstandard`)
 
