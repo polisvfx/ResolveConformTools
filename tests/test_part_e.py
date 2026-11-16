@@ -50,7 +50,8 @@ WANTED = [
     "build_settings_record", "check_retime_properties", "is_clip_retimed",
     "build_retime_marker_text", "item_speed_percent",
     "item_uid", "linked_others", "trim_api_available", "plan_trim", "gap_around",
-    "apply_trim",
+    "apply_trim", "transition_handle_need", "record_to_source_frames",
+    "track_transitions", "is_transition_item",
 ]
 
 
@@ -813,6 +814,67 @@ video = OffsetItem(100, 199, uid="v1", linked=[self_listed, audio])
 check("a build that lists the item itself (another wrapper, same uid) "
       "still counts one", [i.uid for i in linked_others(video)], ["a1"])
 check("no linked items", linked_others(OffsetItem(0, 9)), [])
+
+
+# ---------------------------------------------------------------------------
+# Transition handles (3.1)
+# ---------------------------------------------------------------------------
+#
+# Geometry measured on 21.2.0.6: a 66f centred Cross Dissolve over a cut at 3651
+# spans 3618-3684; a 33f left-aligned one before a clip at 3978 spans 3945-3978.
+
+print("\n== transition handles ==")
+
+transition_handle_need = ns["transition_handle_need"]
+record_to_source_frames = ns["record_to_source_frames"]
+track_transitions = ns["track_transitions"]
+
+check("a centred dissolve over the in point needs half of it at the head",
+      transition_handle_need(3651, 3832, [(3618, 3684)]), (33, 0))
+check("...and half of it at the tail of the outgoing clip",
+      transition_handle_need(3500, 3651, [(3618, 3684)]), (0, 33))
+check("a left-aligned dissolve ending on the in point needs all of it",
+      transition_handle_need(3978, 4076, [(3945, 3978)]), (33, 0))
+check("...and nothing from the outgoing clip",
+      transition_handle_need(3900, 3978, [(3945, 3978)]), (0, 0))
+check("a right-aligned dissolve starting on the out point needs all of it",
+      transition_handle_need(3900, 3978, [(3978, 4011)]), (0, 33))
+check("...and nothing from the incoming clip",
+      transition_handle_need(3978, 4076, [(3978, 4011)]), (0, 0))
+check("dissolves on both cuts",
+      transition_handle_need(100, 200, [(90, 110), (180, 220)]), (10, 20))
+check("an unrelated transition elsewhere on the track",
+      transition_handle_need(100, 200, [(400, 440)]), (0, 0))
+
+check("at 100% record frames are source frames", record_to_source_frames(33, 100), 33)
+check("at 50% half as many, rounded up", record_to_source_frames(33, 50.0), 17)
+check("at 200% twice as many", record_to_source_frames(20, 200), 40)
+check("a reverse speed counts by magnitude", record_to_source_frames(20, -100), 20)
+check("a freeze needs none", record_to_source_frames(20, 0), 0)
+
+
+class TransitionStub:
+    def __init__(self, start, duration):
+        self.start, self.duration = start, duration
+
+    def GetType(self):
+        return "transition"
+
+    def GetStart(self):
+        return self.start
+
+    def GetDuration(self):
+        return self.duration
+
+
+class ClipStub:
+    def GetType(self):
+        return "video"
+
+
+check("track_transitions keeps only the transitions",
+      track_transitions([ClipStub(), TransitionStub(90, 20), None, object()]),
+      [(90, 110)])
 
 
 # ---------------------------------------------------------------------------

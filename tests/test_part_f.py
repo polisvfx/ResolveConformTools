@@ -1647,6 +1647,62 @@ check("the retry deleted the video AND its linked audio", deleted_batches, [2])
 
 
 # ---------------------------------------------------------------------------
+# 3.1: transition handles are part of a shot's range
+# ---------------------------------------------------------------------------
+
+print("\n== 3.1 transition handles ==")
+
+
+class TransitionItem:
+    """Stub transition, as 21.2.0.6 lists it among a track's items."""
+
+    def __init__(self, record_start, duration):
+        self.record_start, self.duration = record_start, duration
+
+    def GetType(self):
+        return "transition"
+
+    def GetName(self):
+        return "Cross Dissolve"
+
+    def GetStart(self):
+        return self.record_start
+
+    def GetDuration(self):
+        return self.duration
+
+    def GetEnd(self):
+        return self.record_start + self.duration
+
+    def GetMediaPoolItem(self):
+        return None
+
+
+# shot_a 100..199 at record 0..99, shot_b 500..599 at 100..199, and a 20-frame
+# centred dissolve over the cut at 100. A reversed shot_c 300..349 at 200..249
+# with a 10-frame left-aligned dissolve ending on its in point.
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 199)], "shot_b": [(500, 599)]}, [])
+src.tracks[1].append(TransitionItem(90, 20))
+_mod, log, built = create_once(res, project)
+ranges = sorted((i.mpi.GetName(), i.source_start, i.source_end)
+                for i in built.all_items())
+check("the outgoing shot gains the dissolve's tail half, the incoming its head",
+      ranges, [("shot_a", 100, 209), ("shot_b", 490, 599)])
+check_true("the log reports the handles", "TRANSITION HANDLES" in log)
+check_true("the transition itself is not treated as a clip",
+           "Could not retrieve media item for clip: Cross Dissolve" not in log)
+
+# Handles past the start of the media are clamped and the log says so.
+res, project, dest, src = build_world({"shot_a": [(5, 99)]}, [])
+src.tracks[1].append(TransitionItem(-10, 20))
+_mod, log, built = create_once(res, project)
+check("a head handle past frame 0 is clamped",
+      [(i.source_start, i.source_end) for i in built.all_items()], [(0, 99)])
+check_true("and reported as short", "clamped at the media's edge" in log)
+
+
+# ---------------------------------------------------------------------------
 
 print("")
 if fails:

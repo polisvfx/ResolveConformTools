@@ -20,7 +20,7 @@
 #
 """
 Generate All Clips Timeline PRO
-Version: 3.0
+Version: 3.1
 
 Two modes.
 
@@ -32,6 +32,7 @@ new timeline. Detects and marks:
 - Frame holds / freeze frames
 - Non-linear retimes / speed ramps (via XML analysis)
 - Reversed clips (normalized to forward-playing)
+- Transitions: each shot's range includes the handle frames its dissolves need
 
 UPDATE: re-reads the source timelines and reconciles an existing All Clips
 timeline against them — lengthening and shortening shots to the newest state,
@@ -67,7 +68,7 @@ from typing import Optional
 # Keep in step with the "Version:" line in the module docstring above — the repo
 # convention is that the docstring is authoritative, this is what gets recorded
 # into the manifest so an old timeline says which build last touched it.
-TOOL_VERSION = "3.0"
+TOOL_VERSION = "3.1"
 MIN_FRAME_DIFF = 3
 MIN_PERCENT_DIFF = 3.0
 # Above this speed a clip is a whip or a ramp rather than a plain speed change,
@@ -730,6 +731,80 @@ def find_duplicate_groups(all_clip_infos: list[ClipInfo]) -> int:
     return set_index
 
 
+# ---------------------------------------------------------------------------
+# Transition handles
+# ---------------------------------------------------------------------------
+#
+# A dissolve needs source frames beyond the cut. GetSourceStartFrame() and
+# GetSourceEndFrame() describe the clip between its cut points only, so a shot
+# collected from those alone is too short to re-conform its transitions.
+#
+# Measured on 21.2.0.6: GetItemListInTrack() returns each transition as an item
+# of its own, GetType() == 'transition', spanning the record frames it covers,
+# with GetProperty('TransitionDuration'/'TransitionAlignment'). A 66-frame
+# centred Cross Dissolve over a cut at 3651 spans 3618-3684; a left-aligned one
+# ends exactly on the cut. The handle a clip needs is read from that geometry,
+# so every alignment works the same way:
+#
+#   head = cut_in  - transition_start   (transition covering the clip's in point)
+#   tail = transition_end - cut_out     (transition covering its out point)
+
+def is_transition_item(item) -> bool:
+    getter = getattr(item, "GetType", None)
+    if not callable(getter):
+        return False
+    try:
+        return getter() == "transition"
+    except Exception:
+        return False
+
+
+def track_transitions(items) -> list:
+    """[(record_start, record_end_exclusive), ...] of the transitions on a track."""
+    spans = []
+    for item in items or []:
+        if item is None or not is_transition_item(item):
+            continue
+        try:
+            start = int(item.GetStart())
+            spans.append((start, start + int(item.GetDuration())))
+        except Exception:
+            continue
+    return spans
+
+
+def transition_handle_need(record_start: int, record_end: int,
+                           transitions: list) -> tuple:
+    """(head, tail) record frames a clip must reach past its cut points.
+
+    `record_end` is exclusive. A transition covers the in point when it starts
+    before it and has not ended before it (a left-aligned one ends exactly on
+    it); it covers the out point when it starts on or before it and runs past
+    it (a right-aligned one starts exactly on it).
+    """
+    head = tail = 0
+    for start, end in transitions:
+        if start < record_start <= end:
+            head = max(head, record_start - start)
+        if start <= record_end < end:
+            tail = max(tail, end - record_end)
+    return head, tail
+
+
+def record_to_source_frames(frames: int, speed_percent) -> int:
+    """Record frames of handle as source frames, at the clip's speed."""
+    if frames <= 0:
+        return 0
+    try:
+        speed = abs(float(speed_percent))
+    except (TypeError, ValueError):
+        speed = 100.0
+    if speed <= 0:
+        return 0
+    # Ceiling division: a partial source frame of handle is still needed.
+    return int(-(-(frames * speed) // 100.0))
+
+
 def get_all_timeline_clips(timeline) -> list[TimelineClipData]:
     """Extract all video clips from all tracks of a timeline."""
     clip_list = []
@@ -1330,10 +1405,16 @@ def collect_desired_clips(
             if not track_items:
                 print(f"No items in track {track_idx}")
                 continue
+            transitions = track_transitions(track_items)
+            if transitions:
+                print(f"  Track {track_idx}: {len(transitions)} transition(s); "
+                      f"their handles are added to the shots they join")
 
             for item_index, track_item in enumerate(track_items):
                 if track_item is None:
                     print(f"Track item #{item_index + 1} is nil")
+                    continue
+                if is_transition_item(track_item):
                     continue
 
                 # Get name
@@ -1506,6 +1587,48 @@ def collect_desired_clips(
                                       f"({new_duration}f, +{added}f, {growth:.2f}x)")
                                 norm_start = proposed_start
                                 norm_end = proposed_end
+
+                # Transition handles: the frames a dissolve on either cut needs
+                # beyond it. A reversed clip's head lies at its higher source
+                # frames, so the two ends swap. A frame hold needs nothing.
+                if transitions and not is_frame_hold:
+                    try:
+                        rec_start = int(track_item.GetStart())
+                        rec_end = rec_start + int(track_item.GetDuration())
+                    except Exception:
+                        rec_start = rec_end = None
+                    if rec_start is not None:
+                        head_rec, tail_rec = transition_handle_need(
+                            rec_start, rec_end, transitions)
+                        if head_rec or tail_rec:
+                            speed = item_speed_percent(track_item)
+                            if speed is None:
+                                speed = retime_pct if (is_retimed and retime_pct) else 100.0
+                            head_src = record_to_source_frames(head_rec, speed)
+                            tail_src = record_to_source_frames(tail_rec, speed)
+                            before = (norm_start, norm_end)
+                            if is_reversed:
+                                wanted = (norm_start - tail_src, norm_end + head_src)
+                            else:
+                                wanted = (norm_start - head_src, norm_end + tail_src)
+                            norm_start = max(0, wanted[0])
+                            norm_end = wanted[1]
+                            try:
+                                raw_media_end = media_item.GetClipProperty("End")
+                                media_end = (int(raw_media_end)
+                                             if raw_media_end not in (None, "") else None)
+                            except (TypeError, ValueError, Exception):
+                                media_end = None
+                            if media_end is not None:
+                                norm_end = min(norm_end, media_end)
+                            note = ""
+                            if (norm_start, norm_end) != wanted:
+                                note = (" (clamped at the media's edge - the "
+                                        "transition will be short of frames)")
+                            print(f"  TRANSITION HANDLES: head +{head_rec}f, "
+                                  f"tail +{tail_rec}f on the timeline -> source "
+                                  f"{before[0]}-{before[1]} -> "
+                                  f"{norm_start}-{norm_end}{note}")
 
                 # Capture source clip name + color version names if option is on
                 source_clip_name: Optional[str] = None
@@ -2938,10 +3061,10 @@ def run_workflow(
 
 
     # Range Audit: flag any clip whose final source range on the new timeline
-    # grew significantly versus the raw API-reported range. The only thing in
-    # the pipeline that can cause growth past 1.0x is XML retime expansion of
-    # a constituent — so this is the primary diagnostic when clips end up
-    # longer than expected.
+    # grew significantly versus the raw API-reported range. Growth past 1.0x
+    # comes from XML retime expansion of a constituent or, since 3.1, from
+    # transition handles on a short clip — so this is the primary diagnostic
+    # when clips end up longer than expected.
     audit_rows = []
     for ci in all_clip_infos:
         if ci.api_source_start is None or ci.api_source_end is None:
@@ -2963,8 +3086,9 @@ def run_workflow(
         print("")
         print(f"=== Range Audit: {len(audit_rows)} clip(s) grew "
               f">={RANGE_AUDIT_GROWTH_THRESHOLD:.1f}x vs raw API range ===")
-        print("(Cause: XML retime expansion. Disable 'Use XML for Precise "
-              "Retime Detection' to keep raw API ranges.)")
+        print("(Cause: XML retime expansion, or transition handles on a short "
+              "clip — see the TRANSITION HANDLES lines above. Disabling 'Use "
+              "XML for Precise Retime Detection' removes the first.)")
         for (growth, name, tl, api_s, api_e, api_d,
              fin_s, fin_e, fin_d, non_lin) in audit_rows:
             tag = " [non-linear]" if non_lin else ""
