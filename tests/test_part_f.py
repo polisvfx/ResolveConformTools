@@ -185,7 +185,12 @@ class Item:
         return True
 
     def GetLinkedItems(self):
-        return [self] * (self.linked + 1) if self.linked else [self]
+        # 21.2.0.6 lists only the OTHER linked items, not the item itself.
+        if not self.linked:
+            return []
+        if not hasattr(self, "_linked_objs"):
+            self._linked_objs = [object() for _ in range(self.linked)]
+        return list(self._linked_objs)
 
     # --- markers ---
     def GetMarkers(self):
@@ -1150,7 +1155,7 @@ res, project, dest, src = build_world({"shot_a": [(100, 200)]}, [])
 # and the narrow range sits entirely inside the wide one.
 twin_mpi = MPI("shot_a", "mid_shot_a_copy", "/vol/shot_a_copy.mov")
 twin = Item(twin_mpi, 90, 210, 500)
-twin.GetClipProperty = lambda key: "50.0" if key == "Speed" else None
+twin.GetSpeed = lambda: {"Percentage": 50.0}
 src.tracks[1].append(twin)
 
 mod = load(res)
@@ -1316,6 +1321,329 @@ check("unscoped, a linear curve reads as the whole media", whole[:2], (0, 6299))
 check("scoped, it reads as the few frames the shot uses",
       scoped[:2], (1716, 1746))
 check("and it is not mistaken for a ramp", scoped[2], False)
+
+
+# ---------------------------------------------------------------------------
+# 3.0: in-place trim on builds with the 21.1.2 offset API
+# ---------------------------------------------------------------------------
+#
+# Everything above runs against a stub with no offset methods, which is what a
+# pre-21.1.2 Resolve looks like, so it covers the rebuild fallback. Here the
+# stub gains the offsets, behaving as measured on 21.2.0.6: head trims move the
+# record start, tail trims the end, a request past the media is refused, and an
+# overlap is NOT refused (Resolve overwrites the neighbour, so the script must
+# never ask for one).
+
+print("\n== 3.0 in-place trim ==")
+
+
+def _left(self):
+    return float(self.source_start)
+
+
+def _right(self):
+    return float(self.mpi._end - self.source_end)
+
+
+def _set_left(self, off, subframe=False, linked=True):
+    if getattr(self, "refuse_trim", False) or off < 0 or off > self.source_end:
+        return False
+    self.record_start += off - self.source_start
+    self.source_start = off
+    self.reported_end = self.source_end + 1   # exclusive, as Resolve mirrors it
+    return True
+
+
+def _set_right(self, off, subframe=False, linked=True):
+    new_end = self.mpi._end - off
+    if getattr(self, "refuse_trim", False) or off < 0 or new_end < self.source_start:
+        return False
+    self.source_end = new_end
+    self.reported_end = new_end + 1
+    return True
+
+
+def _delete_marker(self, frame):
+    return self.markers.pop(int(frame), None) is not None
+
+
+TRIM_API = {
+    "GetLeftOffset": _left, "GetRightOffset": _right,
+    "SetLeftOffset": _set_left, "SetRightOffset": _set_right,
+    "GetSpeed": lambda self: {"Percentage": getattr(self, "speed", 100.0)},
+    "GetUniqueId": lambda self: self.uid,
+    "DeleteMarkerAtFrame": _delete_marker,
+}
+for _name, _fn in TRIM_API.items():
+    setattr(Item, _name, _fn)
+
+
+def no_overlaps(timeline):
+    for track in timeline.tracks.values():
+        spans = sorted((i.record_start, i.GetEnd()) for i in track)
+        for (_s1, e1), (s2, _e2) in zip(spans, spans[1:]):
+            if s2 < e1:
+                return False
+    return True
+
+
+# -- extend with room: the same item, trimmed, keeping its comps -------------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)]},
+    [make_dest("shot_a", (100, 200), 86500, fusion_comps=2,
+               versions=["Version 1", "v2"], label="A010_plate")])
+original = dest.tracks[1][0]
+original.markers[150] = {"color": "Green", "name": "check this", "note": "user",
+                         "duration": 1, "customData": ""}
+mod = load(res)
+log = run_update(mod)
+placed = items_on(dest, 1)
+check("the clip is trimmed, not replaced", placed[0] is original, True)
+check("nothing was appended", project.media_pool.append_calls, [])
+check("it covers the new range", (original.source_start, original.source_end),
+      (80, 240))
+check("kept frames hold position", original.record_start, 86500 - 20)
+check("its Fusion comps are still there", original.fusion_comps, 2)
+check("its colour versions are still there", original.versions,
+      ["Version 1", "v2"])
+check_true("protection does not skip a clip that is trimmed",
+           "SKIP" not in log)
+check_true("the user's marker is untouched", 150 in original.markers)
+marks = update_markers(original)
+check("one update marker", len(marks), 1)
+check("coloured for an extension", marks[0]["color"], "Green")
+check_true("the log says it was trimmed in place", "TRIMMED" in log)
+check_true("the summary counts it", "1 of the range changes were trimmed" in log)
+
+# A second run must find nothing to do, and must not stack markers.
+log2 = run_update(mod, source_selection_mode="Recorded")
+check_true("an immediate re-run has nothing to do", "Nothing to do" in log2)
+check("still one update marker", len(update_markers(original)), 1)
+
+# -- a second change on a trimmed clip replaces its update marker ------------
+src.tracks[1][0].source_start, src.tracks[1][0].source_end = 60, 240
+log3 = run_update(mod, source_selection_mode="Recorded")
+check("the clip is trimmed again", (original.source_start, original.source_end),
+      (60, 240))
+marks = update_markers(original)
+check("the old update marker is replaced, not stacked", len(marks), 1)
+check_true("the changelog keeps both runs",
+           "run 1" in marks[0]["note"] and "run 2" in marks[0]["note"])
+
+# -- shorten: the neighbour is not moved, the gap stays ------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 150)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+first, second = dest.tracks[1]
+mod = load(res)
+run_update(mod)
+check("the shortened clip is trimmed, not replaced",
+      items_on(dest, 1)[0] is first, True)
+check("to the new range", (first.source_start, first.source_end), (100, 150))
+check("it keeps its record start", first.record_start, 86400)
+check("the neighbour has not moved", second.record_start, 86501)
+check("nothing was appended", project.media_pool.append_calls, [])
+
+# -- boxed in: still routed to the update track; nothing overwritten ---------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86400),
+     make_dest("shot_b", (500, 600), 86501)])
+first = dest.tracks[1][0]
+mod = load(res)
+log = run_update(mod)
+check("the boxed-in clip keeps its old range",
+      (first.source_start, first.source_end), (100, 200))
+check("an updated copy goes to the update track", len(items_on(dest, 2)), 1)
+check("no clip overlaps another", no_overlaps(dest), True)
+
+# -- the head can grow into its gap even with no room at the tail -------------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 200)], "shot_b": [(500, 600)]},
+    [make_dest("shot_a", (100, 200), 86450),
+     make_dest("shot_b", (500, 600), 86551)])
+first = dest.tracks[1][0]
+mod = load(res)
+run_update(mod)
+check("head growth into a gap is trimmed in place",
+      (items_on(dest, 1)[0] is first, first.source_start, first.record_start),
+      (True, 80, 86430))
+check("no clip overlaps another", no_overlaps(dest), True)
+
+# -- a retimed clip is rebuilt, because its offsets are not source frames -----
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)]}, [make_dest("shot_a", (100, 200), 86500)])
+first = dest.tracks[1][0]
+first.speed = 50.0
+mod = load(res)
+log = run_update(mod)
+check("a 50% clip is not trimmed", items_on(dest, 1)[0] is first, False)
+check_true("the log says why", "plays at 50%" in log)
+
+# -- a trim Resolve refuses falls back to the rebuild ------------------------
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)]}, [make_dest("shot_a", (100, 200), 86500)])
+dest.tracks[1][0].refuse_trim = True
+mod = load(res)
+log = run_update(mod)
+check_true("a refused trim is reported", "could not be trimmed in place" in log)
+check("and the clip is rebuilt to the new range",
+      (items_on(dest, 1)[0].source_start, items_on(dest, 1)[0].source_end),
+      (80, 240))
+
+
+# -- linked audio ------------------------------------------------------------
+class AudioItem:
+    def __init__(self, uid, start, duration, track=1):
+        self.uid, self.start, self.duration, self.track = uid, start, duration, track
+
+    def GetUniqueId(self):
+        return self.uid
+
+    def GetTrackTypeAndIndex(self):
+        return ["audio", self.track]
+
+    def GetStart(self):
+        return self.start
+
+    def GetDuration(self):
+        return self.duration
+
+
+def with_audio(timeline, audio_items):
+    video_list = timeline.GetItemListInTrack
+
+    def listing(track_type, index):
+        if track_type == "audio":
+            return [a for a in audio_items if a.track == index]
+        return video_list(track_type, index)
+    timeline.GetItemListInTrack = listing
+
+
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)]}, [make_dest("shot_a", (100, 200), 86500)])
+first = dest.tracks[1][0]
+own_audio = AudioItem("a1", 86500, 101)
+first.GetLinkedItems = lambda: [own_audio]
+with_audio(dest, [own_audio])
+mod = load(res)
+log = run_update(mod)
+check("a clip with linked audio and room on both tracks is trimmed",
+      (items_on(dest, 1)[0] is first, first.source_start, first.source_end),
+      (True, 80, 240))
+
+res, project, dest, src = build_world(
+    {"shot_a": [(80, 240)]}, [make_dest("shot_a", (100, 200), 86500)])
+first = dest.tracks[1][0]
+own_audio = AudioItem("a1", 86500, 101)
+blocker = AudioItem("a2", 86601, 50)     # right after it on the audio track
+first.GetLinkedItems = lambda: [own_audio]
+with_audio(dest, [own_audio, blocker])
+mod = load(res)
+log = run_update(mod)
+check_true("no room on the audio track is reported",
+           "not on its linked audio track" in log)
+check("so the clip is not trimmed", (first.source_start, first.source_end),
+      (100, 200))
+check_true("and, being linked, it is left for a manual update",
+           "linked audio" in log and "SKIP" in log)
+
+for _name in TRIM_API:
+    delattr(Item, _name)
+
+
+# ---------------------------------------------------------------------------
+# 3.0: GetSourceEndFrame convention change, and retries orphaning audio
+# ---------------------------------------------------------------------------
+#
+# On 21.2.0.6 a clip AppendToTimeline places from endFrame=E reports
+# GetSourceEndFrame() == E - 1 (inclusive); 21.0.4.5 reported E. The slip check
+# used to compare that against E, so every clip on 21.2 was retried and widened.
+
+print("\n== 3.0 slip check on the 21.2 GetSourceEndFrame convention ==")
+
+
+def create_once(res, project):
+    mod = load(res)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.run_workflow(
+            dst_timeline_name="Conv_Check", selection_method="Current Selection",
+            sorting_method="Source Name", connection_threshold=25,
+            allow_disabled_clips=False, video_only=True, mark_duplicates=False,
+            mark_retimed_clips=False, use_xml_retime=False,
+            import_clip_names=False, preserve_track_layout=False,
+            merge_by_source_file=True)
+    return mod, buf.getvalue(), project.timelines[-1]
+
+
+res, project, dest, src = build_world(
+    {"shot_a": [(100, 200)], "shot_b": [(300, 380)]}, [])
+_append = MediaPool.AppendToTimeline
+
+
+def _append_inclusive(self, clip_infos):
+    placed = _append(self, clip_infos)
+    for item in placed:
+        item.reported_end = item.source_end     # 21.2: inclusive last frame
+    return placed
+
+
+MediaPool.AppendToTimeline = _append_inclusive
+try:
+    _mod, log, built = create_once(res, project)
+finally:
+    MediaPool.AppendToTimeline = _append
+check("one append per clip, no slip retries",
+      len(project.media_pool.append_calls), 2)
+check("each clip covers exactly its range",
+      sorted((i.source_start, i.source_end) for i in built.all_items()),
+      [(100, 200), (300, 380)])
+check_true("nothing is reported as widened", "widened" not in log)
+
+# A SOURCE clip that was itself placed by AppendToTimeline can echo back the
+# exclusive end (21.2.0.6 does so when a recordFrame was given). Create must read
+# it as the frames it covers, not one more.
+res, project, dest, src = build_world({"shot_a": [(100, 199)]}, [])
+src.tracks[1][0].reported_end = 200
+_mod, log, built = create_once(res, project)
+check("an exclusive-end source clip is read as the frames it covers",
+      [(i.source_start, i.source_end) for i in built.all_items()], [(100, 199)])
+
+# A retry must take the clip's linked audio with it.
+res, project, dest, src = build_world({"shot_a": [(100, 200)]}, [])
+deleted_batches = []
+
+
+def _append_slipping(self, clip_infos):
+    placed = _append(self, clip_infos)
+    for item in placed:
+        # Every append lands one frame late, so the compensated retry is exact.
+        item.source_start += 1
+        item.source_end += 1
+        item.reported_end += 1
+        item.linked = 1
+    return placed
+
+
+_delete = Timeline.DeleteClips
+
+
+def _delete_spy(self, items, ripple=False):
+    deleted_batches.append(len(items))
+    return _delete(self, items, ripple)
+
+
+MediaPool.AppendToTimeline = _append_slipping
+Timeline.DeleteClips = _delete_spy
+try:
+    _mod, log, built = create_once(res, project)
+finally:
+    MediaPool.AppendToTimeline = _append
+    Timeline.DeleteClips = _delete
+check("the slipped clip was retried", len(project.media_pool.append_calls), 2)
+check("the retry deleted the video AND its linked audio", deleted_batches, [2])
 
 
 # ---------------------------------------------------------------------------

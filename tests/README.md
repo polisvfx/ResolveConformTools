@@ -74,6 +74,29 @@ undocumented and are what the placement arithmetic rests on.
 Exit codes: `0` pass, `1` fail, `2` skipped because Resolve was unavailable. A skip
 is not a pass — `test_part_d.py` verifies nothing without a live project.
 
+### Update-mode trim, end to end
+
+`live_update_trim.py` runs the real create and update workflows in a throwaway
+project. It builds a three-shot source edit, creates the All Clips timeline,
+grades it (CDL plus a Fusion comp), changes the source edit, and runs Update. It
+checks that the shortened shot and the extended last shot are the same
+TimelineItem afterwards, with their grade (as a LUT hash), comp and linked audio
+intact; that the boxed-in first shot is handled without overwriting anything;
+and what a second run does. Run it with audio, and again with `RCT_VIDEO_ONLY=1`:
+
+```bash
+RCT_LIVE_WRITE=1 RCT_PROBE_MEDIA=clip.mov py -3.12 -u tests/live_update_trim.py
+RCT_LIVE_WRITE=1 RCT_VIDEO_ONLY=1 RCT_PROBE_MEDIA=clip.mov py -3.12 -u tests/live_update_trim.py
+```
+
+Both passed on 21.2.0.6 on 2026-11-16 against PRO 3.0. The first run of this
+check also turned up two 21.2 regressions in create mode, both fixed in 3.0:
+
+| Finding on 21.2.0.6 | Effect before 3.0 |
+|---|---|
+| `GetSourceEndFrame()` of an appended clip is inclusive without a recordFrame (`endFrame=201` → `200`) but still echoes the exclusive end with one | the slip check read every clip as a frame short, retried three times and widened it |
+| `GetLinkedItems()` lists only the other items, not the item itself | linked audio was counted as none; each slip retry deleted only the video and left an orphaned audio clip |
+
 ### Trim and move probes (21.1+ editing APIs)
 
 `live_trim_probe.py` measures the in-place editing APIs added in 21.1/21.1.2
