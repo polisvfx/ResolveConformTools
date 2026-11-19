@@ -214,6 +214,8 @@ Passed on **21.2.0.6** on 2026-11-19. What it established:
 | `FormatWidth/Height` in Individual Clips mode | honoured: the files come out at that size whatever the timeline |
 | A video-only timeline rendered with a preset that exports audio | still gets a silent audio track, so the script sends `ExportAudio: False` |
 | `CopyGrades` onto an item on another timeline | returns True |
+| `LoadRenderPreset` of a preset that leaves a field unset (the factory *ProRes 422 HQ* sets no subfolder) | that field **keeps the previous preset's value**: a date subfolder from `H264_NV` carried over |
+| `CustomName` `%{Source Name}` / `%{Clip Name}` in Individual Clips mode | one file per clip, named after it; the preset's suffix and subfolder still apply, and a clip name keeps the file extension (`B001_Scope.mov00990000_…mp4`) unless renamed |
 | `GetMarkInOut()` | offsets from `GetStartFrame()`, Out **inclusive**: marks 25-45 on a timeline at 86400 render 86425-86445; `{}` per side when unset |
 | Selection after `AppendToTimeline` | one of the appended clips came back **selected**, so a "selected clips" scope picks it up |
 

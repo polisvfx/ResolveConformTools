@@ -94,6 +94,15 @@ EXISTING_LABELS = {
     "new": "Build a new one alongside (_v2, _v3 ...)",
 }
 CURRENT_SETTINGS = "<current render settings>"
+# How rendered files are named. "preset" leaves the preset's own naming alone;
+# the others replace its custom name with a Resolve naming token.
+FILE_NAMINGS = ("preset", "source", "clip")
+FILE_NAMING_LABELS = {
+    "preset": "From the render preset",
+    "source": "Source name (the media file's name)",
+    "clip": "Clip name (as named in the Media Pool)",
+}
+FILE_NAMING_TOKENS = {"source": "%{Source Name}", "clip": "%{Clip Name}"}
 
 # AppendToTimeline can place a clip a frame off from the requested source range;
 # see Generate All Clips Timeline PRO for the measurements behind this.
@@ -342,6 +351,12 @@ def slider_to_factor_text(pos):
     """Value-field text for a slider position: 50 -> '0.5', 100 -> '1'."""
     pos = max(1, min(SLIDER_STEPS, int(pos)))
     return f"{pos / SLIDER_STEPS:g}"
+
+
+def custom_name_for(naming):
+    """The CustomName render setting for a file-naming choice, or None to
+    keep the preset's. Unknown choices keep the preset's too."""
+    return FILE_NAMING_TOKENS.get(naming)
 
 
 def plan_lines(groups, base_name):
@@ -755,7 +770,7 @@ def build_render_timeline(project, media_pool, name, w, h, plates, *, fps,
 
 
 def queue_timeline(project, timeline, manifest, *, preset, base_dir, subfolders,
-                   export_audio):
+                   export_audio, naming="preset"):
     """Add one Individual Clips render job for `timeline`. Returns job id or None."""
     w, h = manifest["resolution"]
     if not project.SetCurrentTimeline(timeline):
@@ -779,6 +794,10 @@ def queue_timeline(project, timeline, manifest, *, preset, base_dir, subfolders,
         settings["TargetDir"] = target
     if not export_audio:
         settings["ExportAudio"] = False
+    custom = custom_name_for(naming)
+    if custom:
+        # The preset's suffix and subfolder still apply; only the name changes.
+        settings["CustomName"] = custom
     if not project.SetRenderSettings(settings):
         print(f"  ERROR: Resolve refused the render settings for '{tl_name(timeline)}'")
         return None
@@ -888,7 +907,8 @@ def run_queue(project, entries, opts):
     for tl, manifest in entries:
         jid = queue_timeline(project, tl, manifest, preset=opts["preset"],
                              base_dir=opts["target_dir"], subfolders=opts["subfolders"],
-                             export_audio=opts["export_audio"])
+                             export_audio=opts["export_audio"],
+                             naming=opts.get("naming", "preset"))
         if jid:
             jobs.append(jid)
     if restore is not None:
@@ -995,6 +1015,15 @@ def build_and_show_ui(project):
                 ui.ComboBox({"ID": "preset"}),
             ]),
             ui.HGroup({"Weight": 0}, [
+                ui.Label({"Text": "File names:", "Weight": 0, "MinimumSize": [110, 0]}),
+                ui.ComboBox({"ID": "naming",
+                             "ToolTip": "Source and Clip name replace the preset's "
+                                        "custom name; its suffix and subfolder "
+                                        "still apply. A clip name usually ends in "
+                                        "the file's extension unless the clip was "
+                                        "renamed."}),
+            ]),
+            ui.HGroup({"Weight": 0}, [
                 ui.Label({"Text": "Target folder:", "Weight": 0, "MinimumSize": [110, 0]}),
                 ui.LineEdit({"ID": "targetDir", "Text": prefs.get("target_dir", ""),
                              "PlaceholderText": "empty = the preset's folder"}),
@@ -1039,6 +1068,10 @@ def build_and_show_ui(project):
         items["existing"].AddItem(EXISTING_LABELS[p])
     if prefs.get("existing") in EXISTING_POLICIES:
         items["existing"].CurrentIndex = EXISTING_POLICIES.index(prefs["existing"])
+    for nm in FILE_NAMINGS:
+        items["naming"].AddItem(FILE_NAMING_LABELS[nm])
+    if prefs.get("naming") in FILE_NAMINGS:
+        items["naming"].CurrentIndex = FILE_NAMINGS.index(prefs["naming"])
     for p in presets:
         items["preset"].AddItem(p)
     if prefs.get("preset") in presets:
@@ -1205,6 +1238,7 @@ def build_and_show_ui(project):
             "target_dir": items["targetDir"].Text.strip(),
             "subfolders": bool(items["subfolders"].Checked),
             "export_audio": bool(items["exportAudio"].Checked),
+            "naming": FILE_NAMINGS[items["naming"].CurrentIndex],
             "start_render": bool(items["startRender"].Checked),
             "dry_run": bool(items["dryRun"].Checked),
         }
@@ -1266,7 +1300,8 @@ def build_and_show_ui(project):
     result = state["result"]
     if result is not None:
         prefs.update({k: result[k] for k in (
-            "preset", "target_dir", "subfolders", "export_audio", "start_render")})
+            "preset", "target_dir", "subfolders", "export_audio", "start_render",
+            "naming")})
         prefs["action"] = result["action"]
         if result["action"] == "create":
             prefs.update({k: result[k] for k in (

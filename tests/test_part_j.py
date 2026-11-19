@@ -31,7 +31,7 @@ def _repo_root():
 REPO = _repo_root()
 SCRIPT = os.path.join(REPO, "Render Scaled Plates.py")
 WANTED = [
-    "summary_headline",
+    "summary_headline", "custom_name_for",
     "parse_resolution", "round_even", "compute_target", "merge_plate_ranges",
     "group_by_resolution", "resolution_label", "render_timeline_name",
     "unique_name", "target_dir_for", "utc_now_iso", "build_manifest",
@@ -148,6 +148,15 @@ raises("height refuses a fraction", psv, "height", "1080.5")
 raises("height refuses empty", psv, "height", "")
 raises("factor refuses negative", psv, "factor", "-1")
 raises("width refuses text", psv, "width", "big")
+
+# --- file naming override -------------------------------------------------
+
+cn = ns["custom_name_for"]
+check("preset naming sends no CustomName", cn("preset"), None)
+check("source name token", cn("source"), "%{Source Name}")
+check("clip name token", cn("clip"), "%{Clip Name}")
+check("an unknown choice keeps the preset's", cn("bogus"), None)
+check("every choice has a label", sorted(ns["FILE_NAMING_LABELS"]), sorted(ns["FILE_NAMINGS"]))
 
 # --- summary headline --------------------------------------------------------
 

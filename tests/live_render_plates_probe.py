@@ -146,7 +146,7 @@ try:
             "scope": "all",
             "base_name": base, "dry_run": False, "preset": "ProRes 422 HQ",
             "target_dir": out_dir, "subfolders": True, "export_audio": False,
-            "start_render": False}
+            "start_render": False, "naming": "source"}
 
     print("\n--- create ---")
     entries = rsp["run_create"](project, opts)
@@ -188,8 +188,12 @@ try:
         time.sleep(1)
     for res in ("1920x1080", "2048x1080", "2048x858"):
         folder = os.path.join(out_dir, res)
-        files = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+        # A preset can add its own subfolder (a date, say), so look all the way down.
+        files = sorted(os.path.relpath(os.path.join(d, f), folder)
+                       for d, _, fs in os.walk(folder) for f in fs)
         check(f"{res}: files rendered into their own subfolder", len(files) >= 1, True)
+        check(f"{res}: files named after their source",
+              all(os.path.basename(f).startswith("plate_") for f in files), True)
         for f in files:
             want = tuple(int(v) for v in res.split("x"))
             check(f"  {f} is {res}", probe_dims(os.path.join(folder, f)), want)

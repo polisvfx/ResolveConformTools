@@ -325,6 +325,11 @@ resolution and the target folder are overridden.
   Timeline PRO* with XML retime analysis first if that matters.
 - **Overlapping uses of one source merge** into a single plate (you can turn this off).
 - **Ungraded by default.** *Copy grades* copies each clip's grade onto its plate.
+- **File names**: from the render preset, or override them with the *Source name*
+  (the media file's name) or the *Clip name* (as named in the Media Pool, so shot
+  names from *Shot Numbering (Clip Name)* carry through). The override replaces
+  only the preset's custom name: its suffix and subfolder still apply, and a clip
+  name usually ends in the file's extension unless the clip was renamed.
 - **Output**: an optional target folder with a subfolder per resolution
   (`.../1920x1080/`). Audio is left out unless *Export audio* is ticked. Queue only,
   or queue and start rendering.
