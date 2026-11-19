@@ -33,7 +33,7 @@ jobs:
       # here -- run those locally before tagging (see tests/README.md).
       - name: Run offline tests
         run: |
-          for t in test_part_a test_part_b test_part_e test_part_f test_part_g test_part_i; do
+          for t in test_part_a test_part_b test_part_e test_part_f test_part_g test_part_i test_part_j; do
             echo "::group::$t"
             python "tests/$t.py"
             echo "::endgroup::"

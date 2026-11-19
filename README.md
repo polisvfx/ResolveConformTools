@@ -288,6 +288,66 @@ Searches every timeline in the current project for the selected clip and lists t
 - Dark, Resolve-style UI built with tkinter — no extra dependencies
 
 
+## Render Scaled Plates
+Queues every plate of the current timeline for rendering at a reduced resolution
+(proxies, a half-res set for a vendor, a 1080-high reference set) in
+**Individual Clips** mode, with the render preset of your choice. Only the output
+resolution and the target folder are overridden.
+
+- **Three rules**: scale to a height (default 2160), scale to a width (default
+  4096), or scale by a factor. For a factor, drag the slider (1.0 down to 0.0) or
+  type a value (`0.5` or `50%`); the two stay in step. Each rule remembers the
+  value you last used with it. The other dimension follows the plate's aspect,
+  and both are rounded to an even number.
+- **One render timeline per output resolution.** Under one rule, plates of
+  different sizes come out at different resolutions: height 1080 turns 4096x2160
+  into 2048x1080 but 3840x2160 into 1920x1080. So the plates are grouped by the
+  resolution they come out at, and each group gets a timeline named
+  `<base>_<W>x<H>` at that resolution, in a `Render Timelines` bin, with its own
+  render job.
+- **Never scales up** unless you tick *Allow upscaling*: a plate already smaller
+  than the target keeps its native size and lands in its own group.
+- **Clips**, with the same rules for every scale mode:
+  - *Selected clips*: the clips selected on the timeline (Resolve 21.0.4+), or
+    every enabled clip if nothing is selected. Resolve keeps a selection around
+    after edits (building a timeline by script leaves a clip selected too), so the
+    dialog says when only some clips are selected: "only the 1 SELECTED clip(s),
+    of 9 enabled".
+  - *All enabled clips*: every enabled video clip on an enabled track.
+  - *Enabled clips between In and Out*: every enabled video clip on an enabled
+    track that touches the timeline's In-Out range. A clip that crosses a mark
+    comes in whole, because a plate is the whole shot. With only one mark set,
+    the other side runs to the timeline's start or end; with none, nothing is taken.
+- **Source range**: each plate covers exactly the source frames the edit uses, with
+  no handles. Retimes are flattened to 100%. A reversed or constant-speed retime
+  covers every frame it plays, but a speed ramp that overshoots its out-point is
+  under-reported by Resolve's API. Run the edit through *Generate All Clips
+  Timeline PRO* with XML retime analysis first if that matters.
+- **Overlapping uses of one source merge** into a single plate (you can turn this off).
+- **Ungraded by default.** *Copy grades* copies each clip's grade onto its plate.
+- **File names**: from the render preset, or override them with the *Source name*
+  (the media file's name) or the *Clip name* (as named in the Media Pool, so shot
+  names from *Shot Numbering (Clip Name)* carry through). The override replaces
+  only the preset's custom name: its suffix and subfolder still apply, and a clip
+  name usually ends in the file's extension unless the clip was renamed.
+- **Output**: an optional target folder with a subfolder per resolution
+  (`.../1920x1080/`). Audio is left out unless *Export audio* is ticked. Queue only,
+  or queue and start rendering.
+- **Re-submit**: each render timeline records how it was made (metadata on its
+  Media Pool item, plus a Cream marker at its start). *Re-submit* mode lists every
+  one in the project, with its source and when it was last queued, and queues the
+  ones you select again, with any preset, without rebuilding them. When *Create*
+  meets a render timeline that already exists, it can re-use it, replace it, or
+  build a `_v2` alongside it.
+- **Dry run** prints the whole plan to the console and changes nothing.
+- **Summary window** at the end says how many render timelines were built and how
+  many jobs were queued and started, above the run's full log. Every job is
+  queued before anything renders, and one call then starts them all.
+- The last settings are remembered per user.
+
+Plates with non-square pixels are fitted to a square-pixel timeline, so render one
+and check it first.
+
 ## Future Features
 The nuke integration is in its infancy and I am contemplating making it a bit more robust and useful, maybe creating a script that will generate a project config file that handles all variables like, project resolution, handles and so on. You could theoretically also reference nukescript templates and generate nuke scripts out of Resolve.
 
