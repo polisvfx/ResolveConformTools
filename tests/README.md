@@ -36,6 +36,7 @@ python tests/test_part_e.py     # Generate All Clips PRO decision functions
 python tests/test_part_f.py     # Generate All Clips PRO create + update, end to end
 python tests/test_part_g.py     # tools/make_release_zip.py, the release gate
 python tests/test_part_i.py     # DCTL Report plugin scan + installed lookup
+python tests/test_part_j.py     # Render Scaled Plates rules, collection, manifest
 
 # Live tests (Resolve must be running with a project open)
 python tests/test_part_d.py     # Generate All Clips timeline resolution
@@ -190,6 +191,31 @@ arithmetic and the manifest round trip. Its `extract()` differs from the Part A/
 one in two ways it documents: it also pulls self-contained module constants
 (functions default arguments to them), and it compiles with the `annotations`
 future flag so return annotations are not evaluated at def time.
+
+### Render Scaled Plates, end to end
+
+`live_render_plates_probe.py` runs the script's real create, queue, render and
+re-submit paths in a throwaway project `RCT_RenderPlates_PROBE`. It makes four
+test plates with ffmpeg (3840x2160, 4096x2160, 2048x858, 1280x720), so it needs
+`ffmpeg` and `ffprobe` on the PATH, then reloads your project and deletes the
+throwaway (`RCT_KEEP_PROBE=1` keeps it):
+
+```bash
+RCT_LIVE_WRITE=1 py -3.12 -u tests/live_render_plates_probe.py
+```
+
+Passed on **21.2.0.6** on 2026-11-19. What it established:
+
+| Probe | Answer |
+|---|---|
+| `useCustomSettings` + `timelineResolutionWidth/Height` on a new timeline | taken, including odd sizes like 2048x858 |
+| `timelineFrameRate` set to the rate it already has | **refused** (returns False), so only set it when it differs |
+| `LoadRenderPreset` | keeps the current render mode; the mode is set afterwards anyway |
+| `FormatWidth/Height` in Individual Clips mode | honoured: the files come out at that size whatever the timeline |
+| A video-only timeline rendered with a preset that exports audio | still gets a silent audio track, so the script sends `ExportAudio: False` |
+| `CopyGrades` onto an item on another timeline | returns True |
+| `GetMarkInOut()` | offsets from `GetStartFrame()`, Out **inclusive**: marks 25-45 on a timeline at 86400 render 86425-86445; `{}` per side when unset |
+| Selection after `AppendToTimeline` | one of the appended clips came back **selected**, so a "selected clips" scope picks it up |
 
 ## Adding to them
 
