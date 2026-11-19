@@ -55,9 +55,11 @@ Run from:  Workspace ▸ Scripts
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 
 TOOL_NAME = "Render Scaled Plates"
@@ -478,6 +480,7 @@ def collect_plates(timeline, *, mode, value, allow_upscale, scope="selection"):
     use_sel = bool(selected_uids)
 
     plates, skipped = [], []
+    enabled_total = 0  # what "All enabled clips" would consider, for the label
     track_count = _call(timeline, "GetTrackCount", "video", default=0) or 0
     for track_index in range(1, int(track_count) + 1):
         track_on = _call(timeline, "GetIsTrackEnabled", "video", track_index, default=True)
@@ -486,6 +489,9 @@ def collect_plates(timeline, *, mode, value, allow_upscale, scope="selection"):
             if item is None:
                 continue
             uid = item_uid(item)
+            if (track_on is not False
+                    and _call(item, "GetClipEnabled", default=True) is not False):
+                enabled_total += 1
             if use_sel:
                 if uid not in selected_uids:
                     continue
@@ -532,7 +538,8 @@ def collect_plates(timeline, *, mode, value, allow_upscale, scope="selection"):
             })
 
     if use_sel:
-        label = f"{len(plates)} selected clip(s)"
+        label = (f"only the {len(plates)} SELECTED clip(s), of {enabled_total} "
+                 f"enabled; deselect, or choose All enabled clips, to take them all")
     elif in_out is not None:
         label = (f"{len(plates)} enabled video clip(s) between In and Out "
                  f"({range_label(in_out)})")
@@ -888,8 +895,10 @@ def run_queue(project, entries, opts):
         project.SetCurrentTimeline(restore)
     print(f"{len(jobs)} of {len(entries)} job(s) added to the render queue.")
     if jobs and opts["start_render"]:
-        if project.StartRendering(jobs, False):
-            print("Rendering started.")
+        # Every job is queued before anything renders; one call starts them all.
+        opts["render_started"] = bool(project.StartRendering(jobs, False))
+        if opts["render_started"]:
+            print(f"Rendering started: {len(jobs)} job(s).")
         else:
             print("ERROR: Resolve did not start rendering.")
     return jobs
@@ -1270,19 +1279,76 @@ def build_and_show_ui(project):
     return result
 
 
+def summary_headline(action, built, queued, wanted, rendering, dry_run):
+    """One line saying what a run did, for the summary window."""
+    if dry_run:
+        return "Dry run: nothing was changed. The plan is below."
+    parts = []
+    if action == "create":
+        parts.append(f"Built or re-used {built} render timeline(s)")
+    parts.append(f"queued {queued} of {wanted} job(s)")
+    if rendering is True:
+        parts.append("rendering started")
+    elif rendering is False:
+        parts.append("rendering did NOT start")
+    text = ", ".join(parts)
+    return text[0].upper() + text[1:] + "."
+
+
+class _Tee(io.TextIOBase):
+    """Copies everything printed during a run, so the summary can show it."""
+
+    def __init__(self, target):
+        self.target, self.parts = target, []
+
+    def write(self, text):
+        self.parts.append(text)
+        try:
+            return self.target.write(text)
+        except Exception:
+            return len(text)
+
+    def flush(self):
+        try:
+            self.target.flush()
+        except Exception:
+            pass
+
+
+def show_summary(headline, log_text):
+    """A window with the outcome and the run's log. The console is easy to
+    miss, and a run that did less than expected should say so on screen."""
+    ui = fu.UIManager  # noqa: F821
+    disp = bmd.UIDispatcher(ui)  # noqa: F821
+    win = disp.AddWindow({
+        "ID": "RSPSummary",
+        "WindowTitle": f"{TOOL_NAME} - done",
+        "Geometry": [160, 160, 760, 520],
+    }, [
+        ui.VGroup({}, [
+            ui.Label({"ID": "headline", "Text": headline, "Weight": 0,
+                      "WordWrap": True, "StyleSheet": "font-weight: bold;"}),
+            ui.TextEdit({"ID": "log", "ReadOnly": True, "Text": log_text,
+                         "Font": ui.Font({"Family": "Consolas", "PixelSize": 12})}),
+            ui.HGroup({"Weight": 0}, [
+                ui.HGap(0, 1),
+                ui.Button({"ID": "ok", "Text": "OK", "Default": True}),
+            ]),
+        ]),
+    ])
+    win.On.ok.Clicked = lambda ev: disp.ExitLoop()
+    win.On.RSPSummary.Close = lambda ev: disp.ExitLoop()
+    win.Show()
+    disp.RunLoop()
+    win.Hide()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
-    if project is None:
-        print("ERROR: no project is open.")
-        return
-    opts = build_and_show_ui(project)
-    if opts is None:
-        print("Cancelled.")
-        return
+def run(project, opts):
+    """Carry out what the dialog asked for. Returns the summary headline."""
     print(f"=== {TOOL_NAME} {TOOL_VERSION} ===")
     if opts["action"] == "create":
         entries = run_create(project, opts)
@@ -1294,10 +1360,37 @@ def main():
                 where = (target_dir_for(opts["target_dir"], w, h, opts["subfolders"])
                          or "the preset's folder")
                 print(f"  would queue '{tl_name(tl)}' at {w}x{h} -> {where}")
-            print("Dry run: nothing queued.")
-            return
+    jobs = []
     if not opts["dry_run"]:
-        run_queue(project, entries, opts)
+        jobs = run_queue(project, entries, opts)
+    rendering = opts.get("render_started") if opts.get("start_render") else None
+    return summary_headline(opts["action"], len(entries), len(jobs), len(entries),
+                            rendering, opts["dry_run"])
+
+
+def main():
+    project = resolve.GetProjectManager().GetCurrentProject()  # noqa: F821
+    if project is None:
+        print("ERROR: no project is open.")
+        return
+    opts = build_and_show_ui(project)
+    if opts is None:
+        print("Cancelled.")
+        return
+    tee = _Tee(sys.stdout)
+    old_stdout, sys.stdout = sys.stdout, tee
+    try:
+        headline = run(project, opts)
+    except Exception as exc:  # show it rather than leave the user guessing
+        import traceback
+        traceback.print_exc(file=tee)
+        headline = f"Stopped by an error: {exc}"
+    finally:
+        sys.stdout = old_stdout
+    try:
+        show_summary(headline, "".join(tee.parts))
+    except Exception as exc:
+        print(f"(could not show the summary window: {exc})")
 
 
 main()

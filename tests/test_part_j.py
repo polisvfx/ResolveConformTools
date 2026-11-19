@@ -31,6 +31,7 @@ def _repo_root():
 REPO = _repo_root()
 SCRIPT = os.path.join(REPO, "Render Scaled Plates.py")
 WANTED = [
+    "summary_headline",
     "parse_resolution", "round_even", "compute_target", "merge_plate_ranges",
     "group_by_resolution", "resolution_label", "render_timeline_name",
     "unique_name", "target_dir_for", "utc_now_iso", "build_manifest",
@@ -147,6 +148,18 @@ raises("height refuses a fraction", psv, "height", "1080.5")
 raises("height refuses empty", psv, "height", "")
 raises("factor refuses negative", psv, "factor", "-1")
 raises("width refuses text", psv, "width", "big")
+
+# --- summary headline --------------------------------------------------------
+
+sh = ns["summary_headline"]
+check("create, queued, rendering", sh("create", 6, 6, 6, True, False),
+      "Built or re-used 6 render timeline(s), queued 6 of 6 job(s), rendering started.")
+check("a short queue is visible", sh("create", 3, 2, 3, None, False),
+      "Built or re-used 3 render timeline(s), queued 2 of 3 job(s).")
+check("re-submit, render refused", sh("resubmit", 2, 2, 2, False, False),
+      "Queued 2 of 2 job(s), rendering did NOT start.")
+check("dry run", sh("create", 3, 0, 3, None, True),
+      "Dry run: nothing was changed. The plan is below.")
 
 # --- GUI value defaults and the factor slider -------------------------------
 
@@ -376,7 +389,9 @@ tl.selected = [i3, i5, Item(uhd, 0, 1, 0, track=("audio", 1))]
 plates, scope, _ = cp(tl, mode="height", value=1080, allow_upscale=False)
 check("a selection wins, disabled or not; audio is ignored",
       sorted(p["name"] for p in plates), ["hd", "uhd"])
-check("scope label says selected", scope, "2 selected clip(s)")
+check("scope label says selected, and of how many",
+      scope, "only the 2 SELECTED clip(s), of 4 enabled; deselect, or choose "
+      "All enabled clips, to take them all")
 check("the selected smaller plate stays native",
       [p["note"] for p in plates if p["name"] == "hd"], ["native"])
 

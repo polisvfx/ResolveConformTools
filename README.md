@@ -310,7 +310,9 @@ resolution and the target folder are overridden.
 - **Clips**, with the same rules for every scale mode:
   - *Selected clips*: the clips selected on the timeline (Resolve 21.0.4+), or
     every enabled clip if nothing is selected. Resolve keeps a selection around
-    after edits, so check the count the dialog shows.
+    after edits (building a timeline by script leaves a clip selected too), so the
+    dialog says when only some clips are selected: "only the 1 SELECTED clip(s),
+    of 9 enabled".
   - *All enabled clips*: every enabled video clip on an enabled track.
   - *Enabled clips between In and Out*: every enabled video clip on an enabled
     track that touches the timeline's In-Out range. A clip that crosses a mark
@@ -333,6 +335,9 @@ resolution and the target folder are overridden.
   meets a render timeline that already exists, it can re-use it, replace it, or
   build a `_v2` alongside it.
 - **Dry run** prints the whole plan to the console and changes nothing.
+- **Summary window** at the end says how many render timelines were built and how
+  many jobs were queued and started, above the run's full log. Every job is
+  queued before anything renders, and one call then starts them all.
 - The last settings are remembered per user.
 
 Plates with non-square pixels are fitted to a square-pixel timeline, so render one
