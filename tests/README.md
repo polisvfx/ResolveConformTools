@@ -37,6 +37,7 @@ python tests/test_part_f.py     # Generate All Clips PRO create + update, end to
 python tests/test_part_g.py     # tools/make_release_zip.py, the release gate
 python tests/test_part_i.py     # DCTL Report plugin scan + installed lookup
 python tests/test_part_j.py     # Render Scaled Plates rules, collection, manifest
+python tests/test_part_k.py     # Batch Rename engine: numbering, filters, timeline rename/undo
 
 # Live tests (Resolve must be running with a project open)
 python tests/test_part_d.py     # Generate All Clips timeline resolution
@@ -218,6 +219,35 @@ Passed on **21.2.0.6** on 2026-11-19. What it established:
 | `CustomName` `%{Source Name}` / `%{Clip Name}` in Individual Clips mode | one file per clip, named after it; the preset's suffix and subfolder still apply, and a clip name keeps the file extension (`B001_Scope.mov00990000_…mp4`) unless renamed |
 | `GetMarkInOut()` | offsets from `GetStartFrame()`, Out **inclusive**: marks 25-45 on a timeline at 86400 render 86425-86445; `{}` per side when unset |
 | Selection after `AppendToTimeline` | one of the appended clips came back **selected**, so a "selected clips" scope picks it up |
+
+### Batch Rename, timeline clips
+
+`test_part_k.py` pulls Batch Rename's engine out of the script with `ast`: the
+constants, the functions and the four data classes, exec'd into a real module
+object (dataclasses look their module up in `sys.modules`). The Qt classes are left
+out, so it needs neither PySide6 nor Resolve and runs on the release runner.
+
+`live_batch_rename_probe.py` drives the same functions against a real timeline in a
+throwaway project `RCT_RENAME_<pid>`, then reloads your project and deletes it
+(`RCT_KEEP_PROBE=1` keeps it). It executes the whole script minus `main()`, so it
+needs a Python with PySide6:
+
+```bash
+RCT_LIVE_WRITE=1 RCT_PROBE_MEDIA=clip.mov py -3.12 -u tests/live_batch_rename_probe.py
+```
+
+Passed on **21.2.0.6** on 2026-11-24. What it established:
+
+| Probe | Answer |
+|---|---|
+| `TimelineItem.SetName` | renames the instance only; the MediaPoolItem keeps its name |
+| Two instances of one source | hold different names |
+| `GetUniqueId()` after a rename | unchanged |
+| `GetClipColor` / `GetFlagList` / `GetMarkers` on a TimelineItem | `'Orange'`, `['Red']`, `{frame: {'color': 'Blue', ...}}`; set on the item, not the Media Pool clip |
+| Media Pool rename, timeline clip never renamed | the timeline clip shows the new name |
+| Media Pool rename, timeline clip renamed before (even back to the same text) | keeps its own name |
+| `TimelineItem.SetName("")` | returns True and leaves a **blank** name, not a re-link; `SetName(None)` returns False |
+| Selection after `AppendToTimeline` | one clip came back selected |
 
 ## Adding to them
 

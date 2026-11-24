@@ -265,17 +265,26 @@ Scans the currently-open project for every LUT and DCTL reference, resolves each
 - Requires `zstandard` installed into Resolve's Python interpreter (usually just a `pip install zstandard`)
 
 ## Batch Rename (Python, PySide6)
-A comprehensive batch renaming utility for media pool items in DaVinci Resolve. Provides Advanced Renamer-style composable operations with a live preview.
+A batch renaming utility with Advanced Renamer-style composable operations and a live preview. Two tabs rename two different things, and each says so in a coloured banner:
 
-- **Operation Pipeline**: Chain multiple rename operations that execute sequentially — search & replace (plain text or regex), add prefix/suffix, remove N characters from start/end/position
-- **Drag-and-Drop Reordering**: Operations can be reordered by dragging, with per-row delete (x) and enable/disable toggles
-- **Type Filters**: Rename only specific item types — Timeline, Video, Audio, Still/Image, Compound Clip, Fusion Comp, Generator, or Other
-- **Live Preview**: See the result of all operations before committing, with automatic collision detection for duplicate names
-- **Undo History**: Up to 20 levels of undo, reverting renamed items back to their original names
-- **Presets**: Save and load operation pipelines with filter states. Set a default preset that auto-loads on script startup
-- **Date/Time Tokens**: Use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`, `{minute}`, `{second}` in prefix, suffix, and replace fields
-- **Include Subfolders**: Optionally recurse into subfolders of the current media pool bin
-- Uses PySide6 (bundled with Resolve) for a native Qt UI with dark theme
+- **Media Pool Clips** (blue) renames the **source clip** (`MediaPoolItem.SetName`). Its uses on timelines show the new name too, unless they were renamed on the timeline before.
+- **Timeline Clips** (orange) renames **clip instances on the current timeline only** (`TimelineItem.SetName`, DaVinci Resolve 20.2+). The Media Pool is not touched, and two uses of the same source can get different names. A renamed timeline clip keeps its own name from then on: it no longer follows Media Pool renames, and Resolve has no way to re-link it.
+
+The operation pipeline, presets and undo are shared by both tabs. The Rename button takes the tab's colour and says what it will touch, e.g. *Rename 12 Timeline Clips (V1–V3)*.
+
+- **Operations**: search & replace (plain text or regex), add prefix/suffix, **Numbering**, **Change Case**, **Clean Name**, remove N characters from start/end/position. Drag to reorder, toggle or delete per row
+- **Numbering**: a template such as `SH_{n}`, placed as the whole name or before/after it with a separator; padding, increment, and either a start number or **Continue after highest existing**, which finds the highest number the template already produced (on the whole timeline, or the whole Media Pool) and continues from it. *Next free* fills that number in. On the Timeline tab, *Count over: every clip on the timeline* gives a selected or filtered subset the numbers a full-timeline run would give it, like Shot Numbering's *Keep full-timeline numbers*. Every instance gets its own number, duplicates of a source included
+- **Change Case**: UPPERCASE, lowercase, Title Case (separators kept) or capitalise the first letter, optionally leaving the file extension alone
+- **Clean Name**: strip the file extension (`.mov`, `.R3D`; `.v002` is kept) and Resolve's sequence range (`_[0001-0100]`)
+- **Tokens**: `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`, `{minute}`, `{second}` everywhere; on the Timeline tab also `{source}` (the Media Pool name, cleaned), `{track}` (e.g. `V2`) and `{timeline}`
+- **Filters** (both tabs): clip colour, flag colour, and markers (has / has none / has one of a colour). Media Pool tab: clip type and *Include Subfolders*. Timeline tab: video-track checkboxes
+- **Timeline scope**: *Whole timeline* or *Selected timeline clips only* (needs `Timeline.GetSelectedClips()`, DaVinci Resolve 21.0.4+). The selection is read on Refresh and again on Rename. With nothing selected it renames nothing rather than falling back to the whole timeline
+- **Media Pool order**: *Sort by* bin order, name or start TC. The preview order is the numbering order
+- **Restore Media Pool Names** (Timeline tab): sets the clips in scope back to their source clip's name. Undoable
+- **Live preview** with collision detection; select rows to rename only those, with the numbers the preview shows
+- **Undo history** (20 levels) for both tabs; timeline undo finds the clips by `GetUniqueId()` on the timeline they were renamed on, even after you switch timelines
+- **Presets** keep the pipeline, the tab, and each tab's filters, sort and scope. v1 presets still load
+- A rename that would leave a blank name is skipped
 
 ## Find Clip in Timelines
 Searches every timeline in the current project for the selected clip and lists the timelines that use it. Run it with a clip selected in the Media Pool or on the active timeline.
